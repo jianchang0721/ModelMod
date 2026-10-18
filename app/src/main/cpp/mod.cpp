@@ -615,6 +615,37 @@ static int scale_mesh_vertices(Il2CppObject* mesh, Il2CppClass* MeshCls, float k
     return (int)arr->max_length;
 }
 
+// 造一个立方体 GameObject 并挂到目标 transform 的父级下
+static Il2CppObject* spawn_cube_for(Il2CppObject* smr) {
+    Il2CppClass* GOCls    = find_class_any("UnityEngine", "GameObject");
+    Il2CppClass* CompCls  = find_class_any("UnityEngine", "Component");
+    Il2CppClass* TransCls = find_class_any("UnityEngine", "Transform");
+    if (!GOCls || !CompCls || !TransCls) { LOGE("spawn: class missing"); return nullptr; }
+
+    const MethodInfo* createPrim = find_method(GOCls, "CreatePrimitive", 1);
+    if (!createPrim) { LOGE("spawn: CreatePrimitive missing"); return nullptr; }
+
+    int32_t cubeType = 3;   // PrimitiveType.Cube
+    void* a1[1] = { &cubeType };
+    Il2CppObject* cube = invoke_static(createPrim, a1);
+    if (!cube) { LOGE("spawn: CreatePrimitive null"); return nullptr; }
+
+    const MethodInfo* getTransGO = find_method(GOCls, "get_transform", 0);
+    const MethodInfo* getTransC  = find_method(CompCls, "get_transform", 0);
+    const MethodInfo* getParent  = find_method(TransCls, "get_parent", 0);
+    const MethodInfo* setParent  = find_method(TransCls, "SetParent", 1);
+
+    Il2CppObject* ct = invoke_inst(getTransGO, cube, nullptr);
+    Il2CppObject* st = invoke_inst(getTransC, smr, nullptr);
+    Il2CppObject* sp = invoke_inst(getParent, st, nullptr);
+
+    if (ct && sp && setParent) {
+        void* a2[1] = { sp };
+        invoke_inst(setParent, ct, a2);
+    }
+    return cube;
+}
+
 static int patch_scene_targeted(Il2CppClass* SMRCls, const MethodInfo* setMesh, int budget) {
     std::vector<Fingerprint> list;
     collect_fingerprints(SMRCls, list);
@@ -637,13 +668,20 @@ static int patch_scene_targeted(Il2CppClass* SMRCls, const MethodInfo* setMesh, 
             if (!rule_matches(rule, f)) continue;
 
             if (g_inplace_mode) {
-                if (!g_setEnabled) break;
                 if (g_patched_meshes.count(f.smr)) break;
-                uint8_t off = 0;
-                void* a[1] = { &off };
-                invoke_inst(g_setEnabled, f.smr, a);
+
+                // 1. 关掉原 renderer
+                if (g_setEnabled) {
+                    uint8_t off = 0;
+                    void* a[1] = { &off };
+                    invoke_inst(g_setEnabled, f.smr, a);
+                }
+
+                // 2. 造立方体挂到同一父级
+                Il2CppObject* cube = spawn_cube_for(f.smr);
+
                 g_patched_meshes[f.smr] = 1;
-                LOGI("hidden %s", f.chain.c_str());
+                LOGI("replaced %s cube=%p", f.chain.c_str(), cube);
                 done++;
                 break;
             }
