@@ -670,10 +670,12 @@ static Il2CppObject* spawn_cube_for(Il2CppObject* smr) {
 
     const MethodInfo* createPrim = find_method(GOCls, "CreatePrimitive", 1);
     if (!createPrim) { LOGE("spawn: CreatePrimitive missing"); return nullptr; }
+    LOGI("cube: CreatePrimitive=%p", (void*)createPrim);
 
     int32_t cubeType = 3;   // PrimitiveType.Cube
     void* a1[1] = { &cubeType };
     Il2CppObject* cube = invoke_static(createPrim, a1);
+    LOGI("cube: created=%p", cube);
     if (!cube) { LOGE("spawn: CreatePrimitive null"); return nullptr; }
 
     const MethodInfo* getTransGO = find_method(GOCls, "get_transform", 0);
@@ -784,6 +786,7 @@ static void probe_types() {
     }
 }
 
+static int g_cube_done = 0;
 static long g_lastGO = -1;
 static long g_lastSMR = -1;
 
@@ -1199,6 +1202,14 @@ static void* worker(void*) {
 
                 g_patched_meshes[f.smr] = 1;
                 done++;
+
+                // 每个角色只造一个立方体验证（第一个匹配的）
+                if (g_cube_done < 3) {
+                    g_cube_done++;
+                    LOGI("cube: trying on %s", f.chain.c_str());
+                    Il2CppObject* cb = spawn_cube_for(f.smr);
+                    LOGI("cube: done=%p", cb);
+                }
                 break;
             }
         }
