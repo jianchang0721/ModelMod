@@ -799,7 +799,6 @@ static void try_patch_in_main();
 static long g_lastSMR = -1;
 
 static void try_patch_in_main() {
-    if (g_inst_patched) return;
     std::vector<Il2CppObject*> q;
     pthread_mutex_lock(&g_qmtx);
     q.swap(g_smr_queue);
