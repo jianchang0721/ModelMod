@@ -861,6 +861,7 @@ static int g_cube_done = 0;
 static long g_lastGO = -1;
 
 // Instantiate hook：在主线程创建对象时插一脚
+static void main_tick();
 static void* g_orig_canvas = nullptr;
 static void* g_orig_inst1 = nullptr;
 static void* g_orig_inst2 = nullptr;
