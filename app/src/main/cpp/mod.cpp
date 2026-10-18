@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdint>
@@ -506,10 +507,25 @@ static void collect_fingerprints(Il2CppClass* SMRCls, std::vector<Fingerprint>& 
 
     void* a[1] = { g_api.type_get_object(g_api.class_get_type(SMRCls)) };
     Il2CppArray* arr = (Il2CppArray*)invoke_static(find, a);
+
     static int dbgFind = 0;
+    bool usedFallback = false;
+
+    if (!arr || arr->max_length == 0) {
+        // 备用：Resources.FindObjectsOfTypeAll，包含未激活对象
+        Il2CppClass* ResCls = find_class_any("UnityEngine", "Resources");
+        if (ResCls) {
+            const MethodInfo* fa = find_method(ResCls, "FindObjectsOfTypeAll", 1);
+            if (fa) {
+                arr = (Il2CppArray*)invoke_static(fa, a);
+                usedFallback = true;
+            }
+        }
+    }
+
     if (dbgFind < 5) {
         dbgFind++;
-        LOGI("find: typeObj=%p arr=%p len=%ld", a[0], arr, arr ? (long)arr->max_length : -1L);
+        LOGI("find: arr=%p len=%ld fallback=%d", arr, arr ? (long)arr->max_length : -1L, (int)usedFallback);
     }
     if (!arr) return;
 
@@ -788,7 +804,16 @@ static void main_tick() {
 
     if (!isMain) return;      // 非主线程不算数
     if (__sync_lock_test_and_set(&g_tick_busy, 1)) return;
-    if ((g_tick++ % 10) == 0) do_patch_tick();
+
+    // 按时间节流，不受调用次数影响
+    static struct timespec last = {0, 0};
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double dt = (now.tv_sec - last.tv_sec) + (now.tv_nsec - last.tv_nsec) / 1e9;
+    if (dt >= 0.5) {
+        last = now;
+        do_patch_tick();
+    }
     __sync_lock_release(&g_tick_busy);
 }
 
