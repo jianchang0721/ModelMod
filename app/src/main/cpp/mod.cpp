@@ -832,8 +832,10 @@ static void probe_playerloop() {
             LOGI("FOUND %s in %s", names[k], g_api.image_get_name(img));
             void* iter = nullptr;
             const MethodInfo* m;
-            while ((m = g_api.class_get_methods(c, &iter))) {
+            int cnt = 0;
+            while ((m = g_api.class_get_methods(c, &iter)) && cnt < 20) {
                 LOGI("  M %s/%u", g_api.method_get_name(m), g_api.method_get_param_count(m));
+                cnt++;
             }
         }
     }
@@ -1245,8 +1247,9 @@ static void* worker(void*) {
     }
     if (!SMRCls) { LOGE("SkinnedMeshRenderer not found"); return nullptr; }
     LOGI("SkinnedMeshRenderer: %p", SMRCls);
-    dump_interesting_classes();
     probe_playerloop();
+    LOGI("probe done, idle (v36)");
+    return nullptr;
 
     if (MOD_MODE == 0) {
         LOGI("mode 0: fingerprint dump, every 10s");
