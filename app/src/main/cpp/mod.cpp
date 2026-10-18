@@ -976,36 +976,23 @@ static void do_patch_tick() {
 
     if (list.empty()) return;
 
+    // 不管 worker 是否已隐藏，前 3 个匹配的 SMR 直接造 cube（当前主线，安全）
     int done = 0;
     for (auto& f : list) {
-        if (done >= 2) break;
-        if (g_patched_meshes.count(f.smr)) continue;
+        if (done >= 1 || g_cube_done >= 3) break;
 
         for (int r = 0; r < RULE_COUNT; r++) {
             if (!rule_matches(g_rules[r], f)) continue;
 
-            LOGI("matched %s", f.chain.c_str());
-
-            if (g_setEnabled) {
-                uint8_t off = 0;
-                void* a[1] = { &off };
-                invoke_inst(g_setEnabled, f.smr, a);
-                LOGI("hidden ok");
-            }
-
-            // UnityMain 线程，直接造
-            if (g_cube_done < 3) {
-                g_cube_done++;
-                Il2CppObject* cb = spawn_cube_for(f.smr);
-                LOGI("main cube=%p", cb);
-            }
-
-            g_patched_meshes[f.smr] = 1;
+            g_cube_done++;
+            LOGI("cube: trying %s", f.chain.c_str());
+            Il2CppObject* cb = spawn_cube_for(f.smr);
+            LOGI("cube: result=%p", cb);
             done++;
             break;
         }
     }
-    if (done > 0) LOGI("tick done=%d total_scan=%zu", done, g_last_scan);
+    if (done > 0) LOGI("tick cube done=%d total=%zu", done, g_last_scan);
 }
 
 // 节流 + 防重入 + 只主线程执行
