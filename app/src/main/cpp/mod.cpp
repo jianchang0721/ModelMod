@@ -378,6 +378,8 @@ static bool bind_api(uintptr_t base) {
     B(thread_attach,             "il2cpp_thread_attach")
     B(assembly_get_image,        "il2cpp_assembly_get_image")
     B(image_get_name,            "il2cpp_image_get_name")
+    B(image_get_class_count,     "il2cpp_image_get_class_count")
+    B(image_get_class,           "il2cpp_image_get_class")
     B(class_from_name,           "il2cpp_class_from_name")
     B(class_get_name,            "il2cpp_class_get_name")
     B(class_get_parent,          "il2cpp_class_get_parent")
@@ -780,6 +782,38 @@ static long scan_count(Il2CppClass* cls) {
     void* a[1] = { g_api.type_get_object(g_api.class_get_type(cls)) };
     Il2CppArray* arr = (Il2CppArray*)invoke_static(f, a);
     return arr ? (long)arr->max_length : -102;
+}
+
+// 扫描全部 assembly/class，把名字带关键词的类全 dump 出来
+static void dump_interesting_classes() {
+    const char* keys[] = {"Model", "Char", "Hero", "Role", "Skin", "Avatar", "Fashion", "Dress", "Part"};
+    size_t n = 0;
+    const Il2CppAssembly** asms = g_api.domain_get_assemblies(g_domain, &n);
+    if (!asms) { LOGE("dump: no assemblies"); return; }
+
+    LOGI("dump: %zu assemblies", n);
+    int found = 0;
+    for (size_t i = 0; i < n; i++) {
+        Il2CppImage* img = g_api.assembly_get_image(asms[i]);
+        if (!img) continue;
+        size_t cn = g_api.image_get_class_count(img);
+        if (cn == 0) continue;
+        const char* imgName = g_api.image_get_name(img);
+        LOGI("dump: img %s classes=%zu", imgName ? imgName : "?", cn);
+        for (size_t j = 0; j < cn && found < 400; j++) {
+            Il2CppClass* c = g_api.image_get_class(img, j);
+            if (!c) continue;
+            const char* nm = g_api.class_get_name(c);
+            if (!nm) continue;
+            bool hit = false;
+            for (int k = 0; k < 9; k++) if (strstr(nm, keys[k])) { hit = true; break; }
+            if (!hit) continue;
+            const char* ns = g_api.class_get_namespace(c);
+            LOGI("CLASS %s.%s", ns ? ns : "", nm);
+            found++;
+        }
+    }
+    LOGI("dump: interesting=%d", found);
 }
 
 static void probe_types() {
@@ -1188,6 +1222,7 @@ static void* worker(void*) {
     }
     if (!SMRCls) { LOGE("SkinnedMeshRenderer not found"); return nullptr; }
     LOGI("SkinnedMeshRenderer: %p", SMRCls);
+    dump_interesting_classes();
 
     if (MOD_MODE == 0) {
         LOGI("mode 0: fingerprint dump, every 10s");

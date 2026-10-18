@@ -35,6 +35,8 @@ typedef const Il2CppAssembly**(*fn_domain_get_assemblies)(const Il2CppDomain*, s
 typedef Il2CppDomain*         (*fn_thread_attach)(Il2CppDomain*);
 typedef Il2CppImage*          (*fn_assembly_get_image)(const Il2CppAssembly*);
 typedef const char*           (*fn_image_get_name)(Il2CppImage*);
+typedef size_t                (*fn_image_get_class_count)(const Il2CppImage*);
+typedef Il2CppClass*          (*fn_image_get_class)(const Il2CppImage*, size_t);
 typedef Il2CppClass*          (*fn_class_from_name)(const Il2CppImage*, const char*, const char*);
 typedef const char*           (*fn_class_get_name)(Il2CppClass*);
 typedef Il2CppClass*          (*fn_class_get_parent)(Il2CppClass*);
@@ -58,6 +60,8 @@ struct Il2CppApi {
     fn_thread_attach             thread_attach;
     fn_assembly_get_image        assembly_get_image;
     fn_image_get_name            image_get_name;
+    fn_image_get_class_count     image_get_class_count;
+    fn_image_get_class           image_get_class;
     fn_class_from_name           class_from_name;
     fn_class_get_name            class_get_name;
     fn_class_get_parent          class_get_parent;
