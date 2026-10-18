@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/prctl.h>
 #include <time.h>
 #include <cstring>
 #include <cstdio>
@@ -61,6 +62,13 @@ static thread_local pid_t t_tid = 0;
 static pid_t cur_tid() {
     if (!t_tid) t_tid = (pid_t)syscall(__NR_gettid);
     return t_tid;
+}
+
+// UnityMain 线程的 tid 不等于 pid！只能靠线程名认
+static bool is_unity_main() {
+    char name[16] = {0};
+    if (prctl(PR_GET_NAME, name) != 0) return false;
+    return strncmp(name, "UnityMain", 9) == 0;
 }
 static std::string g_log_path;
 static FILE* g_log_fp = nullptr;
@@ -879,6 +887,13 @@ static void hk_canvasupdate(void* m) {
 static void* g_orig_setactive = nullptr;
 
 static void hk_setactive(void* self, void* m, uint8_t v) {
+    static int cnt = 0;
+    if (cnt < 10) {
+        cnt++;
+        char nm[16] = {0};
+        prctl(PR_GET_NAME, nm);
+        LOGI("setactive#%d tid=%d name=%s", cnt, (int)cur_tid(), nm);
+    }
     main_tick();
     ((void(*)(void*, void*, uint8_t))g_orig_setactive)(self, m, v);
 }
@@ -989,16 +1004,18 @@ static void do_patch_tick() {
 // 节流 + 防重入 + 只主线程执行
 static void main_tick() {
     pid_t tid = cur_tid();
-    bool isMain = (tid == getpid());
+    bool isMain = is_unity_main();
 
     static int tlog = 0;
     static int tmain = 0;
     if (isMain && tmain < 30) {
         tmain++;
-        LOGI("tick MAIN #%d cnt=%d", tmain, g_tick);
+        LOGI("tick MAIN #%d tid=%d cnt=%d", tmain, (int)tid, g_tick);
     }
     if (!isMain && (tlog++ % 500) == 0) {
-        LOGI("tick sub tid=%d cnt=%d", (int)tid, g_tick);
+        char nm[16] = {0};
+        prctl(PR_GET_NAME, nm);
+        LOGI("tick sub tid=%d name=%s cnt=%d", (int)tid, nm, g_tick);
     }
 
     if (!isMain) return;      // 非主线程不算数
