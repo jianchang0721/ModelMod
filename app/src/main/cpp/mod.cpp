@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdint>
@@ -773,8 +774,16 @@ static void do_patch_tick() {
     if (done > 0) LOGI("tick done=%d total_scan=%zu", done, g_last_scan);
 }
 
-// 节流 + 防重入
+static pid_t cur_tid() { return (pid_t)syscall(__NR_gettid); }
+
+// 节流 + 防重入 + 只主线程执行
 static void main_tick() {
+    static int tlog = 0;
+    if (!tlog) {
+        tlog = 1;
+        LOGI("tick thread: tid=%d pid=%d isMain=%d", (int)cur_tid(), (int)getpid(), cur_tid() == getpid());
+    }
+    if (cur_tid() != getpid()) return;      // 非主线程直接跳过，不在渲染线程摸 Unity API
     if (__sync_lock_test_and_set(&g_tick_busy, 1)) return;
     if ((g_tick++ % 60) == 0) do_patch_tick();
     __sync_lock_release(&g_tick_busy);
@@ -829,29 +838,27 @@ static bool install_hooks() {
     fn_init init = (fn_init)dlsym(sh, "shadowhook_init");
     if (init) LOGI("shadowhook_init -> %d", init(0, false));
 
+    bool ok = false;
+
     Il2CppClass* TimeCls = find_class_any("UnityEngine", "Time");
     if (TimeCls) {
         const MethodInfo* dm = find_method(TimeCls, "get_deltaTime", 0);
         if (dm) {
             void* o = try_hook(sh, *(void**)dm, (void*)hk_delta, "deltaTime");
-            if (o) { g_orig_delta = o; g_tick_mode = 1; return true; }
+            if (o) { g_orig_delta = o; g_tick_mode |= 1; ok = true; }
         }
-        const MethodInfo* tm = find_method(TimeCls, "get_time", 0);
-        if (tm) {
-            void* o = try_hook(sh, *(void**)tm, (void*)hk_delta, "time");
-            if (o) { g_orig_delta = o; g_tick_mode = 2; return true; }
-        }
-    } else {
-        LOGE("Time class missing");
     }
 
+    // 同时装 runtime_invoke 作为主力，两个都带线程检查
     void* inv = (void*)elf_sym(g_il2cpp_base, "il2cpp_runtime_invoke");
     LOGI("runtime_invoke addr=%p", inv);
     if (inv) {
         void* o = try_hook(sh, inv, (void*)hk_invoke, "runtime_invoke");
-        if (o) { g_orig_invoke = o; g_tick_mode = 3; return true; }
+        if (o) { g_orig_invoke = o; g_tick_mode |= 2; ok = true; }
     }
-    return false;
+
+    LOGI("hook mask=%d", g_tick_mode);
+    return ok;
 }
 
 // ================= 工作线程 =================
