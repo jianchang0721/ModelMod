@@ -817,6 +817,28 @@ static void dump_interesting_classes() {
     LOGI("dump: interesting=%d", found);
 }
 
+// Unity PlayerLoop 里的每帧钩子候选
+static void probe_playerloop() {
+    const char* names[] = {"UpdateAllSkinnedMeshes", "ParticleSystemBeginUpdateAll", "ParticleSystemEndUpdateAll"};
+    size_t n = 0;
+    const Il2CppAssembly** asms = g_api.domain_get_assemblies(g_domain, &n);
+    if (!asms) return;
+    for (size_t i = 0; i < n; i++) {
+        Il2CppImage* img = g_api.assembly_get_image(asms[i]);
+        if (!img) continue;
+        for (int k = 0; k < 3; k++) {
+            Il2CppClass* c = g_api.class_from_name(img, "", names[k]);
+            if (!c) continue;
+            LOGI("FOUND %s in %s", names[k], g_api.image_get_name(img));
+            void* iter = nullptr;
+            const MethodInfo* m;
+            while ((m = g_api.class_get_methods(c, &iter))) {
+                LOGI("  M %s/%u", g_api.method_get_name(m), g_api.method_get_param_count(m));
+            }
+        }
+    }
+}
+
 static void probe_types() {
     const char* names[] = {"GameObject", "Transform", "MonoBehaviour", "Camera",
                            "SkinnedMeshRenderer", "MeshRenderer", "Animator"};
@@ -1224,6 +1246,7 @@ static void* worker(void*) {
     if (!SMRCls) { LOGE("SkinnedMeshRenderer not found"); return nullptr; }
     LOGI("SkinnedMeshRenderer: %p", SMRCls);
     dump_interesting_classes();
+    probe_playerloop();
 
     if (MOD_MODE == 0) {
         LOGI("mode 0: fingerprint dump, every 10s");
