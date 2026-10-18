@@ -39,6 +39,7 @@ typedef size_t                (*fn_image_get_class_count)(const Il2CppImage*);
 typedef Il2CppClass*          (*fn_image_get_class)(const Il2CppImage*, size_t);
 typedef Il2CppClass*          (*fn_class_from_name)(const Il2CppImage*, const char*, const char*);
 typedef const char*           (*fn_class_get_name)(Il2CppClass*);
+typedef const char*           (*fn_class_get_namespace)(Il2CppClass*);
 typedef Il2CppClass*          (*fn_class_get_parent)(Il2CppClass*);
 typedef bool                  (*fn_class_is_assignable_from)(Il2CppClass*, Il2CppClass*);
 typedef const Il2CppType*     (*fn_class_get_type)(Il2CppClass*);
@@ -64,6 +65,7 @@ struct Il2CppApi {
     fn_image_get_class           image_get_class;
     fn_class_from_name           class_from_name;
     fn_class_get_name            class_get_name;
+    fn_class_get_namespace       class_get_namespace;
     fn_class_get_parent          class_get_parent;
     fn_class_is_assignable_from  class_is_assignable_from;
     fn_class_get_type            class_get_type;

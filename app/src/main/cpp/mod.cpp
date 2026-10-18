@@ -382,6 +382,7 @@ static bool bind_api(uintptr_t base) {
     B(image_get_class,           "il2cpp_image_get_class")
     B(class_from_name,           "il2cpp_class_from_name")
     B(class_get_name,            "il2cpp_class_get_name")
+    B(class_get_namespace,      "il2cpp_class_get_namespace")
     B(class_get_parent,          "il2cpp_class_get_parent")
     B(class_is_assignable_from,  "il2cpp_class_is_assignable_from")
     B(class_get_type,            "il2cpp_class_get_type")
