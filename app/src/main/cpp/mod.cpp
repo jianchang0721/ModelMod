@@ -3,6 +3,8 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <link.h>
+#include <elf.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <cstring>
 #include <cstdio>
@@ -220,21 +222,93 @@ static void dump_so_list() {
     LOGI("SO count %zu", seen.size());
 }
 
-static void* open_il2cpp() {
+// 从 /proc/self/maps 拿 so 的加载基址（最低地址那一段）
+static uintptr_t maps_base(const char* soname) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    char line[512];
+    uintptr_t base = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strstr(line, soname)) continue;
+        uintptr_t start = strtoull(line, nullptr, 16);
+        if (!base || start < base) base = start;
+    }
+    fclose(f);
+    return base;
+}
+
+// 自己解 ELF 的 dynsym，不靠 linker
+static uintptr_t elf_sym(uintptr_t base, const char* name) {
+    if (!base) return 0;
+    ElfW(Ehdr)* eh = (ElfW(Ehdr)*)base;
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) return 0;
+
+    uintptr_t dyn = 0;
+    ElfW(Phdr)* ph = (ElfW(Phdr)*)(base + eh->e_phoff);
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == PT_DYNAMIC) { dyn = base + ph[i].p_vaddr; break; }
+    }
+    if (!dyn) return 0;
+
+    uintptr_t symtab = 0, strtab = 0, hash = 0, gnu = 0;
+    for (ElfW(Dyn)* d = (ElfW(Dyn)*)dyn; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+            case DT_SYMTAB:   symtab = d->d_un.d_ptr; break;
+            case DT_STRTAB:   strtab = d->d_un.d_ptr; break;
+            case DT_HASH:     hash   = d->d_un.d_ptr; break;
+            case DT_GNU_HASH: gnu    = d->d_un.d_ptr; break;
+            default: break;
+        }
+    }
+    if (symtab < base) symtab += base;
+    if (strtab < base) strtab += base;
+    if (hash && hash < base) hash += base;
+    if (gnu && gnu < base) gnu += base;
+    if (!symtab || !strtab) return 0;
+
+    uint32_t nsym = 0;
+    if (hash) {
+        nsym = ((uint32_t*)hash)[1];
+    } else if (gnu) {
+        uint32_t* g = (uint32_t*)gnu;
+        uint32_t nbuckets = g[0], symoffset = g[1], bloom = g[2];
+        uint32_t* buckets = &g[4 + bloom * 2];
+        uint32_t* chain = &buckets[nbuckets];
+        uint32_t last = 0;
+        for (uint32_t i = 0; i < nbuckets; i++) if (buckets[i] > last) last = buckets[i];
+        if (last >= symoffset) {
+            while (!(chain[last - symoffset] & 1)) last++;
+            nsym = last + 1;
+        }
+    }
+    if (!nsym) return 0;
+
+    ElfW(Sym)* syms = (ElfW(Sym)*)symtab;
+    const char* strs = (const char*)strtab;
+    for (uint32_t i = 0; i < nsym; i++) {
+        if (syms[i].st_name == 0) continue;
+        if (strcmp(strs + syms[i].st_name, name) == 0) {
+            return base + syms[i].st_value;
+        }
+    }
+    return 0;
+}
+
+static uintptr_t wait_il2cpp() {
     for (int i = 0; ; i++) {
-        void* h = try_noload();
-        if (!h) h = try_phdr();
-        if (!h) h = try_maps();
-        if (h) { LOGI("libil2cpp found after %d tries", i); return h; }
+        uintptr_t base = maps_base("libil2cpp.so");
+        if (base) {
+            LOGI("libil2cpp base 0x%lx after %d tries", (unsigned long)base, i);
+            return base;
+        }
         if (i == 300) { LOGI("30s passed, dumping so list"); dump_so_list(); }
-        if (i == 3000) { LOGI("300s passed, giving up dump"); dump_so_list(); }
         usleep(100 * 1000);
     }
 }
 
-static bool bind_api(void* h) {
+static bool bind_api(uintptr_t base) {
 #define B(field, name) \
-    g_api.field = (decltype(g_api.field))dlsym(h, name); \
+    g_api.field = (decltype(g_api.field))elf_sym(base, name); \
     if (!g_api.field) { LOGE("missing symbol: %s", name); return false; }
 
     B(domain_get,                "il2cpp_domain_get")
@@ -494,10 +568,10 @@ static void* worker(void*) {
         return nullptr;
     }
 
-    void* h = open_il2cpp();
-    if (!h) { LOGE("libil2cpp.so not found"); return nullptr; }
-    LOGI("libil2cpp.so ready: %p", h);
-    if (!bind_api(h)) return nullptr;
+    uintptr_t base = wait_il2cpp();
+    if (!base) { LOGE("libil2cpp.so not found"); return nullptr; }
+    if (!bind_api(base)) return nullptr;
+    LOGI("api bound, base 0x%lx", (unsigned long)base);
 
     for (int i = 0; i < 3000 && !g_domain; i++) {
         g_domain = g_api.domain_get();
