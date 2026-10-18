@@ -861,6 +861,7 @@ static int g_cube_done = 0;
 static long g_lastGO = -1;
 
 // Instantiate hook：在主线程创建对象时插一脚
+static void* g_orig_canvas = nullptr;
 static void* g_orig_inst1 = nullptr;
 static void* g_orig_inst2 = nullptr;
 static int g_inst_hits = 0;
@@ -868,6 +869,11 @@ static std::vector<Il2CppObject*> g_smr_queue;
 static pthread_mutex_t g_qmtx = PTHREAD_MUTEX_INITIALIZER;
 static void try_patch_in_main();
 static long g_lastSMR = -1;
+
+static void hk_canvasupdate(void* m) {
+    main_tick();
+    ((void(*)(void*))g_orig_canvas)(m);
+}
 
 static void try_patch_in_main() {
     std::vector<Il2CppObject*> q;
@@ -1253,9 +1259,35 @@ static void* worker(void*) {
     }
     if (!SMRCls) { LOGE("SkinnedMeshRenderer not found"); return nullptr; }
     LOGI("SkinnedMeshRenderer: %p", SMRCls);
-    probe_playerloop();
-    LOGI("probe done, idle (v36)");
-    return nullptr;
+
+    // UGUI 每帧必调的 CanvasUpdateRegistry.PerformUpdate（主线程）
+    {
+        Il2CppClass* CU = find_class_any("UnityEngine.UI", "CanvasUpdateRegistry");
+        if (CU) {
+            LOGI("found CanvasUpdateRegistry");
+            void* it = nullptr;
+            const MethodInfo* mm;
+            int cnt = 0;
+            while ((mm = g_api.class_get_methods(CU, &it)) && cnt < 30) {
+                LOGI("  M %s/%u", g_api.method_get_name(mm), g_api.method_get_param_count(mm));
+                cnt++;
+            }
+            const MethodInfo* pu = find_method(CU, "PerformUpdate", 0);
+            LOGI("PerformUpdate=%p", (void*)pu);
+            if (pu) {
+                void* sh = load_so_by_name("libshadowhook.so");
+                if (sh) {
+                    typedef int (*fn_init)(int, bool);
+                    fn_init init = (fn_init)dlsym(sh, "shadowhook_init");
+                    if (init) init(0, false);
+                    void* o = try_hook(sh, *(void**)pu, (void*)hk_canvasupdate, "CanvasUpdate");
+                    if (o) { g_orig_canvas = o; LOGI("canvas hook ok"); }
+                }
+            }
+        } else {
+            LOGE("no CanvasUpdateRegistry");
+        }
+    }
 
     if (MOD_MODE == 0) {
         LOGI("mode 0: fingerprint dump, every 10s");
