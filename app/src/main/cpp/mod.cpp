@@ -826,16 +826,22 @@ static void probe_playerloop() {
     for (size_t i = 0; i < n; i++) {
         Il2CppImage* img = g_api.assembly_get_image(asms[i]);
         if (!img) continue;
-        for (int k = 0; k < 3; k++) {
-            Il2CppClass* c = g_api.class_from_name(img, "", names[k]);
+        size_t cn = g_api.image_get_class_count(img);
+        for (size_t j = 0; j < cn; j++) {
+            Il2CppClass* c = g_api.image_get_class(img, j);
             if (!c) continue;
-            LOGI("FOUND %s in %s", names[k], g_api.image_get_name(img));
-            void* iter = nullptr;
-            const MethodInfo* m;
-            int cnt = 0;
-            while ((m = g_api.class_get_methods(c, &iter)) && cnt < 20) {
-                LOGI("  M %s/%u", g_api.method_get_name(m), g_api.method_get_param_count(m));
-                cnt++;
+            const char* nm = g_api.class_get_name(c);
+            if (!nm) continue;
+            for (int k = 0; k < 3; k++) {
+                if (strcmp(nm, names[k]) != 0) continue;
+                LOGI("FOUND %s in %s", nm, g_api.image_get_name(img));
+                void* iter = nullptr;
+                const MethodInfo* m;
+                int cnt = 0;
+                while ((m = g_api.class_get_methods(c, &iter)) && cnt < 20) {
+                    LOGI("  M %s/%u", g_api.method_get_name(m), g_api.method_get_param_count(m));
+                    cnt++;
+                }
             }
         }
     }
