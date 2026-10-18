@@ -592,6 +592,25 @@ static void* worker(void*) {
     if (!g_domain) { LOGE("domain timeout"); return nullptr; }
     LOGI("domain ready: %p", g_domain);
 
+    // domain 存在 != 初始化完了。等 assemblies 真正就绪，threadPool 才建好，
+    // 否则 Thread::Attach 里 assert(g_Domain->threadPool != NULL) 直接 abort
+    {
+        int waited = 0;
+        for (;;) {
+            size_t n = 0;
+            const Il2CppAssembly** asms = g_api.domain_get_assemblies(g_domain, &n);
+            if (asms && n > 0) {
+                LOGI("assemblies ready: %zu", n);
+                break;
+            }
+            if (waited % 50 == 0) LOGI("waiting assemblies %d ms", waited * 100);
+            usleep(100 * 1000);
+            if (++waited > 600) { LOGE("assemblies timeout, abort mission"); return nullptr; }
+        }
+    }
+    sleep(3);
+    LOGI("proceeding to thread attach");
+
     // 先挂 JNI，il2cpp 的 Thread::Attach 内部要拿 JNIEnv，没有就 assert -> abort
     if (g_vm) {
         JNIEnv* env = nullptr;
@@ -654,7 +673,14 @@ extern "C" jint JNI_OnLoad(JavaVM* vm, void*) {
     g_vm = vm;
     LOGI("JNI_OnLoad entered");
     pthread_t t;
-    pthread_create(&t, nullptr, worker, nullptr);
-    pthread_detach(t);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+    if (pthread_create(&t, &attr, worker, nullptr) == 0) {
+        pthread_detach(t);
+    } else {
+        LOGE("pthread_create failed");
+    }
+    pthread_attr_destroy(&attr);
     return JNI_VERSION_1_6;
 }
