@@ -731,28 +731,46 @@ static volatile int g_tick_busy = 0;
 static int g_tick_mode = 0;   // 1=deltaTime 2=time 3=runtime_invoke
 
 static void do_patch_tick() {
-    std::vector<PendingItem> work;
-    pthread_mutex_lock(&g_pending_mtx);
-    work.swap(g_pending);
-    pthread_mutex_unlock(&g_pending_mtx);
+    if (!g_tick_inited) {
+        g_tick_inited = true;
+        g_smrCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+        LOGI("tick init: smr=%p setEnabled=%p", g_smrCls, g_setEnabled);
+    }
+    if (!g_smrCls) return;
 
-    if (work.empty()) return;
+    std::vector<Fingerprint> list;
+    collect_fingerprints(g_smrCls, list);
+    g_last_scan = list.size();
+
+    static int dt = 0;
+    if (list.empty()) {
+        if ((dt++ % 10) == 0) LOGI("tick: smrs=0 waiting");
+        return;
+    }
 
     int done = 0;
-    for (auto& it : work) {
-        if (g_patched_meshes.count(it.smr)) continue;
+    for (auto& f : list) {
+        if (done >= 2) break;
+        if (g_patched_meshes.count(f.smr)) continue;
 
-        if (g_setEnabled) {
-            uint8_t off = 0;
-            void* a[1] = { &off };
-            invoke_inst(g_setEnabled, it.smr, a);
+        for (int r = 0; r < RULE_COUNT; r++) {
+            if (!rule_matches(g_rules[r], f)) continue;
+
+            LOGI("matched %s", f.chain.c_str());
+
+            if (g_setEnabled) {
+                uint8_t off = 0;
+                void* a[1] = { &off };
+                invoke_inst(g_setEnabled, f.smr, a);
+                LOGI("hidden ok");
+            }
+
+            g_patched_meshes[f.smr] = 1;
+            done++;
+            break;
         }
-
-        Il2CppObject* cube = spawn_cube_for(it.smr);
-        g_patched_meshes[it.smr] = 1;
-        LOGI("replaced %s smr=%p cube=%p", it.chain.c_str(), it.smr, cube);
-        if (++done >= 4) break;   // 单帧最多 4 个，防卡顿
     }
+    if (done > 0) LOGI("tick done=%d total_scan=%zu", done, g_last_scan);
 }
 
 // 节流 + 防重入
@@ -955,32 +973,8 @@ static void* worker(void*) {
     g_smrCls = SMRCls;
 
     if (install_hooks()) {
-        LOGI("main-thread tick ready, mode=%d; worker -> read-only scan", g_tick_mode);
-        while (true) {
-            std::vector<Fingerprint> list;
-            collect_fingerprints(SMRCls, list);
-
-            std::vector<PendingItem> batch;
-            for (auto& f : list) {
-                for (int r = 0; r < RULE_COUNT; r++) {
-                    if (rule_matches(g_rules[r], f)) {
-                        batch.push_back({f.smr, f.chain});
-                        break;
-                    }
-                }
-            }
-
-            size_t pend;
-            pthread_mutex_lock(&g_pending_mtx);
-            if (!batch.empty()) g_pending = batch;
-            pend = g_pending.size();
-            pthread_mutex_unlock(&g_pending_mtx);
-
-            static int sc = 0;
-            if ((sc++ % 3) == 0)
-                LOGI("scan: smrs=%zu matched=%zu pending=%zu", list.size(), batch.size(), pend);
-            sleep(2);
-        }
+        LOGI("main-thread tick ready, mode=%d, worker exits", g_tick_mode);
+        return nullptr;
     }
 
     LOGE("all hooks failed, staying idle (no off-thread Unity calls)");
