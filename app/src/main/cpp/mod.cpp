@@ -745,7 +745,7 @@ static void do_patch_tick() {
 
     static int dt = 0;
     if (list.empty()) {
-        if ((dt++ % 10) == 0) LOGI("tick: smrs=0 waiting");
+        if ((dt++ % 5) == 0) LOGI("tick: smrs=0 waiting (%d)", dt);
         return;
     }
 
@@ -778,14 +778,17 @@ static pid_t cur_tid() { return (pid_t)syscall(__NR_gettid); }
 
 // 节流 + 防重入 + 只主线程执行
 static void main_tick() {
+    pid_t tid = cur_tid();
+    bool isMain = (tid == getpid());
+
     static int tlog = 0;
-    if (!tlog) {
-        tlog = 1;
-        LOGI("tick thread: tid=%d pid=%d isMain=%d", (int)cur_tid(), (int)getpid(), cur_tid() == getpid());
+    if ((tlog++ % 200) == 0) {
+        LOGI("tick tid=%d main=%d cnt=%d", (int)tid, (int)isMain, g_tick);
     }
-    if (cur_tid() != getpid()) return;      // 非主线程直接跳过，不在渲染线程摸 Unity API
+
+    if (!isMain) return;      // 非主线程不算数
     if (__sync_lock_test_and_set(&g_tick_busy, 1)) return;
-    if ((g_tick++ % 60) == 0) do_patch_tick();
+    if ((g_tick++ % 10) == 0) do_patch_tick();
     __sync_lock_release(&g_tick_busy);
 }
 
