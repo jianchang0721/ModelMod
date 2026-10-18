@@ -43,6 +43,8 @@ typedef const Il2CppType*     (*fn_class_get_type)(Il2CppClass*);
 typedef const MethodInfo*     (*fn_class_get_methods)(Il2CppClass*, void**);
 typedef const char*           (*fn_method_get_name)(const MethodInfo*);
 typedef uint32_t              (*fn_method_get_param_count)(const MethodInfo*);
+typedef const Il2CppType*     (*fn_method_get_param)(const MethodInfo*, uint32_t);
+typedef Il2CppClass*          (*fn_class_from_type)(const Il2CppType*);
 typedef Il2CppObject*         (*fn_runtime_invoke)(const MethodInfo*, void*, void**, Il2CppException**);
 typedef Il2CppString*         (*fn_string_new)(const char*);
 typedef Il2CppObject*         (*fn_object_new)(Il2CppClass*);
@@ -64,6 +66,8 @@ struct Il2CppApi {
     fn_class_get_methods         class_get_methods;
     fn_method_get_name           method_get_name;
     fn_method_get_param_count    method_get_param_count;
+    fn_method_get_param          method_get_param;
+    fn_class_from_type           class_from_type;
     fn_runtime_invoke            runtime_invoke;
     fn_string_new                string_new;
     fn_object_new                object_new;

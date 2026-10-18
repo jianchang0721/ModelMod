@@ -107,6 +107,23 @@ static const MethodInfo* find_method(Il2CppClass* klass, const char* name, int a
     return nullptr;
 }
 
+static void dump_class_methods(Il2CppClass* klass) {
+    int total = 0;
+    for (Il2CppClass* k = klass; k; k = g_api.class_get_parent(k)) {
+        LOGI("--- class %s ---", g_api.class_get_name(k));
+        void* iter = nullptr;
+        const MethodInfo* m;
+        int n = 0;
+        while ((m = g_api.class_get_methods(k, &iter))) {
+            const char* nm = g_api.method_get_name(m);
+            LOGI("  %s/%u", nm ? nm : "?", g_api.method_get_param_count(m));
+            if (++n > 80) break;
+        }
+        total += n;
+    }
+    LOGI("total methods dumped: %d", total);
+}
+
 static Il2CppObject* invoke_static(const MethodInfo* m, void** args) {
     if (!m) return nullptr;
     Il2CppException* exc = nullptr;
@@ -341,6 +358,8 @@ static bool bind_api(uintptr_t base) {
     B(class_get_methods,         "il2cpp_class_get_methods")
     B(method_get_name,           "il2cpp_method_get_name")
     B(method_get_param_count,    "il2cpp_method_get_param_count")
+    B(method_get_param,          "il2cpp_method_get_param")
+    B(class_from_type,           "il2cpp_class_from_type")
     B(runtime_invoke,            "il2cpp_runtime_invoke")
     B(string_new,                "il2cpp_string_new")
     B(object_new,                "il2cpp_object_new")
@@ -676,8 +695,41 @@ static void* worker(void*) {
     }
 
     LOGI("mode 1: targeted swap");
+
     const MethodInfo* setMesh = find_method(SMRCls, "set_sharedMesh", 1);
-    if (!setMesh) { LOGE("set_sharedMesh not found"); return nullptr; }
+    if (setMesh) LOGI("setter by name: set_sharedMesh");
+
+    if (!setMesh) {
+        setMesh = find_method(SMRCls, "set_mesh", 1);
+        if (setMesh) LOGI("setter by name: set_mesh");
+    }
+
+    if (!setMesh) {
+        // 按签名找：1 个参数，类型是 UnityEngine.Mesh
+        Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
+        LOGI("fallback by signature, MeshCls=%p", MeshCls);
+        for (Il2CppClass* k = SMRCls; k && !setMesh; k = g_api.class_get_parent(k)) {
+            void* iter = nullptr;
+            const MethodInfo* m;
+            while ((m = g_api.class_get_methods(k, &iter))) {
+                if (g_api.method_get_param_count(m) != 1) continue;
+                const Il2CppType* pt = g_api.method_get_param(m, 0);
+                if (!pt) continue;
+                Il2CppClass* pc = g_api.class_from_type(pt);
+                if (pc && pc == MeshCls) {
+                    LOGI("setter by signature: %s", g_api.method_get_name(m));
+                    setMesh = m;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!setMesh) {
+        LOGE("no mesh setter found, dumping class methods");
+        dump_class_methods(SMRCls);
+        return nullptr;
+    }
 
     while (true) {
         int n = patch_scene_targeted(SMRCls, setMesh, 8);
