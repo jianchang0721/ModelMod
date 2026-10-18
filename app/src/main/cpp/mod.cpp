@@ -704,12 +704,15 @@ static int patch_scene_targeted(Il2CppClass* SMRCls, const MethodInfo* setMesh, 
 }
 
 // ================= 主线程 hook =================
-// 改 MethodInfo->methodPointer，不动代码段，CRC 校验扫不到
 static void* g_orig_delta = nullptr;
+static void* g_orig_invoke = nullptr;
 static int g_tick = 0;
 static bool g_tick_inited = false;
 static Il2CppClass* g_smrCls = nullptr;
 static const MethodInfo* g_setMeshMI = nullptr;
+static uintptr_t g_il2cpp_base = 0;
+static volatile int g_tick_busy = 0;
+static int g_tick_mode = 0;   // 1=deltaTime 2=time 3=runtime_invoke
 
 static void do_patch_tick() {
     if (!g_tick_inited) {
@@ -731,10 +734,22 @@ static void do_patch_tick() {
     if (n > 0) LOGI("tick swapped %d", n);
 }
 
+// 节流 + 防重入
+static void main_tick() {
+    if (__sync_lock_test_and_set(&g_tick_busy, 1)) return;
+    if ((g_tick++ % 60) == 0) do_patch_tick();
+    __sync_lock_release(&g_tick_busy);
+}
+
 // get_deltaTime 是静态方法，AOT 签名 (MethodInfo* method)
 static float hk_delta(void* method) {
-    if ((g_tick++ % 30) == 0) do_patch_tick();
+    main_tick();
     return ((float(*)(void*))g_orig_delta)(method);
+}
+
+static Il2CppObject* hk_invoke(const MethodInfo* m, void* obj, void** args, Il2CppException** exc) {
+    main_tick();
+    return ((Il2CppObject*(*)(const MethodInfo*, void*, void**, Il2CppException**))g_orig_invoke)(m, obj, args, exc);
 }
 
 static void* load_so_by_name(const char* soname) {
@@ -756,32 +771,48 @@ static void* load_so_by_name(const char* soname) {
     return dlopen(path, RTLD_NOW);
 }
 
-static bool install_time_hook() {
-    Il2CppClass* TimeCls = find_class_any("UnityEngine", "Time");
-    if (!TimeCls) { LOGE("Time class missing"); return false; }
-    const MethodInfo* m = find_method(TimeCls, "get_deltaTime", 0);
-    if (!m) { LOGE("get_deltaTime missing"); return false; }
+static void* try_hook(void* sh, void* code, void* handler, const char* label) {
+    typedef void* (*fn_hook)(void*, void*, void**);
+    fn_hook h = (fn_hook)dlsym(sh, "shadowhook_hook_func_addr");
+    if (!h) { LOGE("hook sym missing"); return nullptr; }
+    void* orig = nullptr;
+    void* stub = h(code, handler, &orig);
+    LOGI("hook %s: code=%p stub=%p orig=%p", label, code, stub, orig);
+    return (stub && orig) ? orig : nullptr;
+}
 
-    void* code = *(void**)m;
-    if (!code) { LOGE("methodPointer null"); return false; }
-    LOGI("deltaTime code=%p", code);
-
+static bool install_hooks() {
     void* sh = load_so_by_name("libshadowhook.so");
     if (!sh) { LOGE("libshadowhook.so not found"); return false; }
     LOGI("shadowhook handle=%p", sh);
 
-    typedef int (*fn_hook)(void*, void*, void**);
-    fn_hook hook = (fn_hook)dlsym(sh, "shadowhook_hook_func_addr");
-    if (!hook) { LOGE("shadowhook_hook_func_addr missing"); return false; }
+    typedef int (*fn_init)(int, bool);
+    fn_init init = (fn_init)dlsym(sh, "shadowhook_init");
+    if (init) LOGI("shadowhook_init -> %d", init(0, false));
 
-    void* orig = nullptr;
-    int ret = hook(code, (void*)hk_delta, &orig);
-    LOGI("shadowhook ret=%d orig=%p", ret, orig);
-    if (!orig) { LOGE("inline hook failed"); return false; }
+    Il2CppClass* TimeCls = find_class_any("UnityEngine", "Time");
+    if (TimeCls) {
+        const MethodInfo* dm = find_method(TimeCls, "get_deltaTime", 0);
+        if (dm) {
+            void* o = try_hook(sh, *(void**)dm, (void*)hk_delta, "deltaTime");
+            if (o) { g_orig_delta = o; g_tick_mode = 1; return true; }
+        }
+        const MethodInfo* tm = find_method(TimeCls, "get_time", 0);
+        if (tm) {
+            void* o = try_hook(sh, *(void**)tm, (void*)hk_delta, "time");
+            if (o) { g_orig_delta = o; g_tick_mode = 2; return true; }
+        }
+    } else {
+        LOGE("Time class missing");
+    }
 
-    g_orig_delta = orig;
-    LOGI("inline hook ok");
-    return true;
+    void* inv = (void*)elf_sym(g_il2cpp_base, "il2cpp_runtime_invoke");
+    LOGI("runtime_invoke addr=%p", inv);
+    if (inv) {
+        void* o = try_hook(sh, inv, (void*)hk_invoke, "runtime_invoke");
+        if (o) { g_orig_invoke = o; g_tick_mode = 3; return true; }
+    }
+    return false;
 }
 
 // ================= 工作线程 =================
@@ -797,6 +828,7 @@ static void* worker(void*) {
     }
 
     uintptr_t base = wait_il2cpp();
+    g_il2cpp_base = base;
     if (!base) { LOGE("libil2cpp.so not found"); return nullptr; }
     if (!bind_api(base)) return nullptr;
     LOGI("api bound, base 0x%lx", (unsigned long)base);
@@ -899,17 +931,12 @@ static void* worker(void*) {
         LOGI("hide mode, set_enabled=%p", (void*)g_setEnabled);
     }
 
-    if (install_time_hook()) {
-        LOGI("main-thread hook installed, worker exits");
+    if (install_hooks()) {
+        LOGI("main-thread tick ready, mode=%d, worker exits", g_tick_mode);
         return nullptr;
     }
 
-    LOGE("hook failed, polling fallback (Unity API off main thread)");
-    while (true) {
-        int n = patch_scene_targeted(SMRCls, setMesh, 8);
-        if (n > 0) LOGI("round swapped %d", n);
-        sleep(2);
-    }
+    LOGE("all hooks failed, staying idle (no off-thread Unity calls)");
     return nullptr;
 }
 
