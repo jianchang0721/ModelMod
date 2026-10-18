@@ -56,6 +56,12 @@ static const int RULE_COUNT = (int)(sizeof(g_rules) / sizeof(g_rules[0]));
 Il2CppApi g_api{};
 static JavaVM* g_vm = nullptr;
 static Il2CppDomain* g_domain = nullptr;
+
+static thread_local pid_t t_tid = 0;
+static pid_t cur_tid() {
+    if (!t_tid) t_tid = (pid_t)syscall(__NR_gettid);
+    return t_tid;
+}
 static std::string g_log_path;
 static FILE* g_log_fp = nullptr;
 static std::map<std::string, Il2CppObject*> g_mesh_cache;
@@ -899,12 +905,6 @@ static void do_patch_tick() {
         }
     }
     if (done > 0) LOGI("tick done=%d total_scan=%zu", done, g_last_scan);
-}
-
-static thread_local pid_t t_tid = 0;
-static pid_t cur_tid() {
-    if (!t_tid) t_tid = (pid_t)syscall(__NR_gettid);
-    return t_tid;
 }
 
 // 节流 + 防重入 + 只主线程执行
