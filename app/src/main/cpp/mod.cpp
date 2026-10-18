@@ -269,14 +269,21 @@ static uintptr_t maps_base(const char* soname) {
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f) return 0;
     char line[512];
-    uintptr_t base = 0;
+    uintptr_t addrs[64];
+    int n = 0;
     while (fgets(line, sizeof(line), f)) {
         if (!strstr(line, soname)) continue;
         uintptr_t start = strtoull(line, nullptr, 16);
-        if (!base || start < base) base = start;
+        if (n < 64) addrs[n++] = start;
     }
     fclose(f);
-    return base;
+    uintptr_t lowest = 0;
+    for (int i = 0; i < n; i++) {
+        uint8_t* p = (uint8_t*)addrs[i];
+        if (p[0] == 0x7f && p[1] == 'E' && p[2] == 'L' && p[3] == 'F') return addrs[i];
+        if (!lowest || addrs[i] < lowest) lowest = addrs[i];
+    }
+    return lowest;
 }
 
 // 自己解 ELF 的 dynsym，不靠 linker
@@ -757,11 +764,32 @@ static uintptr_t g_il2cpp_base = 0;
 static volatile int g_tick_busy = 0;
 static int g_tick_mode = 0;   // 1=deltaTime 2=time 3=runtime_invoke
 
+static long scan_count(Il2CppClass* cls) {
+    Il2CppClass* ObjCls = find_class_any("UnityEngine", "Object");
+    if (!ObjCls) return -100;
+    const MethodInfo* f = find_method(ObjCls, "FindObjectsOfType", 1);
+    if (!f) return -101;
+    void* a[1] = { g_api.type_get_object(g_api.class_get_type(cls)) };
+    Il2CppArray* arr = (Il2CppArray*)invoke_static(f, a);
+    return arr ? (long)arr->max_length : -102;
+}
+
+static void probe_types() {
+    const char* names[] = {"GameObject", "Transform", "MonoBehaviour", "Camera",
+                           "SkinnedMeshRenderer", "MeshRenderer", "Animator"};
+    for (int i = 0; i < 7; i++) {
+        Il2CppClass* c = find_class_any("UnityEngine", names[i]);
+        if (!c) { LOGI("probe %-20s: class null", names[i]); continue; }
+        LOGI("probe %-20s: len=%ld", names[i], scan_count(c));
+    }
+}
+
 static void do_patch_tick() {
     if (!g_tick_inited) {
         g_tick_inited = true;
         g_smrCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
         LOGI("tick init: smr=%p setEnabled=%p", g_smrCls, g_setEnabled);
+        probe_types();
     }
     if (!g_smrCls) return;
 
