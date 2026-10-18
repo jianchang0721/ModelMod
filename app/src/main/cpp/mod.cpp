@@ -6,6 +6,7 @@
 #include <elf.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdint>
@@ -702,6 +703,59 @@ static int patch_scene_targeted(Il2CppClass* SMRCls, const MethodInfo* setMesh, 
     return done;
 }
 
+// ================= 主线程 hook =================
+// 改 MethodInfo->methodPointer，不动代码段，CRC 校验扫不到
+static void* g_orig_delta = nullptr;
+static int g_tick = 0;
+static bool g_tick_inited = false;
+static Il2CppClass* g_smrCls = nullptr;
+static const MethodInfo* g_setMeshMI = nullptr;
+
+static void do_patch_tick() {
+    if (!g_tick_inited) {
+        g_tick_inited = true;
+        g_smrCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+        if (g_smrCls) {
+            g_setMeshMI = find_method(g_smrCls, "set_sharedMesh", 1);
+            if (!g_setMeshMI) {
+                g_inplace_mode = true;
+                Il2CppClass* RendererC = find_class_any("UnityEngine", "Renderer");
+                g_setEnabled = find_method(RendererC, "set_enabled", 1);
+            }
+        }
+        LOGI("tick init: smr=%p setMesh=%p inplace=%d setEnabled=%p",
+             g_smrCls, g_setMeshMI, (int)g_inplace_mode, g_setEnabled);
+    }
+    if (!g_smrCls) return;
+    int n = patch_scene_targeted(g_smrCls, g_setMeshMI, 2);
+    if (n > 0) LOGI("tick swapped %d", n);
+}
+
+static float hk_delta(const MethodInfo* m, void* self) {
+    if ((g_tick++ % 30) == 0) do_patch_tick();
+    return ((float(*)(const MethodInfo*, void*))g_orig_delta)(m, self);
+}
+
+static bool install_time_hook() {
+    Il2CppClass* TimeCls = find_class_any("UnityEngine", "Time");
+    if (!TimeCls) { LOGE("Time class missing"); return false; }
+    const MethodInfo* m = find_method(TimeCls, "get_deltaTime", 0);
+    if (!m) { LOGE("get_deltaTime missing"); return false; }
+
+    void** pp = (void**)m;
+    void* orig = *pp;
+    if (!orig) { LOGE("methodPointer null"); return false; }
+
+    uintptr_t page = (uintptr_t)pp & ~(uintptr_t)0xFFF;
+    if (mprotect((void*)page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        LOGE("mprotect failed");
+    }
+    g_orig_delta = orig;
+    *pp = (void*)hk_delta;
+    LOGI("hooked Time.get_deltaTime mi=%p orig=%p hk=%p", m, orig, (void*)hk_delta);
+    return true;
+}
+
 // ================= 工作线程 =================
 static void* worker(void*) {
     // 等 Java 层把日志路径传过来，最多等 2 秒
@@ -817,6 +871,12 @@ static void* worker(void*) {
         LOGI("hide mode, set_enabled=%p", (void*)g_setEnabled);
     }
 
+    if (install_time_hook()) {
+        LOGI("main-thread hook installed, worker exits");
+        return nullptr;
+    }
+
+    LOGE("hook failed, polling fallback (Unity API off main thread)");
     while (true) {
         int n = patch_scene_targeted(SMRCls, setMesh, 8);
         if (n > 0) LOGI("round swapped %d", n);
