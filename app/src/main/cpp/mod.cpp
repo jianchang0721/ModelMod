@@ -993,6 +993,13 @@ static void do_patch_tick() {
                 LOGI("hidden ok");
             }
 
+            // UnityMain 线程，直接造
+            if (g_cube_done < 3) {
+                g_cube_done++;
+                Il2CppObject* cb = spawn_cube_for(f.smr);
+                LOGI("main cube=%p", cb);
+            }
+
             g_patched_meshes[f.smr] = 1;
             done++;
             break;
