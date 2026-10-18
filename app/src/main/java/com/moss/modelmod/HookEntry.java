@@ -12,6 +12,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class HookEntry implements IXposedHookLoadPackage {
 
+    private static native void setLogPath(String path);
+
     private static final String TAG    = "[ModelMod] ";
     private static final String TARGET = "com.hermes.h1game";
     private static final String SELF   = "com.moss.modelmod";
@@ -41,6 +43,10 @@ public class HookEntry implements IXposedHookLoadPackage {
             String so = ai.nativeLibraryDir + "/libmodelmod.so";
             System.load(so);
             XposedBridge.log(TAG + "native loaded: " + so);
+
+            String logPath = new java.io.File(ctx.getFilesDir(), "modelmod.log").getAbsolutePath();
+            setLogPath(logPath);
+            XposedBridge.log(TAG + "log path: " + logPath);
         } catch (Throwable t) {
             XposedBridge.log(TAG + "native load failed: " + t);
         }

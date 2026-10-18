@@ -48,17 +48,18 @@ static const int RULE_COUNT = (int)(sizeof(g_rules) / sizeof(g_rules[0]));
 Il2CppApi g_api{};
 static JavaVM* g_vm = nullptr;
 static Il2CppDomain* g_domain = nullptr;
+static std::string g_log_path;
+static FILE* g_log_fp = nullptr;
 static std::map<std::string, Il2CppObject*> g_mesh_cache;
 
-// 日志同时落盘，手机直接用文件管理器看
+// 日志同时落盘，路径由 Java 层 getFilesDir() 传过来
 static FILE* log_fp() {
-    static FILE* fp = []() -> FILE* {
-        FILE* f = fopen("/data/data/com.hermes.h1game/files/modelmod.log", "a");
-        if (!f) f = fopen("/sdcard/Android/data/com.hermes.h1game/files/modelmod.log", "a");
-        if (!f) f = fopen("/data/local/tmp/modelmod.log", "a");
-        return f;
-    }();
-    return fp;
+    if (g_log_fp) return g_log_fp;
+    if (!g_log_path.empty()) {
+        g_log_fp = fopen(g_log_path.c_str(), "a");
+        if (g_log_fp) return g_log_fp;
+    }
+    return nullptr;
 }
 
 static void flog(const char* fmt, ...) {
@@ -283,12 +284,19 @@ static uintptr_t elf_sym(uintptr_t base, const char* name) {
         }
     }
     if (!nsym) return 0;
+    if (nsym > 200000) nsym = 200000;   // 防越界，il2cpp 大约十几万个符号
 
     ElfW(Sym)* syms = (ElfW(Sym)*)symtab;
     const char* strs = (const char*)strtab;
+    size_t nameLen = strlen(name);
     for (uint32_t i = 0; i < nsym; i++) {
-        if (syms[i].st_name == 0) continue;
-        if (strcmp(strs + syms[i].st_name, name) == 0) {
+        uint32_t off = syms[i].st_name;
+        if (off == 0 || off > 0xFFFFFF) continue;
+        const char* s = strs + off;
+        // 自己逐字节比，不用 strcmp，避开 bionic fortify 的 __strcmp_chk
+        size_t k = 0;
+        while (k <= nameLen && s[k] == name[k]) k++;
+        if (k == nameLen + 1) {
             return base + syms[i].st_value;
         }
     }
@@ -562,6 +570,9 @@ static int patch_scene_targeted(Il2CppClass* SMRCls, const MethodInfo* setMesh, 
 
 // ================= 工作线程 =================
 static void* worker(void*) {
+    // 等 Java 层把日志路径传过来，最多等 2 秒
+    for (int i = 0; i < 100 && g_log_path.empty(); i++) usleep(20 * 1000);
+
     std::string cmd = self_cmdline();
     LOGI("worker start in [%s]", cmd.c_str());
     if (cmd != "com.hermes.h1game") {
@@ -627,6 +638,18 @@ static void* worker(void*) {
 }
 
 // ================= 入口 =================
+// Java 层把游戏的 files 目录传进来，保证日志一定写得出去
+extern "C" JNIEXPORT void JNICALL
+Java_com_moss_modelmod_HookEntry_setLogPath(JNIEnv* env, jclass, jstring path) {
+    if (!path) return;
+    const char* p = env->GetStringUTFChars(path, nullptr);
+    if (p) {
+        g_log_path = p;
+        env->ReleaseStringUTFChars(path, p);
+    }
+    __android_log_print(ANDROID_LOG_INFO, TAG, "log path: %s", g_log_path.c_str());
+}
+
 extern "C" jint JNI_OnLoad(JavaVM* vm, void*) {
     g_vm = vm;
     LOGI("JNI_OnLoad entered");
