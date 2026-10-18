@@ -28,20 +28,24 @@ static void flog(const char* fmt, ...);
 // 0 = 只打印角色指纹（先跑这个，拿清单）
 // 1 = 执行精确替换（拿到清单后改这个，重编）
 #ifndef MOD_MODE
-#define MOD_MODE 0
+#define MOD_MODE 1
 #endif
 
 // ================= 角色映射表 =================
 // 填法：日志里看到 [SMR 0] path=HeroRoot/hero_11001/body bone0=Bip001 mat0=11001_body
 //      key 填 "11001"，bundle 填对应文件路径，asset 填 bundle 内的资源名
 struct CharRule {
-    const char* key;
-    const char* bundle;
+    const char* id;      // 角色 ID，匹配 "/<id>_" 或 "/<id>/"，空串 = 全部
+    const char* part;    // 部位关键字，nullptr/空 = 全部
+    const char* bundle;  // nullptr = 用立方体兜底
     const char* asset;
 };
 
 static CharRule g_rules[] = {
-    // { "11001", "/data/local/tmp/modelmod/11001.ab", "hero_11001" },
+    // 测试：所有角色的 Body 换立方体
+    { "", "Body", nullptr, nullptr },
+    // 填真模型时这样写：
+    // { "11001", "Body", "/data/local/tmp/modelmod/11001_body.ab", "body" },
 };
 static const int RULE_COUNT = (int)(sizeof(g_rules) / sizeof(g_rules[0]));
 
@@ -531,15 +535,40 @@ static void dump_fingerprints(Il2CppClass* SMRCls) {
 
 // ================= 模式 1：精确替换 =================
 static Il2CppObject* mesh_for_rule(CharRule& r) {
-    auto it = g_mesh_cache.find(r.key);
+    std::string key = r.id ? r.id : "";
+    auto it = g_mesh_cache.find(key);
     if (it != g_mesh_cache.end()) return it->second;
 
-    Il2CppObject* m = load_mesh_from_bundle(r.bundle, r.asset);
+    Il2CppObject* m = nullptr;
+    if (r.bundle) m = load_mesh_from_bundle(r.bundle, r.asset);
+    if (!m) m = build_cube_mesh();
+
     if (m) {
-        g_mesh_cache[r.key] = m;
-        LOGI("rule ready: %s -> %p", r.key, m);
+        g_mesh_cache[key] = m;
+        LOGI("rule ready: [%s] -> %p", key.c_str(), m);
     }
     return m;
+}
+
+// 路径里 /<id>_ 或 /<id>/ 才算命中，避免 11001 误伤 110011
+static bool path_has_id(const std::string& chain, const char* id) {
+    if (!id || !id[0]) return true;
+    std::string k = std::string("/") + id;
+    size_t pos = 0;
+    while ((pos = chain.find(k, pos)) != std::string::npos) {
+        size_t after = pos + k.size();
+        if (after >= chain.size()) return true;
+        char c = chain[after];
+        if (c == '_' || c == '/' || c == '-') return true;
+        pos = after;
+    }
+    return false;
+}
+
+static bool rule_matches(const CharRule& r, const Fingerprint& f) {
+    if (!path_has_id(f.chain, r.id)) return false;
+    if (r.part && r.part[0] && !contains(f.chain, r.part)) return false;
+    return true;
 }
 
 static int patch_scene_targeted(Il2CppClass* SMRCls, const MethodInfo* setMesh, int budget) {
@@ -551,9 +580,7 @@ static int patch_scene_targeted(Il2CppClass* SMRCls, const MethodInfo* setMesh, 
         Fingerprint& f = list[i];
         for (int r = 0; r < RULE_COUNT; r++) {
             CharRule& rule = g_rules[r];
-            if (!contains(f.chain, rule.key) &&
-                !contains(f.bone0, rule.key) &&
-                !contains(f.mat0,  rule.key)) continue;
+            if (!rule_matches(rule, f)) continue;
 
             Il2CppObject* want = mesh_for_rule(rule);
             if (!want) break;
@@ -564,7 +591,7 @@ static int patch_scene_targeted(Il2CppClass* SMRCls, const MethodInfo* setMesh, 
 
             void* a[1] = { want };
             invoke_inst(setMesh, f.smr, a);
-            LOGI("swapped %s -> key=%s", f.chain.c_str(), rule.key);
+            LOGI("swapped %s", f.chain.c_str());
             done++;
             break;
         }
