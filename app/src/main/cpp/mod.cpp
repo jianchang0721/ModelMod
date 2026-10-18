@@ -600,8 +600,11 @@ static int scale_mesh_vertices(Il2CppObject* mesh, Il2CppClass* MeshCls, float k
         LOGE("get_vertices=%p set_vertices=%p", getVerts, setVerts);
         return 0;
     }
-    Il2CppArray* arr = (Il2CppArray*)invoke_inst(getVerts, mesh, nullptr);
-    if (!arr || arr->max_length == 0) return 0;
+    Il2CppException* exc = nullptr;
+    Il2CppArray* arr = (Il2CppArray*)g_api.runtime_invoke(getVerts, mesh, nullptr, &exc);
+    if (exc) { LOGE("get_vertices threw %p", exc); return 0; }
+    if (!arr) { LOGE("get_vertices returned null"); return 0; }
+    if (arr->max_length == 0) { LOGE("vertex array empty"); return 0; }
     for (size_t i = 0; i < arr->max_length; i++) {
         float* p = (float*)array_addr(arr, 12, i);
         p[0] *= k; p[1] *= k; p[2] *= k;
@@ -617,6 +620,13 @@ static int patch_scene_targeted(Il2CppClass* SMRCls, const MethodInfo* setMesh, 
 
     Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
     const MethodInfo* getMesh = find_method(SMRCls, "get_sharedMesh", 0);
+
+    static bool scanLogged = false;
+    if (!scanLogged) {
+        scanLogged = true;
+        LOGI("scan: smrs=%zu inplace=%d MeshCls=%p getMesh=%p rules=%d",
+             list.size(), (int)g_inplace_mode, MeshCls, getMesh, RULE_COUNT);
+    }
 
     int done = 0;
     for (size_t i = 0; i < list.size() && done < budget; i++) {
@@ -767,6 +777,15 @@ static void* worker(void*) {
         LOGI("--- Mesh class methods ---");
         dump_class_methods(MeshCls);
         g_inplace_mode = true;
+
+        // 诊断备用方案需要的方法在不在
+        Il2CppClass* ObjCls    = find_class_any("UnityEngine", "Object");
+        Il2CppClass* TransCls  = find_class_any("UnityEngine", "Transform");
+        Il2CppClass* RendererC = find_class_any("UnityEngine", "Renderer");
+        LOGI("probe Instantiate(Object)=%p", (void*)find_method(ObjCls, "Instantiate", 1));
+        LOGI("probe SetParent(Transform)=%p", (void*)find_method(TransCls, "SetParent", 1));
+        LOGI("probe set_enabled(bool)=%p", (void*)find_method(RendererC, "set_enabled", 1));
+        LOGI("probe get_transform=%p", (void*)find_method(find_class_any("UnityEngine", "Component"), "get_transform", 0));
     }
 
     while (true) {
