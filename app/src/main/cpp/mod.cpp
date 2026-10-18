@@ -55,6 +55,8 @@ static Il2CppDomain* g_domain = nullptr;
 static std::string g_log_path;
 static FILE* g_log_fp = nullptr;
 static std::map<std::string, Il2CppObject*> g_mesh_cache;
+static bool g_inplace_mode = false;
+static std::map<void*, int> g_patched_meshes;
 
 // 日志同时落盘，路径由 Java 层 getFilesDir() 传过来
 static FILE* log_fp() {
@@ -590,9 +592,31 @@ static bool rule_matches(const CharRule& r, const Fingerprint& f) {
     return true;
 }
 
+// 直接改 Mesh 的顶点数组（不换 Mesh 对象）
+static int scale_mesh_vertices(Il2CppObject* mesh, Il2CppClass* MeshCls, float k) {
+    const MethodInfo* getVerts = find_method(MeshCls, "get_vertices", 0);
+    const MethodInfo* setVerts = find_method(MeshCls, "set_vertices", 1);
+    if (!getVerts || !setVerts) {
+        LOGE("get_vertices=%p set_vertices=%p", getVerts, setVerts);
+        return 0;
+    }
+    Il2CppArray* arr = (Il2CppArray*)invoke_inst(getVerts, mesh, nullptr);
+    if (!arr || arr->max_length == 0) return 0;
+    for (size_t i = 0; i < arr->max_length; i++) {
+        float* p = (float*)array_addr(arr, 12, i);
+        p[0] *= k; p[1] *= k; p[2] *= k;
+    }
+    void* a[1] = { arr };
+    invoke_inst(setVerts, mesh, a);
+    return (int)arr->max_length;
+}
+
 static int patch_scene_targeted(Il2CppClass* SMRCls, const MethodInfo* setMesh, int budget) {
     std::vector<Fingerprint> list;
     collect_fingerprints(SMRCls, list);
+
+    Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
+    const MethodInfo* getMesh = find_method(SMRCls, "get_sharedMesh", 0);
 
     int done = 0;
     for (size_t i = 0; i < list.size() && done < budget; i++) {
@@ -601,10 +625,22 @@ static int patch_scene_targeted(Il2CppClass* SMRCls, const MethodInfo* setMesh, 
             CharRule& rule = g_rules[r];
             if (!rule_matches(rule, f)) continue;
 
+            if (g_inplace_mode) {
+                Il2CppObject* mesh = invoke_inst(getMesh, f.smr, nullptr);
+                if (!mesh) break;
+                if (g_patched_meshes.count(mesh)) break;
+                int n = scale_mesh_vertices(mesh, MeshCls, 1.5f);
+                if (n > 0) {
+                    g_patched_meshes[mesh] = n;
+                    LOGI("scaled %s verts=%d", f.chain.c_str(), n);
+                    done++;
+                }
+                break;
+            }
+
             Il2CppObject* want = mesh_for_rule(rule);
             if (!want) break;
 
-            const MethodInfo* getMesh = find_method(SMRCls, "get_sharedMesh", 0);
             Il2CppObject* cur = invoke_inst(getMesh, f.smr, nullptr);
             if (cur == want) break;
 
@@ -726,9 +762,11 @@ static void* worker(void*) {
     }
 
     if (!setMesh) {
-        LOGE("no mesh setter found, dumping class methods");
-        dump_class_methods(SMRCls);
-        return nullptr;
+        LOGE("no mesh setter, switching to in-place vertex edit");
+        Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
+        LOGI("--- Mesh class methods ---");
+        dump_class_methods(MeshCls);
+        g_inplace_mode = true;
     }
 
     while (true) {
