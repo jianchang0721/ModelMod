@@ -56,6 +56,7 @@ static std::string g_log_path;
 static FILE* g_log_fp = nullptr;
 static std::map<std::string, Il2CppObject*> g_mesh_cache;
 static bool g_inplace_mode = false;
+static const MethodInfo* g_setEnabled = nullptr;
 static std::map<void*, int> g_patched_meshes;
 
 // 日志同时落盘，路径由 Java 层 getFilesDir() 传过来
@@ -636,15 +637,14 @@ static int patch_scene_targeted(Il2CppClass* SMRCls, const MethodInfo* setMesh, 
             if (!rule_matches(rule, f)) continue;
 
             if (g_inplace_mode) {
-                Il2CppObject* mesh = invoke_inst(getMesh, f.smr, nullptr);
-                if (!mesh) break;
-                if (g_patched_meshes.count(mesh)) break;
-                int n = scale_mesh_vertices(mesh, MeshCls, 1.5f);
-                if (n > 0) {
-                    g_patched_meshes[mesh] = n;
-                    LOGI("scaled %s verts=%d", f.chain.c_str(), n);
-                    done++;
-                }
+                if (!g_setEnabled) break;
+                if (g_patched_meshes.count(f.smr)) break;
+                uint8_t off = 0;
+                void* a[1] = { &off };
+                invoke_inst(g_setEnabled, f.smr, a);
+                g_patched_meshes[f.smr] = 1;
+                LOGI("hidden %s", f.chain.c_str());
+                done++;
                 break;
             }
 
@@ -772,20 +772,11 @@ static void* worker(void*) {
     }
 
     if (!setMesh) {
-        LOGE("no mesh setter, switching to in-place vertex edit");
-        Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
-        LOGI("--- Mesh class methods ---");
-        dump_class_methods(MeshCls);
+        LOGE("no mesh setter, switching to hide mode");
         g_inplace_mode = true;
-
-        // 诊断备用方案需要的方法在不在
-        Il2CppClass* ObjCls    = find_class_any("UnityEngine", "Object");
-        Il2CppClass* TransCls  = find_class_any("UnityEngine", "Transform");
         Il2CppClass* RendererC = find_class_any("UnityEngine", "Renderer");
-        LOGI("probe Instantiate(Object)=%p", (void*)find_method(ObjCls, "Instantiate", 1));
-        LOGI("probe SetParent(Transform)=%p", (void*)find_method(TransCls, "SetParent", 1));
-        LOGI("probe set_enabled(bool)=%p", (void*)find_method(RendererC, "set_enabled", 1));
-        LOGI("probe get_transform=%p", (void*)find_method(find_class_any("UnityEngine", "Component"), "get_transform", 0));
+        g_setEnabled = find_method(RendererC, "set_enabled", 1);
+        LOGI("hide mode, set_enabled=%p", (void*)g_setEnabled);
     }
 
     while (true) {
