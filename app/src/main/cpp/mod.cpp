@@ -60,6 +60,14 @@ static bool g_inplace_mode = false;
 static const MethodInfo* g_setEnabled = nullptr;
 static std::map<void*, int> g_patched_meshes;
 
+// worker 线程只读扫描 → 队列 → 主线程执行修改
+struct PendingItem {
+    Il2CppObject* smr;
+    std::string chain;
+};
+static std::vector<PendingItem> g_pending;
+static pthread_mutex_t g_pending_mtx = PTHREAD_MUTEX_INITIALIZER;
+
 // 日志同时落盘，路径由 Java 层 getFilesDir() 传过来
 static FILE* log_fp() {
     if (g_log_fp) return g_log_fp;
@@ -723,25 +731,27 @@ static volatile int g_tick_busy = 0;
 static int g_tick_mode = 0;   // 1=deltaTime 2=time 3=runtime_invoke
 
 static void do_patch_tick() {
-    if (!g_tick_inited) {
-        g_tick_inited = true;
-        g_smrCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
-        if (g_smrCls) {
-            g_setMeshMI = find_method(g_smrCls, "set_sharedMesh", 1);
-            if (!g_setMeshMI) {
-                g_inplace_mode = true;
-                Il2CppClass* RendererC = find_class_any("UnityEngine", "Renderer");
-                g_setEnabled = find_method(RendererC, "set_enabled", 1);
-            }
+    std::vector<PendingItem> work;
+    pthread_mutex_lock(&g_pending_mtx);
+    work.swap(g_pending);
+    pthread_mutex_unlock(&g_pending_mtx);
+
+    if (work.empty()) return;
+
+    int done = 0;
+    for (auto& it : work) {
+        if (g_patched_meshes.count(it.smr)) continue;
+
+        if (g_setEnabled) {
+            uint8_t off = 0;
+            void* a[1] = { &off };
+            invoke_inst(g_setEnabled, it.smr, a);
         }
-        LOGI("tick init: smr=%p setMesh=%p inplace=%d setEnabled=%p",
-             g_smrCls, g_setMeshMI, (int)g_inplace_mode, g_setEnabled);
-    }
-    if (!g_smrCls) return;
-    int n = patch_scene_targeted(g_smrCls, g_setMeshMI, 2);
-    static int dt = 0;
-    if (n > 0 || (dt++ % 30) == 0) {
-        LOGI("tick: smrs=%zu swapped=%d", g_last_scan, n);
+
+        Il2CppObject* cube = spawn_cube_for(it.smr);
+        g_patched_meshes[it.smr] = 1;
+        LOGI("replaced %s smr=%p cube=%p", it.chain.c_str(), it.smr, cube);
+        if (++done >= 4) break;   // 单帧最多 4 个，防卡顿
     }
 }
 
@@ -942,9 +952,35 @@ static void* worker(void*) {
         LOGI("hide mode, set_enabled=%p", (void*)g_setEnabled);
     }
 
+    g_smrCls = SMRCls;
+
     if (install_hooks()) {
-        LOGI("main-thread tick ready, mode=%d, worker exits", g_tick_mode);
-        return nullptr;
+        LOGI("main-thread tick ready, mode=%d; worker -> read-only scan", g_tick_mode);
+        while (true) {
+            std::vector<Fingerprint> list;
+            collect_fingerprints(SMRCls, list);
+
+            std::vector<PendingItem> batch;
+            for (auto& f : list) {
+                for (int r = 0; r < RULE_COUNT; r++) {
+                    if (rule_matches(g_rules[r], f)) {
+                        batch.push_back({f.smr, f.chain});
+                        break;
+                    }
+                }
+            }
+
+            size_t pend;
+            pthread_mutex_lock(&g_pending_mtx);
+            if (!batch.empty()) g_pending = batch;
+            pend = g_pending.size();
+            pthread_mutex_unlock(&g_pending_mtx);
+
+            static int sc = 0;
+            if ((sc++ % 3) == 0)
+                LOGI("scan: smrs=%zu matched=%zu pending=%zu", list.size(), batch.size(), pend);
+            sleep(2);
+        }
     }
 
     LOGE("all hooks failed, staying idle (no off-thread Unity calls)");
