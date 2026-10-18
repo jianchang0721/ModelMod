@@ -747,6 +747,8 @@ static int patch_scene_targeted(Il2CppClass* SMRCls, const MethodInfo* setMesh, 
 // ================= 主线程 hook =================
 static void* g_orig_delta = nullptr;
 static void* g_orig_invoke = nullptr;
+static void* g_orig_width = nullptr;
+static void* g_orig_framecount = nullptr;
 static int g_tick = 0;
 static bool g_tick_inited = false;
 static Il2CppClass* g_smrCls = nullptr;
@@ -806,8 +808,13 @@ static void main_tick() {
     bool isMain = (tid == getpid());
 
     static int tlog = 0;
-    if ((tlog++ % 200) == 0) {
-        LOGI("tick tid=%d main=%d cnt=%d", (int)tid, (int)isMain, g_tick);
+    static int tmain = 0;
+    if (isMain && tmain < 30) {
+        tmain++;
+        LOGI("tick MAIN #%d cnt=%d", tmain, g_tick);
+    }
+    if (!isMain && (tlog++ % 500) == 0) {
+        LOGI("tick sub tid=%d cnt=%d", (int)tid, g_tick);
     }
 
     if (!isMain) return;      // 非主线程不算数
@@ -829,6 +836,16 @@ static void main_tick() {
 static float hk_delta(void* method) {
     main_tick();
     return ((float(*)(void*))g_orig_delta)(method);
+}
+
+static int hk_width(void* method) {
+    main_tick();
+    return ((int(*)(void*))g_orig_width)(method);
+}
+
+static int hk_framecount(void* method) {
+    main_tick();
+    return ((int(*)(void*))g_orig_framecount)(method);
 }
 
 // 观察器：把游戏反射调用的名字里带关键字的全记下来
@@ -913,6 +930,25 @@ static bool install_hooks() {
     if (inv) {
         void* o = try_hook(sh, inv, (void*)hk_invoke, "runtime_invoke");
         if (o) { g_orig_invoke = o; g_tick_mode |= 2; ok = true; }
+    }
+
+    // 每帧必调的主线程候选
+    Il2CppClass* ScreenCls = find_class_any("UnityEngine", "Screen");
+    if (ScreenCls) {
+        const MethodInfo* w = find_method(ScreenCls, "get_width", 0);
+        if (w) {
+            void* o = try_hook(sh, *(void**)w, (void*)hk_width, "screen.width");
+            if (o) { g_orig_width = o; g_tick_mode |= 4; ok = true; }
+        }
+    }
+
+    Il2CppClass* TimeCls2 = find_class_any("UnityEngine", "Time");
+    if (TimeCls2) {
+        const MethodInfo* fc = find_method(TimeCls2, "get_frameCount", 0);
+        if (fc) {
+            void* o = try_hook(sh, *(void**)fc, (void*)hk_framecount, "frameCount");
+            if (o) { g_orig_framecount = o; g_tick_mode |= 8; ok = true; }
+        }
     }
 
     LOGI("hook mask=%d", g_tick_mode);
