@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <android/log.h>
 
 #include "il2cpp_api.h"
@@ -526,6 +527,13 @@ static void collect_fingerprints(Il2CppClass* SMRCls, std::vector<Fingerprint>& 
     if (dbgFind < 5) {
         dbgFind++;
         LOGI("find: arr=%p len=%ld fallback=%d", arr, arr ? (long)arr->max_length : -1L, (int)usedFallback);
+    } else {
+        static size_t lastLen = 0;
+        size_t len = arr ? arr->max_length : 0;
+        if (len != lastLen) {
+            lastLen = len;
+            LOGI("find: len changed %zu", len);
+        }
     }
     if (!arr) return;
 
@@ -823,7 +831,29 @@ static float hk_delta(void* method) {
     return ((float(*)(void*))g_orig_delta)(method);
 }
 
+// 观察器：把游戏反射调用的名字里带关键字的全记下来
+static std::set<std::string> g_seen;
+static int g_obs_scan = 0;
+static int g_obs_hit = 0;
+
+static void observe(const MethodInfo* m) {
+    if (!m || ++g_obs_scan > 300000 || g_obs_hit > 400) return;
+    const char* n = g_api.method_get_name(m);
+    if (!n) return;
+    if (!strstr(n, "Mesh") && !strstr(n, "Model") && !strstr(n, "Skin") &&
+        !strstr(n, "Load") && !strstr(n, "Create") && !strstr(n, "Render") &&
+        !strstr(n, "Asset") && !strstr(n, "Bundle") && !strstr(n, "Char") &&
+        !strstr(n, "Hero") && !strstr(n, "Avatar"))
+        return;
+    std::string s(n);
+    if (g_seen.count(s)) return;
+    g_seen.insert(s);
+    g_obs_hit++;
+    LOGI("OBS %s", n);
+}
+
 static Il2CppObject* hk_invoke(const MethodInfo* m, void* obj, void** args, Il2CppException** exc) {
+    observe(m);
     main_tick();
     return ((Il2CppObject*(*)(const MethodInfo*, void*, void**, Il2CppException**))g_orig_invoke)(m, obj, args, exc);
 }
