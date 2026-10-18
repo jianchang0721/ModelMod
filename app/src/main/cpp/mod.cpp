@@ -497,6 +497,11 @@ static void collect_fingerprints(Il2CppClass* SMRCls, std::vector<Fingerprint>& 
 
     void* a[1] = { g_api.type_get_object(g_api.class_get_type(SMRCls)) };
     Il2CppArray* arr = (Il2CppArray*)invoke_static(find, a);
+    static int dbgFind = 0;
+    if (dbgFind < 5) {
+        dbgFind++;
+        LOGI("find: typeObj=%p arr=%p len=%ld", a[0], arr, arr ? (long)arr->max_length : -1L);
+    }
     if (!arr) return;
 
     for (size_t i = 0; i < arr->max_length; i++) {
@@ -647,9 +652,12 @@ static Il2CppObject* spawn_cube_for(Il2CppObject* smr) {
     return cube;
 }
 
+static size_t g_last_scan = 0;
+
 static int patch_scene_targeted(Il2CppClass* SMRCls, const MethodInfo* setMesh, int budget) {
     std::vector<Fingerprint> list;
     collect_fingerprints(SMRCls, list);
+    g_last_scan = list.size();
 
     Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
     const MethodInfo* getMesh = find_method(SMRCls, "get_sharedMesh", 0);
@@ -731,7 +739,10 @@ static void do_patch_tick() {
     }
     if (!g_smrCls) return;
     int n = patch_scene_targeted(g_smrCls, g_setMeshMI, 2);
-    if (n > 0) LOGI("tick swapped %d", n);
+    static int dt = 0;
+    if (n > 0 || (dt++ % 30) == 0) {
+        LOGI("tick: smrs=%zu swapped=%d", g_last_scan, n);
+    }
 }
 
 // 节流 + 防重入
