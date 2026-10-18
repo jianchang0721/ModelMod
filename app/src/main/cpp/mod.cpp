@@ -793,46 +793,50 @@ static long g_lastGO = -1;
 static void* g_orig_inst1 = nullptr;
 static void* g_orig_inst2 = nullptr;
 static int g_inst_hits = 0;
-static int g_inst_patched = 0;
+static std::vector<Il2CppObject*> g_smr_queue;
+static pthread_mutex_t g_qmtx = PTHREAD_MUTEX_INITIALIZER;
 static void try_patch_in_main();
 static long g_lastSMR = -1;
 
 static void try_patch_in_main() {
     if (g_inst_patched) return;
-    g_inst_patched = 1;
-    LOGI("main: attempting patch");
+    std::vector<Il2CppObject*> q;
+    pthread_mutex_lock(&g_qmtx);
+    q.swap(g_smr_queue);
+    pthread_mutex_unlock(&g_qmtx);
 
-    Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
-    if (!SMRCls) { LOGE("main: no SMR class"); return; }
+    if (q.empty()) return;
+    LOGI("main: enter tid=%d isMain=%d queue=%zu",
+         (int)cur_tid(), (int)(cur_tid() == getpid()), q.size());
 
-    std::vector<Fingerprint> list;
-    collect_fingerprints(SMRCls, list);
-    LOGI("main: %zu smrs", list.size());
+    int done = 0;
+    for (auto smr : q) {
+        if (g_patched_meshes.count(smr)) continue;
+        if (done >= 3) break;
 
-    for (auto& f : list) {
-        if (g_patched_meshes.count(f.smr)) continue;
-        for (int r = 0; r < RULE_COUNT; r++) {
-            if (!rule_matches(g_rules[r], f)) continue;
-
-            if (g_setEnabled) {
-                uint8_t off = 0;
-                void* a[1] = { &off };
-                invoke_inst(g_setEnabled, f.smr, a);
-            }
-            g_patched_meshes[f.smr] = 1;
-            LOGI("main: hidden %s", f.chain.c_str());
-
-            Il2CppObject* cb = spawn_cube_for(f.smr);
-            LOGI("main: cube=%p", cb);
-            return;
+        if (g_setEnabled) {
+            uint8_t off = 0;
+            void* a[1] = { &off };
+            invoke_inst(g_setEnabled, smr, a);
         }
+        LOGI("main: hidden smr=%p", smr);
+
+        Il2CppObject* cb = spawn_cube_for(smr);
+        LOGI("main: cube=%p", cb);
+        g_patched_meshes[smr] = 1;
+        done++;
     }
+    LOGI("main: done=%d", done);
 }
 
 static Il2CppObject* hk_inst1(void* m, Il2CppObject* orig) {
     Il2CppObject* r = ((Il2CppObject*(*)(void*, Il2CppObject*))g_orig_inst1)(m, orig);
-    if (g_inst_hits < 20) { g_inst_hits++; LOGI("inst1 #%d orig=%p ret=%p", g_inst_hits, orig, r); }
-    if (g_inst_hits == 5) try_patch_in_main();
+    g_inst_hits++;
+    if (g_inst_hits < 20) {
+        LOGI("inst1 #%d tid=%d main=%d orig=%p ret=%p",
+             g_inst_hits, (int)cur_tid(), (int)(cur_tid() == getpid()), orig, r);
+    }
+    if ((g_inst_hits % 5) == 0) try_patch_in_main();
     return r;
 }
 
@@ -1284,8 +1288,12 @@ static void* worker(void*) {
                     uint8_t off = 0;
                     void* a[1] = { &off };
                     invoke_inst(g_setEnabled, f.smr, a);
-                    LOGI("hidden ok");
                 }
+
+                // 塞队列，等主线程造对象
+                pthread_mutex_lock(&g_qmtx);
+                g_smr_queue.push_back(f.smr);
+                pthread_mutex_unlock(&g_qmtx);
 
                 g_patched_meshes[f.smr] = 1;
                 done++;
