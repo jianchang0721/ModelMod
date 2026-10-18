@@ -24,10 +24,20 @@ android {
 
     packagingOptions { jniLibs { useLegacyPackaging = true } }
 
+    signingConfigs {
+        release {
+            storeFile file("../keystore/modelmod.jks")
+            storePassword "modelmod123"
+            keyAlias "modelmod"
+            keyPassword "modelmod123"
+            storeType "jks"
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
-            signingConfig signingConfigs.debug
+            signingConfig signingConfigs.release
         }
     }
 }
