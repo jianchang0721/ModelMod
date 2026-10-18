@@ -87,14 +87,18 @@ static Il2CppClass* find_class_any(const char* ns, const char* name) {
     return nullptr;
 }
 
+// 沿继承链往上找：il2cpp_class_get_methods 只返回该类自己声明的方法，
+// 不包含继承的。get_name 在 UnityEngine.Object 上，GameObject 自己是没有的。
 static const MethodInfo* find_method(Il2CppClass* klass, const char* name, int argc) {
     if (!klass) return nullptr;
-    void* iter = nullptr;
-    const MethodInfo* m;
-    while ((m = g_api.class_get_methods(klass, &iter))) {
-        if (strcmp(g_api.method_get_name(m), name) != 0) continue;
-        if ((int)g_api.method_get_param_count(m) != argc) continue;
-        return m;
+    for (Il2CppClass* k = klass; k; k = g_api.class_get_parent(k)) {
+        void* iter = nullptr;
+        const MethodInfo* m;
+        while ((m = g_api.class_get_methods(k, &iter))) {
+            if (strcmp(g_api.method_get_name(m), name) != 0) continue;
+            if ((int)g_api.method_get_param_count(m) != argc) continue;
+            return m;
+        }
     }
     return nullptr;
 }
