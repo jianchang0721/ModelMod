@@ -731,9 +731,29 @@ static void do_patch_tick() {
     if (n > 0) LOGI("tick swapped %d", n);
 }
 
-static float hk_delta(const MethodInfo* m, void* self) {
+// get_deltaTime 是静态方法，AOT 签名 (MethodInfo* method)
+static float hk_delta(void* method) {
     if ((g_tick++ % 30) == 0) do_patch_tick();
-    return ((float(*)(const MethodInfo*, void*))g_orig_delta)(m, self);
+    return ((float(*)(void*))g_orig_delta)(method);
+}
+
+static void* load_so_by_name(const char* soname) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return nullptr;
+    char line[512];
+    char path[256] = {0};
+    while (fgets(line, sizeof(line), f)) {
+        if (!strstr(line, soname)) continue;
+        char* p = strchr(line, '/');
+        if (!p) continue;
+        strncpy(path, p, sizeof(path) - 1);
+        char* nl = strchr(path, '\n');
+        if (nl) *nl = 0;
+        break;
+    }
+    fclose(f);
+    if (!path[0]) return nullptr;
+    return dlopen(path, RTLD_NOW);
 }
 
 static bool install_time_hook() {
@@ -742,17 +762,25 @@ static bool install_time_hook() {
     const MethodInfo* m = find_method(TimeCls, "get_deltaTime", 0);
     if (!m) { LOGE("get_deltaTime missing"); return false; }
 
-    void** pp = (void**)m;
-    void* orig = *pp;
-    if (!orig) { LOGE("methodPointer null"); return false; }
+    void* code = *(void**)m;
+    if (!code) { LOGE("methodPointer null"); return false; }
+    LOGI("deltaTime code=%p", code);
 
-    uintptr_t page = (uintptr_t)pp & ~(uintptr_t)0xFFF;
-    if (mprotect((void*)page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        LOGE("mprotect failed");
-    }
+    void* sh = load_so_by_name("libshadowhook.so");
+    if (!sh) { LOGE("libshadowhook.so not found"); return false; }
+    LOGI("shadowhook handle=%p", sh);
+
+    typedef int (*fn_hook)(void*, void*, void**);
+    fn_hook hook = (fn_hook)dlsym(sh, "shadowhook_hook_func_addr");
+    if (!hook) { LOGE("shadowhook_hook_func_addr missing"); return false; }
+
+    void* orig = nullptr;
+    int ret = hook(code, (void*)hk_delta, &orig);
+    LOGI("shadowhook ret=%d orig=%p", ret, orig);
+    if (!orig) { LOGE("inline hook failed"); return false; }
+
     g_orig_delta = orig;
-    *pp = (void*)hk_delta;
-    LOGI("hooked Time.get_deltaTime mi=%p orig=%p hk=%p", m, orig, (void*)hk_delta);
+    LOGI("inline hook ok");
     return true;
 }
 
