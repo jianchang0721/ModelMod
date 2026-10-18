@@ -1235,9 +1235,33 @@ static void* worker(void*) {
 
     g_smrCls = SMRCls;
 
-    // v30: 主线程 tick 每次启动只进 1 次（实测），放弃 hook 方案。
-    // worker 线程直接循环扫描 + 修改，v9 已证明扫描在 worker 线程能扫到 100 个。
-    LOGI("v30 worker loop start (no hooks)");
+    // 只装 Instantiate hook：拿到主线程上下文去造对象
+    {
+        void* sh = load_so_by_name("libshadowhook.so");
+        if (sh) {
+            typedef int (*fn_init)(int, bool);
+            fn_init init = (fn_init)dlsym(sh, "shadowhook_init");
+            if (init) LOGI("shadowhook_init -> %d", init(0, false));
+
+            Il2CppClass* ObjCls = find_class_any("UnityEngine", "Object");
+            if (ObjCls) {
+                const MethodInfo* i1 = find_method(ObjCls, "Instantiate", 1);
+                if (i1) {
+                    void* o = try_hook(sh, *(void**)i1, (void*)hk_inst1, "Instantiate/1");
+                    if (o) g_orig_inst1 = o;
+                }
+                const MethodInfo* i2 = find_method(ObjCls, "Instantiate", 2);
+                if (i2) {
+                    void* o = try_hook(sh, *(void**)i2, (void*)hk_inst2, "Instantiate/2");
+                    if (o) g_orig_inst2 = o;
+                }
+            }
+        } else {
+            LOGE("no shadowhook");
+        }
+    }
+
+    LOGI("worker loop start (hide + instantiate-hook)");
 
     int round = 0;
     while (true) {
