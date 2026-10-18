@@ -788,7 +788,60 @@ static void probe_types() {
 
 static int g_cube_done = 0;
 static long g_lastGO = -1;
+
+// Instantiate hook：在主线程创建对象时插一脚
+static void* g_orig_inst1 = nullptr;
+static void* g_orig_inst2 = nullptr;
+static int g_inst_hits = 0;
+static int g_inst_patched = 0;
+static void try_patch_in_main();
 static long g_lastSMR = -1;
+
+static void try_patch_in_main() {
+    if (g_inst_patched) return;
+    g_inst_patched = 1;
+    LOGI("main: attempting patch");
+
+    Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+    if (!SMRCls) { LOGE("main: no SMR class"); return; }
+
+    std::vector<Fingerprint> list;
+    collect_fingerprints(SMRCls, list);
+    LOGI("main: %zu smrs", list.size());
+
+    for (auto& f : list) {
+        if (g_patched_meshes.count(f.smr)) continue;
+        for (int r = 0; r < RULE_COUNT; r++) {
+            if (!rule_matches(g_rules[r], f)) continue;
+
+            if (g_setEnabled) {
+                uint8_t off = 0;
+                void* a[1] = { &off };
+                invoke_inst(g_setEnabled, f.smr, a);
+            }
+            g_patched_meshes[f.smr] = 1;
+            LOGI("main: hidden %s", f.chain.c_str());
+
+            Il2CppObject* cb = spawn_cube_for(f.smr);
+            LOGI("main: cube=%p", cb);
+            return;
+        }
+    }
+}
+
+static Il2CppObject* hk_inst1(void* m, Il2CppObject* orig) {
+    Il2CppObject* r = ((Il2CppObject*(*)(void*, Il2CppObject*))g_orig_inst1)(m, orig);
+    if (g_inst_hits < 20) { g_inst_hits++; LOGI("inst1 #%d orig=%p ret=%p", g_inst_hits, orig, r); }
+    if (g_inst_hits == 5) try_patch_in_main();
+    return r;
+}
+
+static Il2CppObject* hk_inst2(void* m, Il2CppObject* orig, Il2CppObject* parent) {
+    Il2CppObject* r = ((Il2CppObject*(*)(void*, Il2CppObject*, Il2CppObject*))g_orig_inst2)(m, orig, parent);
+    if (g_inst_hits < 20) { g_inst_hits++; LOGI("inst2 #%d orig=%p ret=%p", g_inst_hits, orig, r); }
+    if (g_inst_hits == 5) try_patch_in_main();
+    return r;
+}
 
 static void do_patch_tick() {
     if (!g_tick_inited) {
@@ -1025,6 +1078,16 @@ static bool install_hooks() {
     // 实例方法：游戏高频调用，且 AOT 签名简单
     Il2CppClass* ObjCls2 = find_class_any("UnityEngine", "Object");
     if (ObjCls2) {
+        const MethodInfo* i1 = find_method(ObjCls2, "Instantiate", 1);
+        if (i1) {
+            void* o = try_hook(sh, *(void**)i1, (void*)hk_inst1, "Instantiate/1");
+            if (o) { g_orig_inst1 = o; ok = true; }
+        }
+        const MethodInfo* i2 = find_method(ObjCls2, "Instantiate", 2);
+        if (i2) {
+            void* o = try_hook(sh, *(void**)i2, (void*)hk_inst2, "Instantiate/2");
+            if (o) { g_orig_inst2 = o; ok = true; }
+        }
         const MethodInfo* nm = find_method(ObjCls2, "get_name", 0);
         if (nm) {
             void* o = try_hook(sh, *(void**)nm, (void*)hk_name, "Object.get_name");
@@ -1203,13 +1266,6 @@ static void* worker(void*) {
                 g_patched_meshes[f.smr] = 1;
                 done++;
 
-                // 每个角色只造一个立方体验证（第一个匹配的）
-                if (g_cube_done < 3) {
-                    g_cube_done++;
-                    LOGI("cube: trying on %s", f.chain.c_str());
-                    Il2CppObject* cb = spawn_cube_for(f.smr);
-                    LOGI("cube: done=%p", cb);
-                }
                 break;
             }
         }
