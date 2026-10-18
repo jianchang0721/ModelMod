@@ -1169,12 +1169,43 @@ static void* worker(void*) {
 
     g_smrCls = SMRCls;
 
-    if (install_hooks()) {
-        LOGI("main-thread tick ready, mode=%d, worker exits", g_tick_mode);
-        return nullptr;
-    }
+    // v30: 主线程 tick 每次启动只进 1 次（实测），放弃 hook 方案。
+    // worker 线程直接循环扫描 + 修改，v9 已证明扫描在 worker 线程能扫到 100 个。
+    LOGI("v30 worker loop start (no hooks)");
 
-    LOGE("all hooks failed, staying idle (no off-thread Unity calls)");
+    int round = 0;
+    while (true) {
+        round++;
+        std::vector<Fingerprint> list;
+        collect_fingerprints(SMRCls, list);
+        LOGI("scan #%d: %zu smrs", round, list.size());
+
+        int done = 0;
+        for (auto& f : list) {
+            if (done >= 4) break;
+            if (g_patched_meshes.count(f.smr)) continue;
+
+            for (int r = 0; r < RULE_COUNT; r++) {
+                if (!rule_matches(g_rules[r], f)) continue;
+
+                LOGI("matched %s", f.chain.c_str());
+
+                if (g_setEnabled) {
+                    uint8_t off = 0;
+                    void* a[1] = { &off };
+                    invoke_inst(g_setEnabled, f.smr, a);
+                    LOGI("hidden ok");
+                }
+
+                g_patched_meshes[f.smr] = 1;
+                done++;
+                break;
+            }
+        }
+
+        if (done > 0) LOGI("round %d done=%d", round, done);
+        sleep(2);
+    }
     return nullptr;
 }
 
