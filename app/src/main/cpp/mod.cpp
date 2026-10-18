@@ -876,6 +876,13 @@ static void hk_canvasupdate(void* m) {
     ((void(*)(void*))g_orig_canvas)(m);
 }
 
+static void* g_orig_setactive = nullptr;
+
+static void hk_setactive(void* self, void* m, uint8_t v) {
+    main_tick();
+    ((void(*)(void*, void*, uint8_t))g_orig_setactive)(self, m, v);
+}
+
 static void try_patch_in_main() {
     std::vector<Il2CppObject*> q;
     pthread_mutex_lock(&g_qmtx);
@@ -1287,6 +1294,22 @@ static void* worker(void*) {
             }
         } else {
             LOGE("no CanvasUpdateRegistry");
+        }
+    }
+
+    // GameObject.SetActive：游戏开关对象必经之路，主线程高频
+    {
+        Il2CppClass* GO = find_class_any("UnityEngine", "GameObject");
+        if (GO) {
+            const MethodInfo* sa = find_method(GO, "SetActive", 1);
+            LOGI("SetActive=%p", (void*)sa);
+            if (sa) {
+                void* sh = load_so_by_name("libshadowhook.so");
+                if (sh) {
+                    void* o = try_hook(sh, *(void**)sa, (void*)hk_setactive, "GameObject.SetActive");
+                    if (o) { g_orig_setactive = o; LOGI("setactive hook ok"); }
+                }
+            }
         }
     }
 
