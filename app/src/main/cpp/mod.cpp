@@ -800,7 +800,11 @@ static void do_patch_tick() {
     if (done > 0) LOGI("tick done=%d total_scan=%zu", done, g_last_scan);
 }
 
-static pid_t cur_tid() { return (pid_t)syscall(__NR_gettid); }
+static thread_local pid_t t_tid = 0;
+static pid_t cur_tid() {
+    if (!t_tid) t_tid = (pid_t)syscall(__NR_gettid);
+    return t_tid;
+}
 
 // 节流 + 防重入 + 只主线程执行
 static void main_tick() {
@@ -846,6 +850,28 @@ static int hk_width(void* method) {
 static int hk_framecount(void* method) {
     main_tick();
     return ((int(*)(void*))g_orig_framecount)(method);
+}
+
+// ---- 实例方法 hook：AOT 签名 (void* self, MethodInfo* m) ----
+struct Vec3 { float x, y, z; };
+
+static void* g_orig_name = nullptr;
+static void* g_orig_gettrans = nullptr;
+static void* g_orig_getpos = nullptr;
+
+static Il2CppString* hk_name(void* self, void* m) {
+    main_tick();
+    return ((Il2CppString*(*)(void*, void*))g_orig_name)(self, m);
+}
+
+static Il2CppObject* hk_gettrans(void* self, void* m) {
+    main_tick();
+    return ((Il2CppObject*(*)(void*, void*))g_orig_gettrans)(self, m);
+}
+
+static Vec3 hk_getpos(void* self, void* m) {
+    main_tick();
+    return ((Vec3(*)(void*, void*))g_orig_getpos)(self, m);
 }
 
 // 观察器：把游戏反射调用的名字里带关键字的全记下来
@@ -948,6 +974,34 @@ static bool install_hooks() {
         if (fc) {
             void* o = try_hook(sh, *(void**)fc, (void*)hk_framecount, "frameCount");
             if (o) { g_orig_framecount = o; g_tick_mode |= 8; ok = true; }
+        }
+    }
+
+    // 实例方法：游戏高频调用，且 AOT 签名简单
+    Il2CppClass* ObjCls2 = find_class_any("UnityEngine", "Object");
+    if (ObjCls2) {
+        const MethodInfo* nm = find_method(ObjCls2, "get_name", 0);
+        if (nm) {
+            void* o = try_hook(sh, *(void**)nm, (void*)hk_name, "Object.get_name");
+            if (o) { g_orig_name = o; g_tick_mode |= 16; ok = true; }
+        }
+    }
+
+    Il2CppClass* CompCls2 = find_class_any("UnityEngine", "Component");
+    if (CompCls2) {
+        const MethodInfo* gt = find_method(CompCls2, "get_transform", 0);
+        if (gt) {
+            void* o = try_hook(sh, *(void**)gt, (void*)hk_gettrans, "Component.get_transform");
+            if (o) { g_orig_gettrans = o; g_tick_mode |= 32; ok = true; }
+        }
+    }
+
+    Il2CppClass* TransCls2 = find_class_any("UnityEngine", "Transform");
+    if (TransCls2) {
+        const MethodInfo* gp = find_method(TransCls2, "get_position", 0);
+        if (gp) {
+            void* o = try_hook(sh, *(void**)gp, (void*)hk_getpos, "Transform.get_position");
+            if (o) { g_orig_getpos = o; g_tick_mode |= 64; ok = true; }
         }
     }
 
