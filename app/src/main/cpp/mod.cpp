@@ -784,6 +784,9 @@ static void probe_types() {
     }
 }
 
+static long g_lastGO = -1;
+static long g_lastSMR = -1;
+
 static void do_patch_tick() {
     if (!g_tick_inited) {
         g_tick_inited = true;
@@ -793,15 +796,26 @@ static void do_patch_tick() {
     }
     if (!g_smrCls) return;
 
+    // 场景变化监控：GO / SMR 数量一变就报
+    {
+        static int probeTick = 0;
+        if ((probeTick++ % 20) == 0) {
+            Il2CppClass* GOCls = find_class_any("UnityEngine", "GameObject");
+            long go = GOCls ? scan_count(GOCls) : -200;
+            long smr = scan_count(g_smrCls);
+            if (go != g_lastGO || smr != g_lastSMR) {
+                g_lastGO = go;
+                g_lastSMR = smr;
+                LOGI("scene: GO=%ld SMR=%ld", go, smr);
+            }
+        }
+    }
+
     std::vector<Fingerprint> list;
     collect_fingerprints(g_smrCls, list);
     g_last_scan = list.size();
 
-    static int dt = 0;
-    if (list.empty()) {
-        if ((dt++ % 5) == 0) LOGI("tick: smrs=0 waiting (%d)", dt);
-        return;
-    }
+    if (list.empty()) return;
 
     int done = 0;
     for (auto& f : list) {
