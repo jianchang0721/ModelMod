@@ -2,6 +2,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <link.h>
 #include <sys/stat.h>
 #include <cstring>
 #include <cstdio>
@@ -150,13 +151,85 @@ static bool contains(const std::string& s, const char* k) {
 }
 
 // ================= 载入 libil2cpp =================
+static std::string self_cmdline() {
+    FILE* f = fopen("/proc/self/cmdline", "r");
+    if (!f) return "";
+    char buf[256] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    return std::string(buf, n ? strnlen(buf, n) : 0);
+}
+
+static void* try_noload() {
+    return dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+}
+
+static int phdr_cb(struct dl_phdr_info* info, size_t, void* data) {
+    if (!info->dlpi_name || !info->dlpi_name[0]) return 0;
+    if (strstr(info->dlpi_name, "libil2cpp.so")) {
+        *(void**)data = (void*)info->dlpi_addr;
+        return 1;
+    }
+    return 0;
+}
+
+static void* try_phdr() {
+    void* base = nullptr;
+    dl_iterate_phdr(phdr_cb, &base);
+    if (!base) return nullptr;
+    return dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+}
+
+static void* try_maps() {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return nullptr;
+    char line[512];
+    char path[256] = {0};
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "libil2cpp.so")) {
+            char* p = strchr(line, '/');
+            if (p) {
+                strncpy(path, p, sizeof(path) - 1);
+                char* nl = strchr(path, '\n');
+                if (nl) *nl = 0;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    if (path[0]) return dlopen(path, RTLD_NOW);
+    return nullptr;
+}
+
+static void dump_so_list() {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) { LOGE("cannot open maps"); return; }
+    char line[512];
+    std::map<std::string, int> seen;
+    while (fgets(line, sizeof(line), f)) {
+        char* p = strchr(line, '/');
+        if (!p) continue;
+        std::string path(p);
+        while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) path.pop_back();
+        if (path.find(".so") == std::string::npos) continue;
+        size_t slash = path.rfind('/');
+        std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
+        if (!seen.count(base)) { seen[base] = 1; LOGI("SO %s", base.c_str()); }
+    }
+    fclose(f);
+    LOGI("SO count %zu", seen.size());
+}
+
 static void* open_il2cpp() {
-    for (int i = 0; i < 600; i++) {
-        void* h = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
-        if (h) return h;
+    for (int i = 0; ; i++) {
+        void* h = try_noload();
+        if (!h) h = try_phdr();
+        if (!h) h = try_maps();
+        if (h) { LOGI("libil2cpp found after %d tries", i); return h; }
+        if (i == 300) { LOGI("30s passed, dumping so list"); dump_so_list(); }
+        if (i == 3000) { LOGI("300s passed, giving up dump"); dump_so_list(); }
         usleep(100 * 1000);
     }
-    return nullptr;
 }
 
 static bool bind_api(void* h) {
@@ -414,6 +487,13 @@ static int patch_scene_targeted(Il2CppClass* SMRCls, const MethodInfo* setMesh, 
 
 // ================= 工作线程 =================
 static void* worker(void*) {
+    std::string cmd = self_cmdline();
+    LOGI("worker start in [%s]", cmd.c_str());
+    if (cmd != "com.hermes.h1game") {
+        LOGI("subprocess, skip");
+        return nullptr;
+    }
+
     void* h = open_il2cpp();
     if (!h) { LOGE("libil2cpp.so not found"); return nullptr; }
     LOGI("libil2cpp.so ready: %p", h);
