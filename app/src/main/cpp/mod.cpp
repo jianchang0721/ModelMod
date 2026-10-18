@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdint>
+#include <cstdarg>
 #include <string>
 #include <vector>
 #include <map>
@@ -14,8 +15,11 @@
 #include "il2cpp_api.h"
 
 #define TAG "ModelMod"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+static void flog(const char* fmt, ...);
+
+#define LOGI(...) do { __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__); flog(__VA_ARGS__); } while (0)
+#define LOGE(...) do { __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__); flog(__VA_ARGS__); } while (0)
 
 // ================= 模式开关 =================
 // 0 = 只打印角色指纹（先跑这个，拿清单）
@@ -41,6 +45,28 @@ static const int RULE_COUNT = (int)(sizeof(g_rules) / sizeof(g_rules[0]));
 Il2CppApi g_api{};
 static Il2CppDomain* g_domain = nullptr;
 static std::map<std::string, Il2CppObject*> g_mesh_cache;
+
+// 日志同时落盘，手机直接用文件管理器看
+static FILE* log_fp() {
+    static FILE* fp = []() -> FILE* {
+        FILE* f = fopen("/data/data/com.hermes.h1game/files/modelmod.log", "a");
+        if (!f) f = fopen("/sdcard/Android/data/com.hermes.h1game/files/modelmod.log", "a");
+        if (!f) f = fopen("/data/local/tmp/modelmod.log", "a");
+        return f;
+    }();
+    return fp;
+}
+
+static void flog(const char* fmt, ...) {
+    FILE* fp = log_fp();
+    if (!fp) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    va_end(ap);
+    fputc('\n', fp);
+    fflush(fp);
+}
 
 // ================= 基础工具 =================
 static Il2CppClass* find_class_any(const char* ns, const char* name) {
