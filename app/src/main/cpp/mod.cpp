@@ -46,6 +46,7 @@ static CharRule g_rules[] = {
 static const int RULE_COUNT = (int)(sizeof(g_rules) / sizeof(g_rules[0]));
 
 Il2CppApi g_api{};
+static JavaVM* g_vm = nullptr;
 static Il2CppDomain* g_domain = nullptr;
 static std::map<std::string, Il2CppObject*> g_mesh_cache;
 
@@ -580,7 +581,21 @@ static void* worker(void*) {
     if (!g_domain) { LOGE("domain timeout"); return nullptr; }
     LOGI("domain ready: %p", g_domain);
 
-    g_api.thread_attach(g_domain);
+    // 先挂 JNI，il2cpp 的 Thread::Attach 内部要拿 JNIEnv，没有就 assert -> abort
+    if (g_vm) {
+        JNIEnv* env = nullptr;
+        JavaVMAttachArgs aa;
+        aa.version = JNI_VERSION_1_6;
+        aa.name = (char*)"ModelMod";
+        aa.group = nullptr;
+        jint r = g_vm->AttachCurrentThread(&env, &aa);
+        LOGI("AttachCurrentThread -> %d env=%p", (int)r, env);
+    } else {
+        LOGE("no JavaVM saved");
+    }
+
+    void* il2cpp_thread = g_api.thread_attach(g_domain);
+    LOGI("il2cpp_thread_attach -> %p", il2cpp_thread);
 
     Il2CppClass* SMRCls = nullptr;
     for (int i = 0; i < 900; i++) {
@@ -613,6 +628,7 @@ static void* worker(void*) {
 
 // ================= 入口 =================
 extern "C" jint JNI_OnLoad(JavaVM* vm, void*) {
+    g_vm = vm;
     LOGI("JNI_OnLoad entered");
     pthread_t t;
     pthread_create(&t, nullptr, worker, nullptr);
