@@ -54,6 +54,12 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static boolean overlayShown = false;
     private static int hideMask = 0;   // 默认全部显示
 
+    // 悬浮板块引用（折叠用）
+    private static ViewGroup[] cardBodies = new ViewGroup[4];
+    private static boolean[] cardVisible = new boolean[]{false, false, false, false};
+    private static TextView[] cardTitles = new TextView[4];
+    private static Activity overlayActivity;
+
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
         if (!TARGET.equals(lp.packageName)) return;
@@ -124,49 +130,150 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+    private static final int CARD_HIDE = 0;
+    private static final int CARD_MODEL = 1;
+    private static final int CARD_OVERLAY_OTHERS = 2;
+    private static final int CARD_LAYER = 3;
+
+    // 工具板块单独做一个窗口，不跟主面板挤在一起
+    private ViewGroup mkCard(Activity act, String name, int index) {
+        LinearLayout card = new LinearLayout(act);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(10, 8, 10, 8);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xCC1A1A22);
+        bg.setCornerRadius(14f);
+        bg.setStroke(1, 0x44FFD54F);
+        card.setBackground(bg);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        clp.topMargin = 6;
+        card.setLayoutParams(clp);
+
+        TextView h = new TextView(act);
+        h.setText(name);
+        h.setTextColor(0xFFFFD54F);
+        h.setTextSize(11);
+        h.setPadding(0, 2, 0, 4);
+        card.addView(h);
+        cardTitles[index] = h;
+
+        LinearLayout body = new LinearLayout(act);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setVisibility(View.GONE);
+        cardBodies[index] = body;
+        card.addView(body);
+
+        final int idx = index;
+        h.setOnClickListener(v -> {
+            boolean vis = body.getVisibility() == View.VISIBLE;
+            body.setVisibility(vis ? View.GONE : View.VISIBLE);
+            cardVisible[idx] = !vis;
+            h.setText((cardVisible[idx] ? "▼ " : "▶ ") + name);
+        });
+        return card;
+    }
+
+    private ViewGroup buildToolPanel(Activity act) {
+        LinearLayout panel = new LinearLayout(act);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(12, 10, 12, 10);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xE6121219);
+        bg.setCornerRadius(18f);
+        bg.setStroke(2, 0x66FFD54F);
+        panel.setBackground(bg);
+
+        TextView title = new TextView(act);
+        title.setText("工具");
+        title.setTextColor(0xFFFFD54F);
+        title.setTextSize(12);
+        title.setPadding(0, 2, 0, 6);
+        panel.addView(title);
+
+        // layer 指示器
+        final TextView info = new TextView(act);
+        info.setTextColor(0xFF7FD4FF);
+        info.setTextSize(10);
+        info.setText("layer: ...");
+        panel.addView(info);
+
+        LinearLayout btnRow = new LinearLayout(act);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        TextView btnReload = mkBtn(act, "刷新模型");
+        btnReload.setOnClickListener(v -> { try { reloadModel(); toast(act, "已刷新"); } catch (Throwable t) { } });
+        TextView btnPick = mkBtn(act, "加载模型");
+        btnPick.setOnClickListener(v -> pickModel(act));
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        blp.rightMargin = 10;
+        btnRow.addView(btnReload, blp);
+        btnRow.addView(btnPick, blp);
+        panel.addView(btnRow);
+
+        final Handler lh = new Handler(Looper.getMainLooper());
+        lh.post(new Runnable() {
+            @Override public void run() {
+                try { info.setText(getLayerInfo()); } catch (Throwable ignored) { }
+                lh.postDelayed(this, 1000);
+            }
+        });
+
+        // 单独窗口拖动
+        panel.setOnTouchListener(new View.OnTouchListener() {
+            private float dx, dy;
+            @Override public boolean onTouch(View v, MotionEvent e) {
+                switch (e.getAction()) {
+                    case MotionEvent.ACTION_DOWN:
+                        dx = e.getRawX() - panel.getX();
+                        dy = e.getRawY() - panel.getY();
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        panel.setX(e.getRawX() - dx);
+                        panel.setY(e.getRawY() - dy);
+                        return true;
+                }
+                return true;
+            }
+        });
+        return panel;
+    }
+
+    private static String hideName(int i) {
+        switch (i) {
+            case 0: return "隐藏开关";
+            case 1: return "工具";
+            case 2: return "";
+            default: return "";
+        }
+    }
+
     private void showOverlay(Activity act) {
         XposedBridge.log(TAG + "showOverlay on " + act.getClass().getName());
+        overlayActivity = act;
 
         final LinearLayout root = new LinearLayout(act);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(18, 10, 18, 10);
+        root.setPadding(12, 10, 12, 10);
 
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(0xE6121219);
-        bg.setCornerRadius(24f);
+        bg.setCornerRadius(18f);
         bg.setStroke(2, 0x66FFD54F);
         root.setBackground(bg);
-
-        LinearLayout header = new LinearLayout(act);
-        header.setOrientation(LinearLayout.HORIZONTAL);
-        header.setPadding(0, 4, 0, 4);
 
         final TextView title = new TextView(act);
         title.setText("ModelMod  ▾");
         title.setTextColor(0xFFFFD54F);
         title.setTextSize(13);
-        title.setPadding(0, 6, 0, 6);
-        header.addView(title);
+        title.setPadding(0, 4, 0, 8);
+        root.addView(title);
 
-        final LinearLayout body = new LinearLayout(act);
-        body.setOrientation(LinearLayout.VERTICAL);
-
-        TextView hint = new TextView(act);
-        hint.setText("勾选 = 隐藏");
-        hint.setTextColor(0xFF888888);
-        hint.setTextSize(10);
-        hint.setPadding(0, 0, 0, 6);
-        body.addView(hint);
-
+        // ---- 板块 1：隐藏开关 ----
+        cardTitles[CARD_HIDE] = null;   // mkCard 会自己填
+        ViewGroup hideCard = mkCard(act, "▶ 隐藏开关", CARD_HIDE);
         final String[] labels = {
-                "身体 Body",
-                "脸 Face",
-                "头发 Hair",
-                "武器 Weapon",
-                "描边 PX",
-                "NPC",
-                "特效 Effect",
-                "披风 Cloak"
+                "身体 Body", "脸 Face", "头发 Hair", "武器 Weapon",
+                "描边 PX", "NPC", "特效 Effect", "披风 Cloak"
         };
         for (int i = 0; i < labels.length; i++) {
             final int bit = i;
@@ -174,76 +281,35 @@ public class HookEntry implements IXposedHookLoadPackage {
             sw.setText(labels[i]);
             sw.setTextColor(Color.WHITE);
             sw.setTextSize(12);
-            sw.setPadding(0, 0, 0, 0);
             sw.setChecked((hideMask & (1 << bit)) != 0);
             sw.setOnCheckedChangeListener((btn, checked) -> {
                 if (checked) hideMask |= (1 << bit);
                 else hideMask &= ~(1 << bit);
-                try {
-                    setHideMask(hideMask);
-                } catch (Throwable ignored) {
-                }
+                try { setHideMask(hideMask); } catch (Throwable ignored) { }
             });
-            body.addView(sw);
+            cardBodies[CARD_HIDE].addView(sw);
         }
+        root.addView(hideCard);
 
-        // ---- 两个操作按钮 ----
-        LinearLayout btnRow = new LinearLayout(act);
-        btnRow.setOrientation(LinearLayout.HORIZONTAL);
-        btnRow.setPadding(0, 10, 0, 2);
-
-        TextView btnReload = mkBtn(act, "刷新模型");
-        btnReload.setOnClickListener(v -> {
-            try {
-                reloadModel();
-                toast(act, "已刷新");
-            } catch (Throwable t) {
-                XposedBridge.log(TAG + "reload fail: " + t);
-            }
-        });
-
-        TextView btnPick = mkBtn(act, "加载模型");
-        btnPick.setOnClickListener(v -> pickModel(act));
-
-        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        blp.rightMargin = 10;
-        btnRow.addView(btnReload, blp);
-        LinearLayout.LayoutParams blp2 = new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        btnRow.addView(btnPick, blp2);
-        body.addView(btnRow);
-
-        // layer 指示器：每秒刷新 camMask / 模型 layer / 原角色 layer
-        final TextView info = new TextView(act);
-        info.setTextColor(0xFF7FD4FF);
-        info.setTextSize(9);
-        info.setPadding(0, 10, 0, 0);
-        info.setText("layer: loading...");
-        body.addView(info);
-
-        final Handler lh = new Handler(Looper.getMainLooper());
-        lh.post(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    info.setText(getLayerInfo());
-                } catch (Throwable ignored) {
-                }
-                lh.postDelayed(this, 1000);
-            }
-        });
-
-        root.addView(header);
-        root.addView(body);
+        // ---- 板块 2：工具（拖动主面板时跟着走，可单独折叠） ----
+        ViewGroup modelCard = mkCard(act, "▶ 工具", CARD_MODEL);
+        cardBodies[CARD_MODEL].addView(buildToolPanel(act));
+        root.addView(modelCard);
 
         FrameLayout.LayoutParams flp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
         flp.leftMargin = 36;
         flp.topMargin = 260;
+        act.addContentView(root, flp);
+        ViewGroup clip = root;
+        ViewParent par2 = clip.getParent();
+        if (par2 instanceof ViewGroup) {
+            ((ViewGroup) par2).setClipChildren(false);
+            ((ViewGroup) par2).setClipToPadding(false);
+        }
 
-        header.setOnTouchListener(new View.OnTouchListener() {
+        title.setOnTouchListener(new View.OnTouchListener() {
             private float dx, dy;
             private long downAt;
             private boolean moved;
@@ -264,9 +330,25 @@ public class HookEntry implements IXposedHookLoadPackage {
                         return true;
                     case MotionEvent.ACTION_UP:
                         if (!moved && System.currentTimeMillis() - downAt < 300) {
-                            boolean visible = body.getVisibility() == View.VISIBLE;
-                            body.setVisibility(visible ? View.GONE : View.VISIBLE);
-                            title.setText(visible ? "ModelMod  ▸" : "ModelMod  ▾");
+                            boolean visible = root.getVisibility() == View.VISIBLE;
+                            boolean anyOpen = false;
+                            for (boolean b : cardVisible) if (b) anyOpen = true;
+                            if (anyOpen) {
+                                for (int i = 0; i < 4; i++) {
+                                    if (cardBodies[i] != null) cardBodies[i].setVisibility(View.GONE);
+                                    cardVisible[i] = false;
+                                    if (cardTitles[i] != null) cardTitles[i].setText("▶ " + hideName(i));
+                                }
+                                title.setText("ModelMod  ▸");
+                            } else {
+                                for (int i = 0; i < 4; i++) {
+                                    if (cardBodies[i] != null) cardBodies[i].setVisibility(View.VISIBLE);
+                                    cardVisible[i] = true;
+                                    if (cardTitles[i] != null) cardTitles[i].setText("▼ " + hideName(i));
+                                }
+                                title.setText("ModelMod  ▾");
+                            }
+                            title.invalidate();
                         }
                         return true;
                 }
