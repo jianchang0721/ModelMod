@@ -1823,7 +1823,25 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
     Il2CppObject* st = (smr && getTransC) ? invoke_inst(getTransC, smr, nullptr) : nullptr;
     Il2CppObject* sp = (st && getParent) ? invoke_inst(getParent, st, nullptr) : nullptr;
     LOGI("mmesh: step st=%p sp=%p setParent=%p", st, sp, (void*)setParent);
-    if (gt && sp && setParent) { void* a[1] = { sp }; invoke_inst(setParent, gt, a); LOGI("mmesh: parent ok"); }
+
+    // 直接挂到主相机前面 3 米，保证能看见（先验证渲染链路）
+    Il2CppClass* CamCls = find_class_any("UnityEngine", "Camera");
+    const MethodInfo* getMain = CamCls ? find_method(CamCls, "get_main", 0) : nullptr;
+    Il2CppObject* cam = getMain ? invoke_static(getMain, nullptr) : nullptr;
+    Il2CppObject* camT = (cam && getTransC) ? invoke_inst(getTransC, cam, nullptr) : nullptr;
+    LOGI("mmesh: camera=%p camTrans=%p", cam, camT);
+
+    if (gt && camT && setParent) {
+        void* a[1] = { camT };
+        invoke_inst(setParent, gt, a);
+        if (setLScale) { Vec3 s = {20, 20, 20}; void* b[1] = { &s }; invoke_inst(setLScale, gt, b); }
+        if (setLPos)   { Vec3 p = {0, 0, 3};    void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
+        LOGI("mmesh: attached to camera front");
+    } else if (gt && sp && setParent) {
+        void* a[1] = { sp };
+        invoke_inst(setParent, gt, a);
+        LOGI("mmesh: parent ok (no camera)");
+    }
 
     LOGI("mmesh: done go=%p trans=%p parent=%p", go, gt, sp);
     g_last_model_go = go;
