@@ -894,6 +894,33 @@ static void probe_playerloop() {
     }
 }
 
+// 枚举所有 MonoBehaviour 子类，找出真正带 Update 的（这些必定主线程每帧调、且走虚表不可内联）
+static void find_updates() {
+    Il2CppClass* MB = find_class_any("UnityEngine", "MonoBehaviour");
+    if (!MB) { LOGE("no MonoBehaviour class"); return; }
+
+    size_t n = 0;
+    const Il2CppAssembly** asms = g_api.domain_get_assemblies(g_domain, &n);
+    if (!asms) return;
+
+    int found = 0;
+    for (size_t i = 0; i < n && found < 60; i++) {
+        Il2CppImage* img = g_api.assembly_get_image(asms[i]);
+        if (!img) continue;
+        size_t cn = g_api.image_get_class_count(img);
+        for (size_t j = 0; j < cn && found < 60; j++) {
+            Il2CppClass* c = g_api.image_get_class(img, j);
+            if (!c) continue;
+            if (!g_api.class_is_assignable_from(MB, c)) continue;
+            const MethodInfo* m = find_method(c, "Update", 0);
+            if (!m) continue;
+            LOGI("UPDATE %s.%s", g_api.class_get_namespace(c), g_api.class_get_name(c));
+            found++;
+        }
+    }
+    LOGI("updates=%d", found);
+}
+
 static void probe_types() {
     const char* names[] = {"GameObject", "Transform", "MonoBehaviour", "Camera",
                            "SkinnedMeshRenderer", "MeshRenderer", "Animator"};
@@ -1318,6 +1345,7 @@ static void* worker(void*) {
     }
     if (!SMRCls) { LOGE("SkinnedMeshRenderer not found"); return nullptr; }
     LOGI("SkinnedMeshRenderer: %p", SMRCls);
+    find_updates();
 
     // UGUI 每帧必调的 CanvasUpdateRegistry.PerformUpdate（主线程）
     {
