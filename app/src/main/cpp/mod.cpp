@@ -1125,6 +1125,10 @@ static void do_patch_tick() {
 
 // 节流 + 防重入 + 只主线程执行
 static void main_tick() {
+    static thread_local int in_tick = 0;
+    if (in_tick) return;      // 防递归（以后 hook libc 时会用到）
+    in_tick = 1;
+
     pid_t tid = cur_tid();
     bool isMain = is_unity_main();
 
@@ -1140,8 +1144,8 @@ static void main_tick() {
         }
     }
 
-    if (!isMain) return;      // 非主线程不算数
-    if (__sync_lock_test_and_set(&g_tick_busy, 1)) return;
+    if (!isMain) { in_tick = 0; return; }      // 非主线程不算数
+    if (__sync_lock_test_and_set(&g_tick_busy, 1)) { in_tick = 0; return; }
 
     // 时间节流 250ms 一次，不看命中次数
     static struct timespec last = {0, 0};
@@ -1153,6 +1157,7 @@ static void main_tick() {
         do_patch_tick();
     }
     __sync_lock_release(&g_tick_busy);
+    in_tick = 0;
 }
 
 // get_deltaTime 是静态方法，AOT 签名 (MethodInfo* method)
@@ -1241,6 +1246,20 @@ static void* load_so_by_name(const char* soname) {
     return dlopen(path, RTLD_NOW);
 }
 
+// 每个 hook 点的快照，看门狗拿它判断代码是否被改回去
+struct HookRec {
+    void* code;
+    void* fn;
+    void* stub;
+    void* orig;
+    const char* tag;
+    unsigned char snap[16];
+    int reinstalls;
+};
+static std::vector<HookRec> g_hookrecs;
+static pthread_mutex_t g_hrec_mtx = PTHREAD_MUTEX_INITIALIZER;
+static void* g_shook = nullptr;
+
 static void* try_hook(void* sh, void* code, void* handler, const char* label) {
     typedef void* (*fn_hook)(void*, void*, void**);
     fn_hook h = (fn_hook)dlsym(sh, "shadowhook_hook_func_addr");
@@ -1248,7 +1267,61 @@ static void* try_hook(void* sh, void* code, void* handler, const char* label) {
     void* orig = nullptr;
     void* stub = h(code, handler, &orig);
     LOGI("hook %s: code=%p stub=%p orig=%p", label, code, stub, orig);
-    return (stub && orig) ? orig : nullptr;
+    if (!stub || !orig) return nullptr;
+
+    HookRec r;
+    r.code = code; r.fn = handler; r.stub = stub; r.orig = orig;
+    r.tag = label; r.reinstalls = 0;
+    memcpy(r.snap, code, 16);
+    pthread_mutex_lock(&g_hrec_mtx);
+    g_hookrecs.push_back(r);
+    g_shook = sh;
+    pthread_mutex_unlock(&g_hrec_mtx);
+    return orig;
+}
+
+// 看门狗：腾讯 ACE 会把 .text 改回去，这里每 80ms 对比快照，变了就重装
+static void* hook_watchdog(void*) {
+    typedef void* (*fn_hook)(void*, void*, void**);
+    typedef int (*fn_unhook)(void*);
+    int round = 0;
+    while (true) {
+        usleep(80 * 1000);
+        round++;
+        pthread_mutex_lock(&g_hrec_mtx);
+        for (size_t i = 0; i < g_hookrecs.size(); i++) {
+            HookRec& r = g_hookrecs[i];
+            if (memcmp((const void*)r.code, r.snap, 16) == 0) continue;
+
+            fn_hook h = (fn_hook)dlsym(g_shook, "shadowhook_hook_func_addr");
+            fn_unhook un = (fn_unhook)dlsym(g_shook, "shadowhook_unhook");
+            if (un && r.stub) un(r.stub);
+            void* orig2 = nullptr;
+            void* stub2 = h ? h(r.code, r.fn, &orig2) : nullptr;
+            if (stub2) {
+                r.stub = stub2;
+                if (orig2) r.orig = orig2;
+                memcpy(r.snap, (const void*)r.code, 16);
+                r.reinstalls++;
+                if (r.reinstalls <= 3 || (r.reinstalls % 50) == 0)
+                    LOGI("rehook %s #%d ok", r.tag, r.reinstalls);
+            } else {
+                if (r.reinstalls >= 0) LOGE("rehook %s FAILED", r.tag);
+                r.reinstalls = -1000000;
+            }
+        }
+        pthread_mutex_unlock(&g_hrec_mtx);
+
+        if (round >= 125) {   // 约 10 秒报一次总量
+            round = 0;
+            int total = 0;
+            pthread_mutex_lock(&g_hrec_mtx);
+            for (auto& r : g_hookrecs) if (r.reinstalls > 0) total += r.reinstalls;
+            pthread_mutex_unlock(&g_hrec_mtx);
+            LOGI("watchdog: total rehooks=%d points=%zu", total, g_hookrecs.size());
+        }
+    }
+    return nullptr;
 }
 
 static bool install_hooks() {
@@ -1612,6 +1685,15 @@ static void* worker(void*) {
             }
         } else {
             LOGE("no shadowhook");
+        }
+    }
+
+    // 看门狗：盯住所有 hook 点，被改回去就重装
+    {
+        pthread_t wt;
+        if (pthread_create(&wt, nullptr, hook_watchdog, nullptr) == 0) {
+            pthread_detach(wt);
+            LOGI("watchdog started");
         }
     }
 
