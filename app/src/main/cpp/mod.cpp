@@ -1022,6 +1022,7 @@ static void probe_types() {
 }
 
 static volatile int g_cube_done = 0;
+static volatile int g_replace_mode = 0;   // 1 = 隐藏原角色，用我们的模型顶替
 static Il2CppObject* g_last_model_go = nullptr;
 static Il2CppObject* g_model_go = nullptr;
 static long g_lastGO = -1;
@@ -2042,9 +2043,22 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
         }
         float k = 20.0f / psc;
         if (setLScale) { Vec3 s = {k, k, k}; void* b[1] = { &s }; invoke_inst(setLScale, gt, b); }
-        // 直接顶在头顶上方：身体会被原模型/特效挡住，头顶空着，最容易被看到
-        if (setLPos)   { Vec3 p = {0, 2.4f, 0}; void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
-        LOGI("mmesh: parent set to role root %p localScale=%f", roleRoot, k);
+
+        if (g_replace_mode) {
+            // 替换模式：模型站在角色原点，再把原模型的 SMR 关掉
+            if (setLPos) { Vec3 p = {0, 0, 0}; void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
+            if (smr && g_setEnabled) {
+                uint8_t off = 0;
+                void* a[1] = { &off };
+                invoke_inst(g_setEnabled, smr, a);
+                LOGI("mmesh: original SMR hidden (replace mode)");
+            }
+            LOGI("mmesh: parent set to role root %p scale=%f REPLACE", roleRoot, k);
+        } else {
+            // 预览模式：顶在头顶上方，不会被原模型/特效遮住
+            if (setLPos) { Vec3 p = {0, 2.4f, 0}; void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
+            LOGI("mmesh: parent set to role root %p scale=%f ABOVE", roleRoot, k);
+        }
     }
 
     LOGI("mmesh: done go=%p trans=%p parent=%p", go, gt, sp);
@@ -2454,6 +2468,13 @@ static void* worker(void*) {
 
 // ================= 入口 =================
 // Java 层把游戏的 files 目录传进来，保证日志一定写得出去
+extern "C" JNIEXPORT void JNICALL
+Java_com_moss_modelmod_HookEntry_setReplaceMode(JNIEnv*, jclass, jint on) {
+    g_replace_mode = (int)on;
+    g_cube_done = 0;   // 重建一次，让新位置生效
+    LOGI("replace mode = %d", (int)on);
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_moss_modelmod_HookEntry_getLayerInfo(JNIEnv* env, jclass) {
     update_layer_info();

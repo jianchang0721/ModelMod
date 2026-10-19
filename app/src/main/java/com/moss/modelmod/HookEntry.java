@@ -43,6 +43,7 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static native void setLogPath(String path);
     private static native void setHideMask(int mask);
     private static native void reloadModel();
+    private static native void setReplaceMode(int on);
     private static native String getLayerInfo();
 
     private static final int REQ_PICK = 0x4D44;   // 自定义模型选择器
@@ -197,6 +198,17 @@ public class HookEntry implements IXposedHookLoadPackage {
         title.setTextSize(12);
         title.setPadding(0, 2, 0, 6);
         panel.addView(title);
+
+        // 替换模式开关
+        Switch rep = new Switch(act);
+        rep.setText("替换原角色");
+        rep.setTextColor(Color.WHITE);
+        rep.setTextSize(12);
+        rep.setChecked(false);
+        rep.setOnCheckedChangeListener((btn, checked) -> {
+            try { setReplaceMode(checked ? 1 : 0); } catch (Throwable ignored) { }
+        });
+        panel.addView(rep);
 
         // layer 指示器
         final TextView info = new TextView(act);
