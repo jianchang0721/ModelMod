@@ -3181,7 +3181,7 @@ static Il2CppObject* spawn_gpu_part_inner(Il2CppObject* baseSmr, Il2CppObject* r
     if (!gt) { LOGE("gpu: clone transform null"); return nullptr; }
 
     if (GOCls && cgo) {
-        const MethodInfo* setAct = find_method_any(GOCls, "SetActive", 1);
+        const MethodInfo* setAct = find_method_any(GOCls, "SetActive");
         if (setAct) { uint8_t t = 1; void* a[1] = { &t }; invoke_inst(setAct, cgo, a); }
     }
     // 克隆上带的 Animator 会跟原角色抢同一套骨骼，关掉
