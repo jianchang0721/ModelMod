@@ -1377,6 +1377,7 @@ static void main_tick() {
     struct timespec now;
     syscall(__NR_clock_gettime, CLOCK_MONOTONIC, &now);   // 绕开自己的 hook
     long ms = (long)(now.tv_sec - last.tv_sec) * 1000L + (now.tv_nsec - last.tv_nsec) / 1000000L;
+    ensure_model_visible();
     if (last.tv_sec == 0 || ms >= 3000) {
         last = now;
         do_patch_tick();
@@ -1722,6 +1723,29 @@ static void probe_native_mesh() {
 static char g_layer_info[192] = "model not spawned yet";
 static int g_model_layer = -1;
 static int g_role_layer = -1;
+
+// 200ms 检查一次：模型还在、相机 cullingMask 又没它的层，就补回去（切场景时引擎会改）
+static void ensure_model_visible() {
+    if (!g_model_go) return;
+    if (g_model_layer < 0) return;
+
+    Il2CppClass* CamCls = find_class_any("UnityEngine", "Camera");
+    if (!CamCls) return;
+    const MethodInfo* getMain = find_method(CamCls, "get_main", 0);
+    Il2CppObject* cam = getMain ? invoke_static(getMain, nullptr) : nullptr;
+    if (!cam) return;
+    const MethodInfo* getMask = find_method(CamCls, "get_cullingMask", 0);
+    const MethodInfo* setMask = find_method(CamCls, "set_cullingMask", 1);
+    if (!getMask || !setMask) return;
+    Il2CppObject* r = invoke_inst(getMask, cam, nullptr);
+    if (!r) return;
+    int cur = *(int*)((char*)r + 16);
+    if ((cur & (1 << g_model_layer)) != 0) return;
+    int want = cur | (1 << g_model_layer);
+    void* a[1] = { &want };
+    invoke_inst(setMask, cam, a);
+    LOGI("camMask fix: 0x%08X -> 0x%08X", cur, want);
+}
 
 static void update_layer_info() {
     int camMask = -1;

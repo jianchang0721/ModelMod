@@ -53,6 +53,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static boolean overlayShown = false;
     private static int hideMask = 0;   // 默认全部显示
+    private static long overlayAt = 0;   // 防抖：闪屏页和主界面都会走 onResume
 
     // 悬浮板块引用（折叠用）
     private static ViewGroup[] cardBodies = new ViewGroup[4];
@@ -97,12 +98,15 @@ public class HookEntry implements IXposedHookLoadPackage {
                 if (act == null || overlayShown) return;
                 String cn = act.getClass().getName();
                 if (cn.toLowerCase().contains("splash")) return;
+                long now = System.currentTimeMillis();
+                if (now - overlayAt < 3000) return;   // 3 秒内不重复弹
 
                 new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
                     @Override
                     public void run() {
                         if (overlayShown || act.isFinishing()) return;
                         overlayShown = true;
+                        overlayAt = System.currentTimeMillis();
                         try {
                             showOverlay(act);
                         } catch (Throwable t) {
