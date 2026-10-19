@@ -74,7 +74,7 @@ static std::string g_log_path;
 static FILE* g_log_fp = nullptr;
 static std::map<std::string, Il2CppObject*> g_mesh_cache;
 static bool g_inplace_mode = false;
-static volatile int g_hide_mask = 0x3F;   // bit0 Body, 1 Face, 2 Hair, 3 Weapon, 4 PX, 5 NPC
+static volatile int g_hide_mask = 0;   // 默认全显示。bit0 Body 1 Face 2 Hair 3 Weapon 4 PX 5 NPC 6 Effect 7 Cloak
 static const MethodInfo* g_setEnabled = nullptr;
 static std::map<void*, int> g_patched_meshes;
 
@@ -656,12 +656,22 @@ static int part_bit(const std::string& chain) {
     size_t p = chain.rfind('/');
     std::string leaf = (p == std::string::npos) ? chain : chain.substr(p + 1);
 
+    // 披风优先（Cloak / Cape）
+    if (leaf.find("Cloak") != std::string::npos || leaf.find("Cape") != std::string::npos) return 7;
+    // 特效层
+    if (leaf.find("Effect") != std::string::npos || leaf.find("Fx") != std::string::npos ||
+        leaf.find("FX") != std::string::npos || leaf.find("Trail") != std::string::npos ||
+        leaf.find("Glow") != std::string::npos || leaf.find("Aura") != std::string::npos) return 6;
+    // 描边
     if (leaf.find("PX") != std::string::npos) return 4;
+
     if (leaf.find("Weapon") != std::string::npos) return 3;
     if (leaf.find("Hair") != std::string::npos) return 2;
     if (leaf.find("Face") != std::string::npos) return 1;
     if (leaf.find("Body") != std::string::npos) return 0;
 
+    if (chain.find("Cloak") != std::string::npos || chain.find("Cape") != std::string::npos) return 7;
+    if (chain.find("Effect") != std::string::npos || chain.find("Trail") != std::string::npos) return 6;
     if (chain.find("_PX") != std::string::npos) return 4;
     if (chain.find("Weapon") != std::string::npos) return 3;
     if (chain.find("Hair") != std::string::npos) return 2;

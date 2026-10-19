@@ -12,6 +12,7 @@ import android.os.Looper;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.Switch;
@@ -35,7 +36,7 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static final String SELF   = "com.moss.modelmod";
 
     private static boolean overlayShown = false;
-    private static int hideMask = 0x3F;
+    private static int hideMask = 0;   // 默认全部显示
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
@@ -104,7 +105,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         bg.setStroke(2, 0x66FFD54F);
         root.setBackground(bg);
 
-        // 标题行（拖动 + 折叠）
         LinearLayout header = new LinearLayout(act);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setPadding(0, 4, 0, 4);
@@ -116,7 +116,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         title.setPadding(0, 6, 0, 6);
         header.addView(title);
 
-        // 开关容器
         final LinearLayout body = new LinearLayout(act);
         body.setOrientation(LinearLayout.VERTICAL);
 
@@ -127,7 +126,16 @@ public class HookEntry implements IXposedHookLoadPackage {
         hint.setPadding(0, 0, 0, 6);
         body.addView(hint);
 
-        final String[] labels = {"身体 Body", "脸 Face", "头发 Hair", "武器 Weapon", "描边 PX", "NPC"};
+        final String[] labels = {
+                "身体 Body",
+                "脸 Face",
+                "头发 Hair",
+                "武器 Weapon",
+                "描边 PX",
+                "NPC",
+                "特效 Effect",
+                "披风 Cloak"
+        };
         for (int i = 0; i < labels.length; i++) {
             final int bit = i;
             Switch sw = new Switch(act);
@@ -171,11 +179,9 @@ public class HookEntry implements IXposedHookLoadPackage {
                         moved = false;
                         return true;
                     case MotionEvent.ACTION_MOVE:
-                        float nx = e.getRawX() - dx;
-                        float ny = e.getRawY() - dy;
-                        if (Math.abs(nx - root.getX()) > 8 || Math.abs(ny - root.getY()) > 8) moved = true;
-                        root.setX(nx);
-                        root.setY(ny);
+                        root.setX(e.getRawX() - dx);
+                        root.setY(e.getRawY() - dy);
+                        moved = true;
                         return true;
                     case MotionEvent.ACTION_UP:
                         if (!moved && System.currentTimeMillis() - downAt < 300) {
@@ -190,6 +196,14 @@ public class HookEntry implements IXposedHookLoadPackage {
         });
 
         act.addContentView(root, flp);
+
+        // 允许拖出容器边界
+        ViewParent par = root.getParent();
+        if (par instanceof ViewGroup) {
+            ((ViewGroup) par).setClipChildren(false);
+            ((ViewGroup) par).setClipToPadding(false);
+        }
+
         XposedBridge.log(TAG + "overlay added");
     }
 }
