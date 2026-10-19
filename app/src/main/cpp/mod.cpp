@@ -1023,6 +1023,7 @@ static void probe_types() {
 
 static volatile int g_cube_done = 0;
 static Il2CppObject* g_last_model_go = nullptr;
+static Il2CppObject* g_model_go = nullptr;
 static long g_lastGO = -1;
 
 // Instantiate hook：在主线程创建对象时插一脚
@@ -1309,6 +1310,7 @@ static void do_patch_tick() {
             LOGI("model: old destroyed %p", g_last_model_go);
         }
         g_last_model_go = nullptr;
+        g_model_go = nullptr;
     }
 
     std::vector<Fingerprint> list;
@@ -1961,6 +1963,7 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
 
     LOGI("mmesh: done go=%p trans=%p parent=%p", go, gt, sp);
     g_last_model_go = go;
+    g_model_go = go;
     return go;
 }
 
