@@ -1987,8 +1987,8 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
         }
         float k = 20.0f / psc;
         if (setLScale) { Vec3 s = {k, k, k}; void* b[1] = { &s }; invoke_inst(setLScale, gt, b); }
-        // 站在旁边半米，不再被原模型包住
-        if (setLPos)   { Vec3 p = {0.5f, 0, 0}; void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
+        // 直接顶在头顶上方：身体会被原模型/特效挡住，头顶空着，最容易被看到
+        if (setLPos)   { Vec3 p = {0, 2.4f, 0}; void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
         LOGI("mmesh: parent set to role root %p localScale=%f", roleRoot, k);
     }
 
