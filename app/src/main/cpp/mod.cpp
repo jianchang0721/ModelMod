@@ -885,6 +885,14 @@ static void hk_canvasupdate(void* m) {
 }
 
 static void* g_orig_setactive = nullptr;
+static void* g_orig_getpos = nullptr;
+
+struct Vec3 { float x, y, z; };
+
+static Vec3 hk_getpos(void* self, void* m) {
+    main_tick();
+    return ((Vec3(*)(void*, void*))g_orig_getpos)(self, m);
+}
 
 static void hk_setactive(void* self, void* m, uint8_t v) {
     static int cnt = 0;
@@ -1016,14 +1024,8 @@ static void main_tick() {
     if (__sync_lock_test_and_set(&g_tick_busy, 1)) return;
 
     // 按时间节流，不受调用次数影响
-    static struct timespec last = {0, 0};
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    double dt = (now.tv_sec - last.tv_sec) + (now.tv_nsec - last.tv_nsec) / 1e9;
-    if (dt >= 0.5) {
-        last = now;
-        do_patch_tick();
-    }
+    static int cnt = 0;
+    if ((cnt++ % 20) == 0) do_patch_tick();
     __sync_lock_release(&g_tick_busy);
 }
 
@@ -1319,6 +1321,22 @@ static void* worker(void*) {
                 if (sh) {
                     void* o = try_hook(sh, *(void**)sa, (void*)hk_setactive, "GameObject.SetActive");
                     if (o) { g_orig_setactive = o; LOGI("setactive hook ok"); }
+                }
+            }
+        }
+    }
+
+    // Transform.get_position：每帧每个物体都调，真正的脏活入口
+    {
+        Il2CppClass* TR = find_class_any("UnityEngine", "Transform");
+        if (TR) {
+            const MethodInfo* gp = find_method(TR, "get_position", 0);
+            LOGI("get_position=%p", (void*)gp);
+            if (gp) {
+                void* sh = load_so_by_name("libshadowhook.so");
+                if (sh) {
+                    void* o = try_hook(sh, *(void**)gp, (void*)hk_getpos, "Transform.get_position");
+                    if (o) { g_orig_getpos = o; LOGI("getpos hook ok"); }
                 }
             }
         }
