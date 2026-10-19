@@ -914,6 +914,7 @@ static void* g_orig_inst1 = nullptr;
 static void* g_orig_inst2 = nullptr;
 static int g_inst_hits = 0;
 static std::vector<Il2CppObject*> g_smr_queue;
+static std::set<std::string> g_path_dump;
 static pthread_mutex_t g_qmtx = PTHREAD_MUTEX_INITIALIZER;
 static void try_patch_in_main();
 static long g_lastSMR = -1;
@@ -1491,6 +1492,12 @@ static void* worker(void*) {
 
         int done = 0;
         for (auto& f : list) {
+            // 全路径采样，用于分析特效/披风的真实命名
+            if (g_path_dump.size() < 600 && !g_path_dump.count(f.chain)) {
+                g_path_dump.insert(f.chain);
+                LOGI("PATH %s", f.chain.c_str());
+            }
+
             if (done >= 4) break;
             if (g_patched_meshes.count(f.smr)) continue;
 
