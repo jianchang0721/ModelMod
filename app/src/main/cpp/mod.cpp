@@ -3984,7 +3984,7 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
                                     const MethodInfo* sm2 = find_method(MatCls, "set_mainTexture", 1);
                                     if (sm2) {
                                         void* sa[1]={tex}; invoke_inst(sm2, mat, sa);
-                                        const MethodInfo* gm2 = find_method(MatCls, "get_mainTexture");
+                                        const MethodInfo* gm2 = find_method_any(MatCls, "get_mainTexture");
                                         Il2CppObject* back = gm2 ? invoke_inst(gm2, mat, nullptr) : nullptr;
                                         LOGI("rigid: tex part=%d %ux%u readback=%s", part, tw, th,
                                              back == tex ? "OK" : "MISMATCH");
