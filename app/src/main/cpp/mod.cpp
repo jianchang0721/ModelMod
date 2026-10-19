@@ -2658,6 +2658,7 @@ static Il2CppObject* spawn_one_part(Il2CppObject* smr, Il2CppObject* roleRoot,
 
 
 
+
 // =====================================================================
 // v116：不克隆了，直接改原角色的 SkinnedMeshRenderer
 //
@@ -2730,23 +2731,17 @@ struct BwLayout { int idx[4]; int wgt[4]; int size; bool ok; };
 static BwLayout g_bw_layout = {{0,0,0,0},{0,0,0,0},0,false};
 
 static BwLayout bw_layout(Il2CppClass* BW) {
-    BwLayout L; L.ok = false; L.size = 0;
-    if (g_bw_layout.ok) return g_bw_layout;
-    const char* in[4] = {"m_BoneIndex0","m_BoneIndex1","m_BoneIndex2","m_BoneIndex3"};
-    const char* wn[4] = {"m_Weight0","m_Weight1","m_Weight2","m_Weight3"};
-    int mx = 0;
-    for (int k = 0; k < 4; k++) {
-        FieldInfo* a = find_own_field(BW, in[k]);
-        FieldInfo* b = find_own_field(BW, wn[k]);
-        if (!a || !b) { LOGE("gpu: BoneWeight missing %s/%s", in[k], wn[k]); return L; }
-        L.idx[k] = (int)g_api.field_get_offset(a);
-        L.wgt[k] = (int)g_api.field_get_offset(b);
-        if (L.idx[k] + 4 > mx) mx = L.idx[k] + 4;
-        if (L.wgt[k] + 4 > mx) mx = L.wgt[k] + 4;
-    }
-    L.size = mx; L.ok = true;
-    LOGI("gpu: BW layout i0=%d w0=%d i3=%d w3=%d span=%d stride=%d",
-         L.idx[0], L.wgt[0], L.idx[3], L.wgt[3], L.size, array_elem_size(BW, L.size));
+    BwLayout L;
+    // Unity 2018 的 BoneWeight 是 [StructLayout(LayoutKind.Sequential)]：
+    // (int boneIndex, float weight) x4，紧凑 32 字节。
+    // il2cpp_field_get_offset 返回的不是紧凑布局（实测 span=48），所以直接写死标准布局。
+    L.idx[0]=0;  L.wgt[0]=4;  L.idx[1]=8;  L.wgt[1]=12;
+    L.idx[2]=16; L.wgt[2]=20; L.idx[3]=24; L.wgt[3]=28;
+    L.size = 32; L.ok = true;
+    int stride = array_elem_size(BW, 32);
+    if (stride != 32)
+        LOGE("gpu: BoneWeight stride=%d != 32, using standard layout anyway", stride);
+    LOGI("gpu: BW layout std i0=0 w0=4 i3=24 w3=28 stride=%d", stride);
     g_bw_layout = L;
     return L;
 }
@@ -2815,38 +2810,123 @@ static bool read_mm2_names(const char* path, std::vector<std::string>& out) {
 }
 
 // ---------------------------------------------------------------
+// 骨骼名归一化 + 模糊映射
+//   我们的:  "Bip001 L Thigh"  -> "lthigh"
+//   游戏的:  "11055_L_Thigh"   -> "lthigh"
+// ---------------------------------------------------------------
+static std::string norm_bone(const std::string& in, bool stripBip) {
+    std::string s;
+    for (size_t i = 0; i < in.size(); i++) {
+        char c = in[i];
+        if (c == ' ' || c == '_' || c == '-' || c == '.') continue;
+        s.push_back((char)tolower((unsigned char)c));
+    }
+    if (stripBip && s.size() > 6 && s.compare(0, 6, "bip001") == 0) s = s.substr(6);
+    size_t k = 0;
+    while (k < s.size() && s[k] >= '0' && s[k] <= '9') k++;
+    if (k > 0) s = s.substr(k);
+    return s;
+}
+
+static bool bone_suffix_match(const std::string& a, const std::string& b) {
+    if (a.empty() || b.empty()) return false;
+    if (a == b) return true;
+    if (b.size() > a.size() && b.compare(b.size() - a.size(), a.size(), a) == 0) return true;
+    return false;
+}
+
+// 两轮：先精确相等，再后缀匹配
+static int map_bones(const std::vector<std::string>& ourNames,
+                     const std::vector<std::string>& gameNorm,
+                     std::vector<int>* gidxOut) {
+    int nb = (int)ourNames.size(), N = (int)gameNorm.size();
+    std::vector<int> gidx((size_t)nb, -1);
+    int found = 0;
+    for (int i = 0; i < nb; i++) {
+        std::string a = norm_bone(ourNames[i], true);
+        if (a.empty()) continue;
+        for (int j = 0; j < N; j++) {
+            if (gameNorm[j] == a) { gidx[i] = j; found++; break; }
+        }
+    }
+    for (int i = 0; i < nb; i++) {
+        if (gidx[i] >= 0) continue;
+        std::string a = norm_bone(ourNames[i], true);
+        if (a.empty()) continue;
+        for (int j = 0; j < N; j++) {
+            if (bone_suffix_match(a, gameNorm[j])) { gidx[i] = j; found++; break; }
+        }
+    }
+    if (gidxOut) *gidxOut = gidx;
+    return found;
+}
+
+static bool under_root_chain(Il2CppObject* smr, Il2CppObject* root) {
+    if (!smr || !root) return false;
+    Il2CppClass* CompC = find_class_any("UnityEngine", "Component");
+    Il2CppClass* TransC = find_class_any("UnityEngine", "Transform");
+    if (!CompC || !TransC) return false;
+    const MethodInfo* gt = find_method(CompC, "get_transform", 0);
+    const MethodInfo* gp = find_method(TransC, "get_parent", 0);
+    if (!gt || !gp) return false;
+    Il2CppObject* cur = invoke_inst(gt, smr, nullptr);
+    for (int i = 0; i < 12 && cur; i++) {
+        if (cur == root) return true;
+        cur = invoke_inst(gp, cur, nullptr);
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------
 // 挑骨骼命中数最多的原 SMR
 // ---------------------------------------------------------------
 static Il2CppObject* pick_best_smr(Il2CppClass* SMRCls, const std::vector<std::string>& names,
-                                   std::vector<Il2CppObject*>* outBones) {
+                                   Il2CppObject* preferRoot,
+                                   std::vector<Il2CppObject*>* outBones,
+                                   std::vector<std::string>* outNorm) {
     std::vector<Fingerprint> list;
     collect_fingerprints(SMRCls, list);
     const MethodInfo* gb = find_method_any(SMRCls, "get_bones");
     if (!gb) { LOGE("gpu: no get_bones"); return nullptr; }
+
     Il2CppObject* best = nullptr;
     int bestN = 0;
-    for (size_t i = 0; i < list.size(); i++) {
-        Il2CppObject* s = list[i].smr;
-        if (!s || !*(void**)((char*)s + 16)) continue;
-        Il2CppArray* a = (Il2CppArray*)invoke_inst(gb, s, nullptr);
-        if (!a) continue;
-        int n = 0;
-        for (size_t j = 0; j < a->max_length; j++) {
-            Il2CppObject* t = *(Il2CppObject**)array_addr(a, 8, j);
-            if (!t) continue;
-            std::string nm = obj_name(t);
-            if (nm.empty()) continue;
-            for (size_t k = 0; k < names.size(); k++) {
-                if (names[k] == nm) { n++; break; }
+    bool dumped = false;
+
+    // 第一轮只扫玩家角色根节点下的；不够再扫全场
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1 && bestN * 4 >= (int)names.size() * 3) break;
+        for (size_t i = 0; i < list.size(); i++) {
+            Il2CppObject* sm = list[i].smr;
+            if (!sm || !*(void**)((char*)sm + 16)) continue;
+            if (pass == 0 && preferRoot && !under_root_chain(sm, preferRoot)) continue;
+            Il2CppArray* a = (Il2CppArray*)invoke_inst(gb, sm, nullptr);
+            if (!a) continue;
+            int N = (int)a->max_length;
+            std::vector<std::string> gnorm((size_t)N);
+            for (int j = 0; j < N; j++) {
+                Il2CppObject* t = *(Il2CppObject**)array_addr(a, 8, (size_t)j);
+                gnorm[j] = t ? norm_bone(obj_name(t), false) : "";
             }
-        }
-        if (n >= 4) LOGI("gpu: cand %s bones=%d matched=%d", list[i].chain.c_str(), (int)a->max_length, n);
-        if (n > bestN) {
-            bestN = n; best = s;
-            if (outBones) {
-                outBones->clear();
-                for (size_t j = 0; j < a->max_length; j++)
-                    outBones->push_back(*(Il2CppObject**)array_addr(a, 8, j));
+            std::vector<int> gidx;
+            int n = map_bones(names, gnorm, &gidx);
+            if (n >= 3) LOGI("gpu: cand[p%d] %s bones=%d matched=%d", pass, list[i].chain.c_str(), N, n);
+            // 玩家角色骨骼名对不上时，把真实名字打出来看看
+            if (pass == 0 && !dumped && n * 2 < (int)names.size()) {
+                dumped = true;
+                for (int j = 0; j < N && j < 16; j++) {
+                    Il2CppObject* t = *(Il2CppObject**)array_addr(a, 8, (size_t)j);
+                    LOGI("  playBone[%d] = %s", j, t ? obj_name(t).c_str() : "(null)");
+                }
+            }
+            if (n > bestN) {
+                bestN = n; best = sm;
+                if (outNorm) *outNorm = gnorm;
+                if (outBones) {
+                    outBones->clear();
+                    for (int j = 0; j < N; j++)
+                        outBones->push_back(*(Il2CppObject**)array_addr(a, 8, (size_t)j));
+                }
             }
         }
     }
@@ -2894,7 +2974,7 @@ static void restore_mesh_native(Il2CppObject* node, void* backTo) {
 //   N: 目标 SMR 的骨骼总数（bindposes 必须这个长度）
 // ---------------------------------------------------------------
 static Il2CppObject* build_skinned_mesh(const char* meshPath,
-                                        const std::map<std::string,int>& name2idx,
+                                        const std::vector<std::string>& gameNorm,
                                         int N, int fallback, float k,
                                         int* outNv, int* outFound) {
     Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
@@ -2946,16 +3026,11 @@ static Il2CppObject* build_skinned_mesh(const char* meshPath,
     if (fread(ibm.data(),4,(size_t)nb*16,f) != (size_t)nb*16) { fclose(f); return nullptr; }
     fclose(f);
 
-    // 骨骼名 -> 目标数组下标
-    std::vector<int> gidx(nb, -1);
-    int found = 0, fb = -1;
-    for (uint32_t i = 0; i < nb; i++) {
-        std::map<std::string,int>::const_iterator it = name2idx.find(names[i]);
-        if (it != name2idx.end()) {
-            gidx[i] = it->second; found++;
-            if (fb < 0) fb = gidx[i];
-        }
-    }
+    // 骨骼名 -> 目标数组下标（模糊匹配）
+    std::vector<int> gidx;
+    int found = map_bones(names, gameNorm, &gidx);
+    int fb = -1;
+    for (uint32_t i = 0; i < nb; i++) if (gidx[i] >= 0) { fb = gidx[i]; break; }
     if (fb < 0) fb = fallback;
     for (uint32_t i = 0; i < nb; i++) if (gidx[i] < 0) gidx[i] = fb;
     LOGI("gpu: %s nv=%u nb=%u matched=%d/%u targetBones=%d", meshPath, nv, nb, found, nb, N);
@@ -3124,7 +3199,7 @@ static void destroy_our_smrs() {
 // ---------------------------------------------------------------
 static int replace_original_smr(Il2CppObject* SMRCls_unused, Il2CppObject* smr,
                                 const char* meshPath, const char* texPath,
-                                int N, const std::map<std::string,int>& name2idx,
+                                int N, const std::vector<std::string>& gameNorm,
                                 float k) {
     (void)SMRCls_unused;
     Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
@@ -3136,7 +3211,7 @@ static int replace_original_smr(Il2CppObject* SMRCls_unused, Il2CppObject* smr,
     LOGI("gpu: original mesh=%p nat=%p", origMesh, origNat);
 
     int nv = 0, found = 0;
-    Il2CppObject* ours = build_skinned_mesh(meshPath, name2idx, N, 0, k, &nv, &found);
+    Il2CppObject* ours = build_skinned_mesh(meshPath, gameNorm, N, 0, k, &nv, &found);
     if (!ours) { LOGE("gpu: build_skinned_mesh failed"); return 0; }
     void* oursNat = *(void**)((char*)ours + 16);
     LOGI("gpu: our mesh=%p nat=%p", ours, oursNat);
@@ -3195,22 +3270,18 @@ static int spawn_gpu_parts(Il2CppObject* origSmr) {
     Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
     if (!SMRCls) { LOGE("gpu: no SMR class"); return 0; }
 
+    Il2CppObject* roleRoot = find_role_root(origSmr);
+    LOGI("gpu: player roleRoot=%p", roleRoot);
+
     std::vector<Il2CppObject*> bones;
-    Il2CppObject* target = pick_best_smr(SMRCls, names, &bones);
+    std::vector<std::string> gameNorm;
+    Il2CppObject* target = pick_best_smr(SMRCls, names, roleRoot, &bones, &gameNorm);
     if (!target) { LOGE("gpu: no SMR matches our bones"); return 0; }
     int N = (int)bones.size();
     LOGI("gpu: target smr=%p bones=%d", target, N);
 
-    std::map<std::string,int> name2idx;
-    for (int i = 0; i < N; i++) {
-        Il2CppObject* t = bones[i];
-        if (!t) continue;
-        std::string nm = obj_name(t);
-        if (!nm.empty() && name2idx.find(nm) == name2idx.end()) name2idx[nm] = i;
-    }
-
     float k = 1.7f / 20.214f;
-    int ok = replace_original_smr(nullptr, target, p0, t0, N, name2idx, k);
+    int ok = replace_original_smr(nullptr, target, p0, t0, N, gameNorm, k);
     if (ok) { g_gpu_skin = 1; LOGI("gpu: GPU skinning ACTIVE"); }
     else     { LOGE("gpu: falling back to static path"); }
     return ok;
