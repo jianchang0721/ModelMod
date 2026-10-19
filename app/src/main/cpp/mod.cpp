@@ -1048,6 +1048,7 @@ static void ensure_model_visible();
 static Il2CppObject* find_role_root(Il2CppObject* smr);
 static bool under_player_root(Il2CppObject* smr);
 static int spawn_parts_loop(Il2CppObject* smr);
+static void build_target_list(Il2CppObject* playerRoot);
 static void update_skin_parts();
 static void* g_orig_canvas = nullptr;
 static void* g_orig_inst1 = nullptr;
@@ -1317,6 +1318,9 @@ static void do_patch_tick() {
             g_gpu_tried = 0; g_gpu_skin = 0; g_ourSmrs.clear();   // v114
         }
     }
+
+    // 目标列表（给悬浮窗选择用），每次 tick 刷一遍
+    build_target_list(g_player_root);
 
     // 已经干完活就不再全量扫描，别再拖主线程
     if (g_cube_done >= 1) return;
@@ -2881,6 +2885,52 @@ static bool under_root_chain(Il2CppObject* smr, Il2CppObject* root) {
 // ---------------------------------------------------------------
 // 挑骨骼命中数最多的原 SMR
 // ---------------------------------------------------------------
+// ---------------------------------------------------------------
+// 目标列表：给悬浮窗用，列出场景里所有可替换的 SMR
+// 显示用「角色根节点名 + 部件名 + 骨骼数」，玩家自己打星号
+// ---------------------------------------------------------------
+static pthread_mutex_t g_tgt_mtx = PTHREAD_MUTEX_INITIALIZER;
+static std::string g_tgt_list;
+static std::vector<Il2CppObject*> g_tgt_smrs;
+static volatile int g_tgt_sel = -1;      // -1 = 自动挑
+
+static void build_target_list(Il2CppObject* playerRoot) {
+    Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+    if (!SMRCls) return;
+    std::vector<Fingerprint> list;
+    collect_fingerprints(SMRCls, list);
+    const MethodInfo* gb = find_method_any(SMRCls, "get_bones");
+    std::string out;
+    std::vector<Il2CppObject*> smrs;
+    int idx = 0;
+    for (size_t i = 0; i < list.size(); i++) {
+        Il2CppObject* s = list[i].smr;
+        if (!s || !*(void**)((char*)s + 16)) continue;
+        Il2CppArray* a = gb ? (Il2CppArray*)invoke_inst(gb, s, nullptr) : nullptr;
+        int nb = a ? (int)a->max_length : 0;
+        if (nb < 12) continue;                 // 跳过脸骨、手指这种小骨架
+        std::string ch = list[i].chain;
+        std::string leaf = ch;
+        size_t p = ch.find_last_of('/');
+        if (p != std::string::npos) leaf = ch.substr(p + 1);
+        Il2CppObject* root = find_role_root(s);
+        std::string rootName = root ? obj_name(root) : std::string();
+        bool isPlayer = (playerRoot != nullptr) && under_root_chain(s, playerRoot);
+        char line[360];
+        snprintf(line, sizeof(line), "%d|%d|%s|%s|%d\n",
+                 idx, isPlayer ? 1 : 0,
+                 rootName.empty() ? leaf.c_str() : rootName.c_str(),
+                 leaf.c_str(), nb);
+        out += line;
+        smrs.push_back(s);
+        idx++;
+    }
+    pthread_mutex_lock(&g_tgt_mtx);
+    g_tgt_list = out;
+    g_tgt_smrs.swap(smrs);
+    pthread_mutex_unlock(&g_tgt_mtx);
+}
+
 static Il2CppObject* pick_best_smr(Il2CppClass* SMRCls, const std::vector<std::string>& names,
                                    Il2CppObject* preferRoot,
                                    std::vector<Il2CppObject*>* outBones,
@@ -3514,7 +3564,30 @@ static int spawn_gpu_parts(Il2CppObject* origSmr) {
 
     std::vector<Il2CppObject*> bones;
     std::vector<std::string> gameNorm;
-    Il2CppObject* target = pick_best_smr(SMRCls, names, roleRoot, &bones, &gameNorm);
+    Il2CppObject* target = nullptr;
+
+    // 用户手动选过就用它
+    if (g_tgt_sel >= 0) {
+        Il2CppObject* forced = nullptr;
+        pthread_mutex_lock(&g_tgt_mtx);
+        if (g_tgt_sel < (int)g_tgt_smrs.size()) forced = g_tgt_smrs[g_tgt_sel];
+        pthread_mutex_unlock(&g_tgt_mtx);
+        if (forced && *(void**)((char*)forced + 16)) {
+            const MethodInfo* gb2 = find_method_any(SMRCls, "get_bones");
+            Il2CppArray* a2 = gb2 ? (Il2CppArray*)invoke_inst(gb2, forced, nullptr) : nullptr;
+            if (a2 && a2->max_length > 0) {
+                for (size_t j = 0; j < a2->max_length; j++) {
+                    Il2CppObject* t = *(Il2CppObject**)array_addr(a2, 8, j);
+                    bones.push_back(t);
+                    gameNorm.push_back(t ? norm_bone(obj_name(t), false) : "");
+                }
+                target = forced;
+                LOGI("gpu: USER-PICKED target idx=%d bones=%d", (int)g_tgt_sel, (int)a2->max_length);
+            }
+        }
+        if (!target) LOGE("gpu: picked target %d is gone, auto-picking", (int)g_tgt_sel);
+    }
+    if (!target) target = pick_best_smr(SMRCls, names, roleRoot, &bones, &gameNorm);
     if (!target) { LOGE("gpu: no SMR matches our bones"); return 0; }
     int N = (int)bones.size();
     LOGI("gpu: target smr=%p bones=%d", target, N);
@@ -4040,6 +4113,28 @@ Java_com_moss_modelmod_HookEntry_reloadModel(JNIEnv*, jclass) {
     destroy_our_smrs();        // v114: 干掉旧的 GPU 部件
     g_gpu_tried = 0; g_gpu_skin = 0;
     LOGI("reload requested: force rebuild");
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_moss_modelmod_HookEntry_getTargets(JNIEnv* env, jclass) {
+    pthread_mutex_lock(&g_tgt_mtx);
+    std::string out = g_tgt_list;
+    pthread_mutex_unlock(&g_tgt_mtx);
+    return env->NewStringUTF(out.c_str());
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_moss_modelmod_HookEntry_selectTarget(JNIEnv*, jclass, jint idx) {
+    g_tgt_sel = (int)idx;
+    g_gpu_tried = 0;
+    g_cube_done = 0;
+    g_force_tick = 1;
+    LOGI("target selected = %d, rebuild queued", (int)idx);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_moss_modelmod_HookEntry_selectedTarget(JNIEnv*, jclass) {
+    return (jint)g_tgt_sel;
 }
 
 extern "C" JNIEXPORT void JNICALL

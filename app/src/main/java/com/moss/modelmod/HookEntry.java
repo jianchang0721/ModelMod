@@ -45,6 +45,9 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static native void reloadModel();
     private static native void setReplaceMode(int on);
     private static native String getLayerInfo();
+    private static native String getTargets();
+    private static native void selectTarget(int idx);
+    private static native int selectedTarget();
 
     private static final int REQ_PICK = 0x4D44;   // 自定义模型选择器
 
@@ -228,6 +231,13 @@ public class HookEntry implements IXposedHookLoadPackage {
         btnRow.addView(btnReload, blp);
         btnRow.addView(btnPick, blp);
         panel.addView(btnRow);
+
+        LinearLayout btnRow2 = new LinearLayout(act);
+        btnRow2.setOrientation(LinearLayout.HORIZONTAL);
+        TextView btnTarget = mkBtn(act, "选择目标");
+        btnTarget.setOnClickListener(v -> showTargets(act));
+        btnRow2.addView(btnTarget, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        panel.addView(btnRow2);
 
         final Handler lh = new Handler(Looper.getMainLooper());
         lh.post(new Runnable() {
@@ -420,6 +430,53 @@ public class HookEntry implements IXposedHookLoadPackage {
         try {
             android.widget.Toast.makeText(act, msg, android.widget.Toast.LENGTH_SHORT).show();
         } catch (Throwable ignored) {
+        }
+    }
+
+    private void showTargets(Activity act) {
+        try {
+            String raw = getTargets();
+            if (raw == null || raw.trim().isEmpty()) {
+                toast(act, "还没扫到目标，进场景等几秒再点");
+                return;
+            }
+            String[] lines = raw.trim().split("\n");
+            final String[] names = new String[lines.length];
+            final int[] ids = new int[lines.length];
+            int n = 0;
+            int cur = -1;
+            try { cur = selectedTarget(); } catch (Throwable ignored) { }
+            for (String ln : lines) {
+                String[] p = ln.split("\\|");
+                if (p.length < 5) continue;
+                int id = Integer.parseInt(p[0].trim());
+                boolean me = "1".equals(p[1].trim());
+                String root = p[2];
+                String leaf = p[3];
+                String bones = p[4];
+                StringBuilder sb = new StringBuilder();
+                sb.append(me ? "★ " : "   ");
+                if (id == cur) sb.append("[已选] ");
+                sb.append(root);
+                if (!root.equals(leaf)) sb.append("  ").append(leaf);
+                sb.append("   (").append(bones).append(" 骨骼)");
+                names[n] = sb.toString();
+                ids[n] = id;
+                n++;
+            }
+            final String[] show = new String[n];
+            System.arraycopy(names, 0, show, 0, n);
+            new android.app.AlertDialog.Builder(act)
+                    .setTitle("选择要替换的目标（★ = 你自己）")
+                    .setItems(show, (d, which) -> {
+                        selectTarget(ids[which]);
+                        toast(act, "已选：" + show[which]);
+                    })
+                    .setNegativeButton("取消", null)
+                    .show();
+        } catch (Throwable t) {
+            toast(act, "读列表失败: " + t);
+            XposedBridge.log(TAG + " showTargets err " + t);
         }
     }
 
