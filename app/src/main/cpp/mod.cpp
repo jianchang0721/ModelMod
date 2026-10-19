@@ -992,7 +992,14 @@ static void hk_tween_update(void* self, void* m) {
 
 // libc 的 clock_gettime：UnityMain 每秒调几千次，这才是真正的高频主线程入口
 static int (*g_orig_cgt)(clockid_t, struct timespec*) = nullptr;
+
+// 兜底：hook 刚装上的瞬间有无数线程在调 clock_gettime，orig 还没赋值就崩了
+static int cgt_fallback(clockid_t id, struct timespec* ts) {
+    return (int)syscall(__NR_clock_gettime, id, ts);
+}
+
 static int hk_cgt(clockid_t id, struct timespec* ts) {
+    if (!g_orig_cgt) return cgt_fallback(id, ts);
     if (is_unity_main()) {
         g_hookcnt[HC_CGT]++;
         main_tick();
@@ -1175,9 +1182,9 @@ static void main_tick() {
     // 时间节流 250ms 一次，不看命中次数
     static struct timespec last = {0, 0};
     struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
+    syscall(__NR_clock_gettime, CLOCK_MONOTONIC, &now);   // 绕开自己的 hook
     long ms = (long)(now.tv_sec - last.tv_sec) * 1000L + (now.tv_nsec - last.tv_nsec) / 1000000L;
-    if (last.tv_sec == 0 || ms >= 250) {
+    if (last.tv_sec == 0 || ms >= 500) {
         last = now;
         do_patch_tick();
     }
@@ -1638,6 +1645,7 @@ static void* worker(void*) {
         void* cgt = dlsym(RTLD_DEFAULT, "clock_gettime");
         LOGI("clock_gettime addr=%p", cgt);
         if (shc && cgt) {
+            g_orig_cgt = cgt_fallback;   // 先给兜底，再改代码
             void* o = try_hook(shc, cgt, (void*)hk_cgt, "clock_gettime");
             if (o) { g_orig_cgt = (int(*)(clockid_t, struct timespec*))o; LOGI("cgt hook ok"); }
         }
