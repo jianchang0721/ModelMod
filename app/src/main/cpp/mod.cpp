@@ -3936,7 +3936,7 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
                 if (ShCls) {
                     const MethodInfo* sf = find_method(ShCls, "Find", 1);
                     if (sf) {
-                        const char* sn[] = {"Unlit/Texture", "Sprites/Default", "Mobile/Diffuse"};
+                        const char* sn[] = {"Unlit/Texture", "Mobile/Diffuse", "Sprites/Default"};
                         for (int q = 0; q < 3 && !mat; q++) {
                             void* a[1] = { g_api.string_new(sn[q]) };
                             Il2CppObject* sh = invoke_static(sf, a);
@@ -3944,7 +3944,8 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
                             mat = g_api.object_new(MatCls);
                             const MethodInfo* c1 = find_method(MatCls, ".ctor", 1);
                             if (c1) { void* b[1]={sh}; invoke_inst(c1, mat, b); }
-                            if (mat) usedShader = sn[q];
+                            if (mat) { usedShader = sn[q]; LOGI("rigid: shader pick[%d]=%s ok", q, sn[q]); }
+                            else LOGI("rigid: shader pick[%d]=%s null", q, sn[q]);
                         }
                     }
                 }
