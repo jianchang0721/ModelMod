@@ -2386,6 +2386,13 @@ static bool load_skin_part(FILE* f, Il2CppObject* mesh, int nv, int ni,
     return found > 0;
 }
 
+// Unity 对象被销毁后 m_CachedPtr 会归零，这时候碰它必崩
+static bool obj_alive(Il2CppObject* o) {
+    if (!o) return false;
+    void* np = *(void**)((char*)o + 16);
+    return np != nullptr;
+}
+
 // 每帧把蒙皮后的顶点写回 mesh
 static void update_skin_parts() {
     if (g_skinParts.empty()) return;
@@ -2397,6 +2404,14 @@ static void update_skin_parts() {
     const MethodInfo* getL2W   = find_method(TransCls, "get_localToWorldMatrix", 0);
     const MethodInfo* setVerts = find_method(MeshCls, "set_vertices", 1);
     if (!getL2W || !setVerts) return;
+
+    // 场景切换会把挂上去的对象销毁掉，这里先把死掉的 part 清掉
+    for (size_t i = g_skinParts.size(); i-- > 0; ) {
+        if (!obj_alive(g_skinParts[i].mesh)) {
+            LOGI("skin: part %zu dead, removed", i);
+            g_skinParts.erase(g_skinParts.begin() + i);
+        }
+    }
 
     for (auto& sp : g_skinParts) {
         if (!sp.mesh) continue;
@@ -2414,7 +2429,7 @@ static void update_skin_parts() {
         size_t nb = sp.bones.size();
         std::vector<float> mats(nb * 16, 0.0f);
         for (size_t b = 0; b < nb; b++) {
-            if (!sp.bones[b]) { mats[b*16+0] = 1; mats[b*16+5] = 1; mats[b*16+10] = 1; mats[b*16+15] = 1; continue; }
+            if (!obj_alive(sp.bones[b])) { mats[b*16+0] = 1; mats[b*16+5] = 1; mats[b*16+10] = 1; mats[b*16+15] = 1; continue; }
             Il2CppObject* m = invoke_inst(getL2W, sp.bones[b], nullptr);
             if (!m) continue;
             const float* mm = (const float*)((char*)m + 16);
@@ -2623,6 +2638,7 @@ static Il2CppObject* spawn_one_part(Il2CppObject* smr, Il2CppObject* roleRoot,
 
 // 一次加载 custom_0..custom_3
 static int spawn_parts_loop(Il2CppObject* smr) {
+    g_skinParts.clear();   // 重建时先清掉旧的蒙皮数据
     Il2CppObject* roleRoot = find_role_root(smr);
     if (!roleRoot) { LOGE("parts: no roleRoot"); return 0; }
 
