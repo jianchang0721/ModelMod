@@ -1039,6 +1039,7 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr);
 static void ensure_model_visible();
 static Il2CppObject* find_role_root(Il2CppObject* smr);
 static bool under_player_root(Il2CppObject* smr);
+static int spawn_parts_loop(Il2CppObject* smr);
 static void* g_orig_canvas = nullptr;
 static void* g_orig_inst1 = nullptr;
 static void* g_orig_inst2 = nullptr;
