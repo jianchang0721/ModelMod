@@ -169,18 +169,26 @@ static Il2CppClass* find_class_any(const char* ns, const char* name) {
 
 // 沿继承链往上找：il2cpp_class_get_methods 只返回该类自己声明的方法，
 // 不包含继承的。get_name 在 UnityEngine.Object 上，GameObject 自己是没有的。
+// il2cpp_class_get_methods 的迭代器是类内部共享的：worker 线程在扫时，主线程也扫，
+// 两边互相把迭代器搞坏 → find_method 返回 null → 主线程 collect_fingerprints 直接返回空
+static pthread_mutex_t g_find_mtx = PTHREAD_MUTEX_INITIALIZER;
+
 static const MethodInfo* find_method(Il2CppClass* klass, const char* name, int argc) {
     if (!klass) return nullptr;
-    for (Il2CppClass* k = klass; k; k = g_api.class_get_parent(k)) {
+    pthread_mutex_lock(&g_find_mtx);
+    const MethodInfo* found = nullptr;
+    for (Il2CppClass* k = klass; k && !found; k = g_api.class_get_parent(k)) {
         void* iter = nullptr;
         const MethodInfo* m;
         while ((m = g_api.class_get_methods(k, &iter))) {
             if (strcmp(g_api.method_get_name(m), name) != 0) continue;
             if ((int)g_api.method_get_param_count(m) != argc) continue;
-            return m;
+            found = m;
+            break;
         }
     }
-    return nullptr;
+    pthread_mutex_unlock(&g_find_mtx);
+    return found;
 }
 
 static void dump_class_methods(Il2CppClass* klass) {
@@ -2182,7 +2190,7 @@ static void* worker(void*) {
         }
 
         if (done > 0) LOGI("round %d done=%d", round, done);
-        sleep(2);
+        sleep(5);
     }
     return nullptr;
 }
