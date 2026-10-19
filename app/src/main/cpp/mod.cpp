@@ -1665,11 +1665,20 @@ static void probe_native_mesh() {
 // 加载我们自己转好的 .mmesh，主线程里建 Mesh + GameObject 挂到角色身上
 // 文件放在游戏私有目录，因为 app 读不了 /sdcard 上任意路径
 // ---------------------------------------------------------------
-#define MMESH_PATH "/data/user/0/com.hermes.h1game/files/human.mmesh"
+static const char* kMmeshPaths[] = {
+    "/sdcard/MT2/ModelMod/human.mmesh",
+    "/storage/emulated/0/MT2/ModelMod/human.mmesh",
+    "/data/user/0/com.hermes.h1game/files/human.mmesh",
+    "/data/data/com.hermes.h1game/files/human.mmesh",
+};
 
 static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
-    FILE* f = fopen(MMESH_PATH, "rb");
-    if (!f) { LOGE("mmesh: open fail %s", MMESH_PATH); return nullptr; }
+    FILE* f = nullptr;
+    for (auto p : kMmeshPaths) {
+        f = fopen(p, "rb");
+        if (f) { LOGI("mmesh: opened %s", p); break; }
+    }
+    if (!f) { LOGE("mmesh: all paths failed"); return nullptr; }
     char magic[4]; uint32_t nv = 0, ni = 0, flags = 0;
     if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MMSH", 4) != 0) { fclose(f); LOGE("mmesh: bad magic"); return nullptr; }
     fread(&nv, 4, 1, f); fread(&ni, 4, 1, f); fread(&flags, 4, 1, f);
