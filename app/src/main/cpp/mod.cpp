@@ -3078,7 +3078,8 @@ static int rewrite_original_mesh(Il2CppObject* mesh,
                                  const char* meshPath,
                                  const std::vector<std::string>& gameNorm,
                                  int N, int fallback, float k,
-                                 int* outNv, int* outFound) {
+                                 int* outNv, int* outFound,
+                                 float* boneWorldY = nullptr) {
     Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
     Il2CppClass* V3Cls   = find_class_any("UnityEngine", "Vector3");
     Il2CppClass* V2Cls   = find_class_any("UnityEngine", "Vector2");
@@ -3186,6 +3187,35 @@ static int rewrite_original_mesh(Il2CppObject* mesh,
     if (setN) { void* a[1] = { na }; invoke_inst(setN, mesh, a); }
     if (setU) { void* a[1] = { ua }; invoke_inst(setU, mesh, a); }
     { void* a[1] = { ia }; invoke_chk(setT, mesh, a); if (g_last_exc) { LOGE("gpu: set_triangles threw"); return 0; } }
+
+    // ---- 用目标骨骼的实际跨度重算 k ----
+    // 之前硬编码 1.7/20.214=0.084，但目标角色的骨骼跨度可能是 7 米，
+    // 差 11 倍 -> 顶点全被压到骨骼间距的 1/11，接缝撕裂。
+    if (boneWorldY) {
+        int pi = -1, hi = -1;
+        for (uint32_t i = 0; i < nb; i++) {
+            if (gameNorm[gidx[i]].find("pelvis") != std::string::npos) pi = gidx[i];
+            if (gameNorm[gidx[i]].find("head") != std::string::npos) hi = gidx[i];
+        }
+        float pmxSpan = 0.0f;
+        for (uint32_t i = 0; i < nb; i++) {
+            if (gameNorm[gidx[i]].find("pelvis") != std::string::npos)
+                pmxSpan -= ibm[(size_t)i*16 + 13];      // p_y
+            if (gameNorm[gidx[i]].find("head") != std::string::npos)
+                pmxSpan += ibm[(size_t)i*16 + 13];
+        }
+        float gameSpan = 0.0f;
+        if (pi >= 0 && hi >= 0 && pi < N && hi < N)
+            gameSpan = boneWorldY[hi] - boneWorldY[pi];
+        LOGI("gpu: k-auto pelvisBin=%d headBin=%d pmxSpan=%.3f gameSpan=%.3f", pi, hi, pmxSpan, gameSpan);
+        if (pmxSpan > 0.01f && gameSpan > 0.01f) {
+            float knew = gameSpan / pmxSpan;
+            LOGI("gpu: k auto %.5f -> %.5f", k, knew);
+            k = knew;
+        } else {
+            LOGE("gpu: k auto failed, keep %.5f", k);
+        }
+    }
 
     // bindposes 长度必须 = 骨骼数
     const MethodInfo* setBP = find_method_any(MeshCls, "set_bindposes");
@@ -3489,9 +3519,30 @@ static int replace_original_smr(Il2CppObject* SMRCls_unused, Il2CppObject* smr,
     LOGI("gpu: original mesh=%p nat=%p", origMesh, origNat);
     if (!origMesh || !origNat) { LOGE("gpu: no original mesh"); return 0; }
 
+    // 先读一遍每根骨骼的世界 Y（用来算自适应缩放 k）
+    std::vector<float> boneY;
+    {
+        Il2CppClass* TrCls = find_class_any("UnityEngine", "Transform");
+        const MethodInfo* gb4 = SMRCls ? find_method_any(SMRCls, "get_bones") : nullptr;
+        const MethodInfo* l2w = TrCls ? find_method_any(TrCls, "get_localToWorldMatrix") : nullptr;
+        Il2CppArray* ba = gb4 ? (Il2CppArray*)invoke_inst(gb4, smr, nullptr) : nullptr;
+        if (ba && l2w) {
+            boneY.assign((size_t)N, 0.0f);
+            for (int i = 0; i < N && i < (int)ba->max_length; i++) {
+                Il2CppObject* b = *(Il2CppObject**)array_addr(ba, 8, (size_t)i);
+                if (!b) continue;
+                Il2CppObject* m = invoke_inst(l2w, b, nullptr);
+                if (!m) continue;
+                const float* mm = (const float*)((char*)m + 16);
+                boneY[i] = mm[13];
+            }
+        }
+    }
+
     // ===== 方案 A：直接把原 mesh 的内容重写成我们的模型（不换引用）=====
     int nv = 0, found = 0;
-    int okA = rewrite_original_mesh(origMesh, meshPath, gameNorm, N, 0, k, &nv, &found);
+    int okA = rewrite_original_mesh(origMesh, meshPath, gameNorm, N, 0, k, &nv, &found,
+                                    boneY.empty() ? nullptr : boneY.data());
     if (okA) {
         Il2CppObject* back = invoke_inst(getSM, smr, nullptr);
         LOGI("gpu: sharedMesh after rewrite = %p (same obj? %d)", back, back == origMesh);
