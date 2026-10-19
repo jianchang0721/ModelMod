@@ -19,6 +19,7 @@
 #include <map>
 #include <set>
 #include <android/log.h>
+#include <time.h>
 
 #include "il2cpp_api.h"
 
@@ -75,6 +76,19 @@ static FILE* g_log_fp = nullptr;
 static std::map<std::string, Il2CppObject*> g_mesh_cache;
 static bool g_inplace_mode = false;
 static volatile int g_hide_mask = 0;   // 默认全显示。bit0 Body 1 Face 2 Hair 3 Weapon 4 PX 5 NPC 6 Effect 7 Cloak
+
+// 每个 hook 入口的命中数，用来判断哪个真的在高频跑
+static volatile int g_hookcnt[10] = {0};
+#define HC_TWEEN    0
+#define HC_CANVAS   1
+#define HC_SETACT   2
+#define HC_GETNAME  3
+#define HC_GETTRANS 4
+#define HC_GETPOS   5
+#define HC_EVENT    6
+#define HC_CSCALER  7
+#define HC_ASPECT   8
+#define HC_VOLUME   9
 static const MethodInfo* g_setEnabled = nullptr;
 static std::map<void*, int> g_patched_meshes;
 
@@ -947,6 +961,7 @@ static void try_patch_in_main();
 static long g_lastSMR = -1;
 
 static void hk_canvasupdate(void* m) {
+    g_hookcnt[HC_CANVAS]++;
     main_tick();
     ((void(*)(void*))g_orig_canvas)(m);
 }
@@ -956,17 +971,50 @@ static void* g_orig_tween = nullptr;
 
 // DOTween 的 Update：第三方 MonoBehaviour，虚表调用，不可能被内联
 static void hk_tween_update(void* self, void* m) {
+    g_hookcnt[HC_TWEEN]++;
     main_tick();
     ((void(*)(void*, void*))g_orig_tween)(self, m);
+}
+
+// dotween 之外每帧必调的 MonoBehaviour 候选
+static void* g_orig_event  = nullptr;
+static void* g_orig_cscaler = nullptr;
+static void* g_orig_aspect = nullptr;
+static void* g_orig_volume = nullptr;
+
+static void hk_event_update(void* self, void* m) {
+    g_hookcnt[HC_EVENT]++;
+    main_tick();
+    ((void(*)(void*, void*))g_orig_event)(self, m);
+}
+
+static void hk_cscaler_update(void* self, void* m) {
+    g_hookcnt[HC_CSCALER]++;
+    main_tick();
+    ((void(*)(void*, void*))g_orig_cscaler)(self, m);
+}
+
+static void hk_aspect_update(void* self, void* m) {
+    g_hookcnt[HC_ASPECT]++;
+    main_tick();
+    ((void(*)(void*, void*))g_orig_aspect)(self, m);
+}
+
+static void hk_volume_update(void* self, void* m) {
+    g_hookcnt[HC_VOLUME]++;
+    main_tick();
+    ((void(*)(void*, void*))g_orig_volume)(self, m);
 }
 static void* g_orig_getname = nullptr;
 
 static Il2CppString* hk_getname(void* self, void* m) {
+    g_hookcnt[HC_GETNAME]++;
     main_tick();
     return ((Il2CppString*(*)(void*, void*))g_orig_getname)(self, m);
 }
 
 static void hk_setactive(void* self, void* m, uint8_t v) {
+    g_hookcnt[HC_SETACT]++;
     static int cnt = 0;
     if (cnt < 10) {
         cnt++;
@@ -1059,7 +1107,7 @@ static void do_patch_tick() {
     // 不管 worker 是否已隐藏，前 3 个匹配的 SMR 直接造 cube（当前主线，安全）
     int done = 0;
     for (auto& f : list) {
-        if (done >= 1 || g_cube_done >= 3) break;
+        if (done >= 3 || g_cube_done >= 6) break;
 
         for (int r = 0; r < RULE_COUNT; r++) {
             if (!rule_matches(g_rules[r], f)) continue;
@@ -1080,24 +1128,30 @@ static void main_tick() {
     pid_t tid = cur_tid();
     bool isMain = is_unity_main();
 
-    static int tlog = 0;
     static int tmain = 0;
-    if (isMain && tmain < 30) {
+    if (isMain) {
         tmain++;
-        LOGI("tick MAIN #%d tid=%d cnt=%d", tmain, (int)tid, g_tick);
-    }
-    if (!isMain && (tlog++ % 500) == 0) {
-        char nm[16] = {0};
-        prctl(PR_GET_NAME, nm);
-        LOGI("tick sub tid=%d name=%s cnt=%d", (int)tid, nm, g_tick);
+        if (tmain <= 5 || (tmain % 200) == 0) {
+            LOGI("tick MAIN #%d tid=%d", tmain, (int)tid);
+            LOGI("hookcnt tween=%d canvas=%d setact=%d getname=%d gettrans=%d getpos=%d event=%d cscaler=%d aspect=%d volume=%d",
+                 g_hookcnt[HC_TWEEN], g_hookcnt[HC_CANVAS], g_hookcnt[HC_SETACT],
+                 g_hookcnt[HC_GETNAME], g_hookcnt[HC_GETTRANS], g_hookcnt[HC_GETPOS],
+                 g_hookcnt[HC_EVENT], g_hookcnt[HC_CSCALER], g_hookcnt[HC_ASPECT], g_hookcnt[HC_VOLUME]);
+        }
     }
 
     if (!isMain) return;      // 非主线程不算数
     if (__sync_lock_test_and_set(&g_tick_busy, 1)) return;
 
-    // 按时间节流，不受调用次数影响
-    static int cnt = 0;
-    if ((cnt++ % 20) == 0) do_patch_tick();
+    // 时间节流 250ms 一次，不看命中次数
+    static struct timespec last = {0, 0};
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long ms = (long)(now.tv_sec - last.tv_sec) * 1000L + (now.tv_nsec - last.tv_nsec) / 1000000L;
+    if (last.tv_sec == 0 || ms >= 250) {
+        last = now;
+        do_patch_tick();
+    }
     __sync_lock_release(&g_tick_busy);
 }
 
@@ -1130,11 +1184,13 @@ static Il2CppString* hk_name(void* self, void* m) {
 }
 
 static Il2CppObject* hk_gettrans(void* self, void* m) {
+    g_hookcnt[HC_GETTRANS]++;
     main_tick();
     return ((Il2CppObject*(*)(void*, void*))g_orig_gettrans)(self, m);
 }
 
 static Vec3 hk_getpos(void* self, void* m) {
+    g_hookcnt[HC_GETPOS]++;
     main_tick();
     return ((Vec3(*)(void*, void*))g_orig_getpos)(self, m);
 }
@@ -1372,6 +1428,28 @@ static void* worker(void*) {
             }
         } else {
             LOGE("no DOTweenComponent");
+        }
+    }
+
+    // 其他 MonoBehaviour.Update 候选：越多入口越好，总有一个高频
+    {
+        void* sh3 = load_so_by_name("libshadowhook.so");
+        struct Cand { const char* ns; const char* cls; void* fn; void** orig; const char* tag; };
+        Cand cands[] = {
+            { "UnityEngine.EventSystems", "EventSystem",       (void*)hk_event_update,  &g_orig_event,   "EventSystem.Update" },
+            { "UnityEngine.UI",           "CanvasScaler",      (void*)hk_cscaler_update,&g_orig_cscaler, "CanvasScaler.Update" },
+            { "UnityEngine.UI",           "AspectRatioFitter", (void*)hk_aspect_update, &g_orig_aspect,  "AspectRatioFitter.Update" },
+            { "UnityEngine.Experimental.Rendering", "Volume",  (void*)hk_volume_update, &g_orig_volume,  "Volume.Update" },
+        };
+        if (!sh3) LOGE("cand: no shadowhook");
+        for (auto& c : cands) {
+            Il2CppClass* K = find_class_any(c.ns, c.cls);
+            if (!K) { LOGE("cand: no class %s", c.cls); continue; }
+            const MethodInfo* up = find_method(K, "Update", 0);
+            if (!up) { LOGE("cand: no Update in %s", c.cls); continue; }
+            if (!sh3) break;
+            void* o = try_hook(sh3, *(void**)up, c.fn, c.tag);
+            if (o) *c.orig = o;
         }
     }
 
