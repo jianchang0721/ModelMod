@@ -1049,6 +1049,38 @@ static int cgt_fallback(clockid_t id, struct timespec* ts) {
     return (int)syscall(__NR_clock_gettime, id, ts);
 }
 
+// libunity/libil2cpp 的代码段范围：只有从这两个模块里发起 clock_gettime 才敢做重活
+// （从 malloc/GC/ART 内部调进来的，此时可能持着锁，再调 il2cpp 就死锁）
+static uintptr_t g_unity_lo = 0, g_unity_hi = 0;
+static uintptr_t g_il2cpp_lo = 0, g_il2cpp_hi = 0;
+
+static void find_module_ranges() {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        uintptr_t lo = 0, hi = 0;
+        if (sscanf(line, "%lx-%lx", &lo, &hi) != 2) continue;
+        if (strstr(line, "libunity.so")) {
+            if (!g_unity_lo || lo < g_unity_lo) g_unity_lo = lo;
+            if (hi > g_unity_hi) g_unity_hi = hi;
+        } else if (strstr(line, "libil2cpp.so")) {
+            if (!g_il2cpp_lo || lo < g_il2cpp_lo) g_il2cpp_lo = lo;
+            if (hi > g_il2cpp_hi) g_il2cpp_hi = hi;
+        }
+    }
+    fclose(f);
+    LOGI("ranges unity=%p-%p il2cpp=%p-%p", (void*)g_unity_lo, (void*)g_unity_hi,
+         (void*)g_il2cpp_lo, (void*)g_il2cpp_hi);
+}
+
+static bool safe_call_site() {
+    uintptr_t r = (uintptr_t)__builtin_return_address(0);
+    if (r >= g_unity_lo && r < g_unity_hi) return true;
+    if (r >= g_il2cpp_lo && r < g_il2cpp_hi) return true;
+    return false;
+}
+
 static int hk_cgt(clockid_t id, struct timespec* ts) {
     g_hookcnt[HC_CGT_ALL]++;          // 不管哪个线程，先进来就算
 
@@ -1070,7 +1102,7 @@ static int hk_cgt(clockid_t id, struct timespec* ts) {
         }
     }
 
-    if (is_unity_main()) {
+    if (is_unity_main() && safe_call_site()) {
         g_hookcnt[HC_CGT]++;
         main_tick();
     }
@@ -1215,7 +1247,7 @@ static void do_patch_tick() {
     }
 
     // 已经干完活就不再全量扫描，别再拖主线程
-    if (g_cube_done >= 3) return;
+    if (g_cube_done >= 1) return;
 
     std::vector<Fingerprint> list;
     collect_fingerprints(g_smrCls, list);
@@ -1226,7 +1258,7 @@ static void do_patch_tick() {
     // 不管 worker 是否已隐藏，前 3 个匹配的 SMR 直接造 cube（当前主线，安全）
     int done = 0;
     for (auto& f : list) {
-        if (done >= 1 || g_cube_done >= 3) break;
+        if (done >= 1 || g_cube_done >= 1) break;
 
         for (int r = 0; r < RULE_COUNT; r++) {
             if (!rule_matches(g_rules[r], f)) continue;
@@ -1254,7 +1286,7 @@ static void main_tick() {
     static int tmain = 0;
     if (isMain) {
         tmain++;
-        if (tmain <= 5 || (tmain % 1000) == 0) {
+        if (tmain <= 5 || (tmain % 20000) == 0) {
             LOGI("tick MAIN #%d tid=%d", tmain, (int)tid);
             LOGI("hookcnt tween=%d canvas=%d setact=%d getname=%d gettrans=%d getpos=%d event=%d cscaler=%d aspect=%d volume=%d",
                  g_hookcnt[HC_TWEEN], g_hookcnt[HC_CANVAS], g_hookcnt[HC_SETACT],
@@ -1738,6 +1770,8 @@ static void* worker(void*) {
             LOGE("no DOTweenComponent");
         }
     }
+
+    find_module_ranges();
 
     // libc clock_gettime：实测 UnityMain 每秒 5000+ 次，这是真正的主线程 tick
     // 不走 shadowhook（它没写入代码），用自己的 patch
