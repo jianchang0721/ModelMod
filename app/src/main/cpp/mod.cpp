@@ -2860,8 +2860,20 @@ static void probe_unity_api() {
 // 一个部位 = 一个 Mesh + 一个克隆来的 SkinnedMeshRenderer
 // 任何一步失败返回 nullptr，外层回落静态版
 // ---------------------------------------------------------------
-static Il2CppObject* spawn_gpu_part(Il2CppObject* origSmr, Il2CppObject* roleRoot,
-                                    const char* meshPath, const char* texPath, float k) {
+static Il2CppObject* g_orphan_clone = nullptr;
+
+static void destroy_one_obj(Il2CppObject* o) {
+    if (!o) return;
+    if (!*(void**)((char*)o + 16)) return;      // 已经被引擎销毁过
+    Il2CppClass* ObjectCls = find_class_any("UnityEngine", "Object");
+    const MethodInfo* destroy = ObjectCls ? find_method(ObjectCls, "Destroy", 1) : nullptr;
+    if (!destroy) return;
+    void* a[1] = { o };
+    invoke_inst(destroy, nullptr, a);
+}
+
+static Il2CppObject* spawn_gpu_part_inner(Il2CppObject* origSmr, Il2CppObject* roleRoot,
+                                          const char* meshPath, const char* texPath, float k) {
     Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
     Il2CppClass* V3Cls   = find_class_any("UnityEngine", "Vector3");
     Il2CppClass* V2Cls   = find_class_any("UnityEngine", "Vector2");
@@ -2927,6 +2939,20 @@ static Il2CppObject* spawn_gpu_part(Il2CppObject* origSmr, Il2CppObject* roleRoo
     void* ia[1] = { origSmr };
     Il2CppObject* clone = invoke_chk(inst1, nullptr, ia);
     if (!clone) { LOGE("gpu: Instantiate(SMR) failed"); return nullptr; }
+    g_orphan_clone = clone;     // 后面任何一步失败都由外层统一销毁
+
+    // 克隆会原样复制 enabled / activeSelf。替换开关一开，原 SMR 就是关着的，
+    // 克隆出来也是关的 —— 必须自己开回来，否则永远看不见
+    {
+        Il2CppClass* BehCls = find_class_any("UnityEngine", "Behaviour");
+        const MethodInfo* setEn = BehCls ? find_method(BehCls, "set_enabled", 1) : nullptr;
+        if (setEn) { uint8_t t = 1; void* a[1] = { &t }; invoke_inst(setEn, clone, a); }
+        const MethodInfo* getEn = BehCls ? find_method(BehCls, "get_enabled", 0) : nullptr;
+        if (getEn) {
+            Il2CppObject* e = invoke_inst(getEn, clone, nullptr);
+            LOGI("gpu: clone.enabled = %d", e ? (int)*(uint8_t*)((char*)e + 16) : -1);
+        }
+    }
 
     const MethodInfo* gb = find_method_any(SMRCls, "get_bones");
     Il2CppArray* origBones = gb ? (Il2CppArray*)invoke_inst(gb, clone, nullptr) : nullptr;
@@ -3142,6 +3168,26 @@ static Il2CppObject* spawn_gpu_part(Il2CppObject* origSmr, Il2CppObject* roleRoo
         if (cgo) gt = invoke_inst(getTransGO, cgo, nullptr);
     }
     if (!gt) { LOGE("gpu: clone transform null"); return nullptr; }
+
+    // GameObject 也可能是 inactive 的（池子里的模板），强制激活
+    {
+        Il2CppClass* GOCls2 = find_class_any("UnityEngine", "GameObject");
+        const MethodInfo* setAct = GOCls2 ? find_method(GOCls2, "SetActive", 1) : nullptr;
+        Il2CppClass* CompCls2 = find_class_any("UnityEngine", "Component");
+        const MethodInfo* getGO2 = CompCls2 ? find_method(CompCls2, "get_gameObject", 0) : nullptr;
+        if (setAct && getGO2) {
+            Il2CppObject* cg = invoke_inst(getGO2, clone, nullptr);
+            if (cg) { uint8_t t = 1; void* a[1] = { &t }; invoke_inst(setAct, cg, a); LOGI("gpu: clone SetActive(true)"); }
+        }
+        // 克隆上如果带着 Animator，会跟原角色抢同一套骨骼，直接关掉
+        Il2CppClass* AnimCls = find_class_any("UnityEngine", "Animator");
+        const MethodInfo* getComp = CompCls2 ? find_method(CompCls2, "GetComponent", 1) : nullptr;
+        if (AnimCls && getComp && g_setEnabled) {
+            void* a[1] = { g_api.type_get_object(g_api.class_get_type(AnimCls)) };
+            Il2CppObject* an = invoke_inst(getComp, clone, a);
+            if (an) { uint8_t f = 0; void* b[1] = { &f }; invoke_inst(g_setEnabled, an, b); LOGI("gpu: clone Animator disabled"); }
+        }
+    }
     if (roleRoot && setParent) {
         void* a[1] = { roleRoot };
         invoke_inst(setParent, gt, a);
@@ -3150,9 +3196,23 @@ static Il2CppObject* spawn_gpu_part(Il2CppObject* origSmr, Il2CppObject* roleRoo
     if (setLRot) { Quat q = {0,0,0,1}; void* b[1] = { &q }; invoke_inst(setLRot, gt, b); }
     if (setLPos) { Vec3 p = {0,0,0}; void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
 
+    g_orphan_clone = nullptr;   // 成功了，不回收
     g_ourSmrs.insert(clone);
     LOGI("gpu: PART OK %s clone=%p mesh=%p", meshPath, clone, mesh);
     return clone;
+}
+
+// 包装：失败了把半成品克隆销毁，别留在场景里叠着
+static Il2CppObject* spawn_gpu_part(Il2CppObject* origSmr, Il2CppObject* roleRoot,
+                                    const char* meshPath, const char* texPath, float k) {
+    g_orphan_clone = nullptr;
+    Il2CppObject* r = spawn_gpu_part_inner(origSmr, roleRoot, meshPath, texPath, k);
+    if (!r && g_orphan_clone) {
+        destroy_one_obj(g_orphan_clone);
+        LOGI("gpu: cleaned orphan clone %p", g_orphan_clone);
+        g_orphan_clone = nullptr;
+    }
+    return r;
 }
 
 static void destroy_our_smrs() {
