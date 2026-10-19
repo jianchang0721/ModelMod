@@ -1166,7 +1166,7 @@ static void do_patch_tick() {
     // 场景变化监控：GO / SMR 数量一变就报
     {
         static int probeTick = 0;
-        if ((probeTick++ % 20) == 0) {
+        if ((probeTick++ % 3) == 0) {
             Il2CppClass* GOCls = find_class_any("UnityEngine", "GameObject");
             long go = GOCls ? scan_count(GOCls) : -200;
             long smr = scan_count(g_smrCls);
@@ -1178,6 +1178,9 @@ static void do_patch_tick() {
         }
     }
 
+    // 已经干完活就不再全量扫描，别再拖主线程
+    if (g_cube_done >= 3) return;
+
     std::vector<Fingerprint> list;
     collect_fingerprints(g_smrCls, list);
     g_last_scan = list.size();
@@ -1187,7 +1190,7 @@ static void do_patch_tick() {
     // 不管 worker 是否已隐藏，前 3 个匹配的 SMR 直接造 cube（当前主线，安全）
     int done = 0;
     for (auto& f : list) {
-        if (done >= 3 || g_cube_done >= 6) break;
+        if (done >= 1 || g_cube_done >= 3) break;
 
         for (int r = 0; r < RULE_COUNT; r++) {
             if (!rule_matches(g_rules[r], f)) continue;
@@ -1215,7 +1218,7 @@ static void main_tick() {
     static int tmain = 0;
     if (isMain) {
         tmain++;
-        if (tmain <= 5 || (tmain % 100) == 0) {
+        if (tmain <= 5 || (tmain % 1000) == 0) {
             LOGI("tick MAIN #%d tid=%d", tmain, (int)tid);
             LOGI("hookcnt tween=%d canvas=%d setact=%d getname=%d gettrans=%d getpos=%d event=%d cscaler=%d aspect=%d volume=%d",
                  g_hookcnt[HC_TWEEN], g_hookcnt[HC_CANVAS], g_hookcnt[HC_SETACT],
@@ -1233,7 +1236,7 @@ static void main_tick() {
     struct timespec now;
     syscall(__NR_clock_gettime, CLOCK_MONOTONIC, &now);   // 绕开自己的 hook
     long ms = (long)(now.tv_sec - last.tv_sec) * 1000L + (now.tv_nsec - last.tv_nsec) / 1000000L;
-    if (last.tv_sec == 0 || ms >= 500) {
+    if (last.tv_sec == 0 || ms >= 3000) {
         last = now;
         do_patch_tick();
     }
