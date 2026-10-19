@@ -1486,6 +1486,45 @@ static void probe_native_mesh() {
     }
 }
 
+// 实测 0x1d8 就是 native SkinnedMeshRenderer 里的 mesh 指针，直接改它换模型
+#define NATIVE_MESH_OFF 0x1d8
+
+static void test_native_swap() {
+    Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+    if (!SMRCls) return;
+    const MethodInfo* getMesh = find_method(SMRCls, "get_sharedMesh", 0);
+    if (!getMesh) return;
+
+    std::vector<Fingerprint> list;
+    collect_fingerprints(SMRCls, list);
+
+    Il2CppObject* smrA = nullptr; Il2CppObject* meshA = nullptr;
+    Il2CppObject* smrB = nullptr; Il2CppObject* meshB = nullptr;
+    for (auto& f : list) {
+        if (f.chain.find("Body") == std::string::npos) continue;
+        Il2CppObject* m = invoke_inst(getMesh, f.smr, nullptr);
+        if (!m) continue;
+        if (!smrA) { smrA = f.smr; meshA = m; continue; }
+        if (m == meshA) continue;
+        smrB = f.smr; meshB = m; break;
+    }
+    if (!smrA || !smrB) { LOGI("swap: need 2 distinct meshes (A=%p B=%p)", smrA, smrB); return; }
+
+    void* natA = *(void**)((char*)smrA + 16);
+    void* nMeshB = *(void**)((char*)meshB + 16);
+    if (!natA || !nMeshB) { LOGE("swap: null nat ptr"); return; }
+
+    void* old = *(void**)((char*)natA + NATIVE_MESH_OFF);
+    *(void**)((char*)natA + NATIVE_MESH_OFF) = nMeshB;
+    LOGI("swap: smrA=%p nat=%p off=0x%x old=%p new=%p", smrA, natA, NATIVE_MESH_OFF, old, nMeshB);
+    LOGI("swap: meshA=%p meshB=%p", meshA, meshB);
+
+    void* back = *(void**)((char*)natA + NATIVE_MESH_OFF);
+    LOGI("swap: readback=%p %s", back, back == nMeshB ? "OK" : "MISMATCH");
+    Il2CppObject* after = invoke_inst(getMesh, smrA, nullptr);
+    LOGI("swap: get_sharedMesh after=%p (want %p)", after, meshB);
+}
+
 // ================= 工作线程 =================
 static void* worker(void*) {
     // 等 Java 层把日志路径传过来，最多等 2 秒
@@ -1786,6 +1825,10 @@ static void* worker(void*) {
         {
             static int probed = 0;
             if (!probed && list.size() >= 10) { probed = 1; probe_native_mesh(); }
+        }
+        {
+            static int swapped = 0;
+            if (!swapped && round >= 12 && list.size() >= 10) { swapped = 1; test_native_swap(); }
         }
 
         int done = 0;
