@@ -1321,24 +1321,55 @@ static void do_patch_tick() {
     if (list.empty()) return;
 
     // 不管 worker 是否已隐藏，前 3 个匹配的 SMR 直接造 cube（当前主线，安全）
-    // 选靶子：优先真玩家角色（PlayerRoot），其次角色池，最后随便一个 Body
-    // 只认你自己的角色：PlayerRoot 下的 Body；预览/池子（VisualPool）全跳过
-    // （挂到池子上等于挂到屏幕外，永远看不见）
+    // 选靶子：离主相机最近的那个 Body 就是你自己
+    // （PlayerRoot 下同时挂着自己和对面玩家，光看路径分不出谁是谁）
     Il2CppObject* pick = nullptr;
     const char* chainOf = nullptr;
-    for (auto& f : list) {
-        if (f.chain.find("PlayerRoot") != std::string::npos &&
-            f.chain.find("Body") != std::string::npos) {
-            pick = f.smr; chainOf = f.chain.c_str(); break;
+    {
+        float camX = 0, camY = 0, camZ = 0;
+        bool haveCam = false;
+        Il2CppClass* CamClsP = find_class_any("UnityEngine", "Camera");
+        Il2CppClass* TransClsP = find_class_any("UnityEngine", "Transform");
+        if (CamClsP && TransClsP) {
+            const MethodInfo* getMainP = find_method(CamClsP, "get_main", 0);
+            Il2CppObject* cam = getMainP ? invoke_static(getMainP, nullptr) : nullptr;
+            const MethodInfo* getTransC2 = find_method(find_class_any("UnityEngine", "Component"), "get_transform", 0);
+            const MethodInfo* getPosP = find_method(TransClsP, "get_position", 0);
+            if (cam && getTransC2 && getPosP) {
+                Il2CppObject* ct = invoke_inst(getTransC2, cam, nullptr);
+                Il2CppObject* po = ct ? invoke_inst(getPosP, ct, nullptr) : nullptr;
+                if (po) {
+                    Vec3 v = *(Vec3*)((char*)po + 16);
+                    camX = v.x; camY = v.y; camZ = v.z;
+                    haveCam = true;
+                }
+            }
         }
-    }
-    if (!pick) {
-        for (auto& f : list) {
-            if (f.chain.find("NPCRoot") == std::string::npos &&
-                f.chain.find("VisualPool") == std::string::npos &&
-                f.chain.find("AvatarPoolRoot") == std::string::npos &&
-                f.chain.find("Body") != std::string::npos) {
-                pick = f.smr; chainOf = f.chain.c_str(); break;
+
+        if (haveCam) {
+            float best = 1e18f;
+            for (auto& f : list) {
+                if (f.chain.find("Body") == std::string::npos) continue;
+                if (f.chain.find("VisualPool") != std::string::npos) continue;
+                if (f.chain.find("AvatarPoolRoot") != std::string::npos) continue;
+                if (f.chain.find("NPCRoot") != std::string::npos) continue;
+                Il2CppObject* t = getTransC2 ? invoke_inst(getTransC2, f.smr, nullptr) : nullptr;
+                Il2CppObject* po = t ? invoke_inst(getPosP, t, nullptr) : nullptr;
+                if (!po) continue;
+                Vec3 v = *(Vec3*)((char*)po + 16);
+                float dx = v.x - camX, dy = v.y - camY, dz = v.z - camZ;
+                float d = dx * dx + dy * dy + dz * dz;
+                if (d < best) { best = d; pick = f.smr; chainOf = f.chain.c_str(); }
+            }
+            LOGI("pick: nearest body dist2=%.1f", best);
+        }
+        // 拿不到相机位置时退回老的 PlayerRoot 优先
+        if (!pick) {
+            for (auto& f : list) {
+                if (f.chain.find("PlayerRoot") != std::string::npos &&
+                    f.chain.find("Body") != std::string::npos) {
+                    pick = f.smr; chainOf = f.chain.c_str(); break;
+                }
             }
         }
     }
