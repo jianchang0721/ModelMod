@@ -2088,6 +2088,54 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
         if (mat) {
             const MethodInfo* setMat = find_method(MRCls, "set_sharedMaterial", 1);
             if (setMat) { void* a[1] = { mat }; invoke_inst(setMat, mr, a); }
+
+            // ---- 挂贴图：读 .mmtex（"MMTX"+w+h+RGBA），建 Texture2D 塞进材质 ----
+            {
+                FILE* tf = nullptr;
+                const char* texPaths[] = {
+                    "/data/user/0/com.hermes.h1game/files/custom.mmtex",
+                    "/data/data/com.hermes.h1game/files/custom.mmtex",
+                    "/sdcard/MT2/ModelMod/body.mmtex",
+                };
+                for (auto tp : texPaths) { tf = fopen(tp, "rb"); if (tf) { LOGI("tex: opened %s", tp); break; } }
+                if (tf) {
+                    char tm[4]; uint32_t tw = 0, th = 0;
+                    if (fread(tm, 1, 4, tf) == 4 && memcmp(tm, "MMTX", 4) == 0) {
+                        fread(&tw, 4, 1, tf); fread(&th, 4, 1, tf);
+                        LOGI("tex: %ux%u", tw, th);
+                        if (tw > 0 && th > 0 && tw <= 4096 && th <= 4096) {
+                            size_t nbytes = (size_t)tw * th * 4;
+                            std::vector<unsigned char> px(nbytes);
+                            fread(px.data(), 1, nbytes, tf);
+
+                            Il2CppClass* TexCls = find_class_any("UnityEngine", "Texture2D");
+                            Il2CppClass* ByteCls = find_class_any("System", "Byte");
+                            if (TexCls && ByteCls) {
+                                const MethodInfo* tctor = find_method(TexCls, ".ctor", 2);
+                                Il2CppObject* tex = g_api.object_new(TexCls);
+                                if (tctor) { int wi = (int)tw, hi = (int)th; void* ta[2] = { &wi, &hi }; invoke_inst(tctor, tex, ta); }
+                                const MethodInfo* loadRaw = find_method(TexCls, "LoadRawTextureData", 1);
+                                const MethodInfo* apply = find_method(TexCls, "Apply", 0);
+                                if (tex && loadRaw) {
+                                    Il2CppArray* barr = g_api.array_new(ByteCls, nbytes);
+                                    memcpy(array_addr(barr, 1, 0), px.data(), nbytes);
+                                    void* la[1] = { barr };
+                                    invoke_inst(loadRaw, tex, la);
+                                    if (apply) invoke_inst(apply, tex, nullptr);
+                                    const MethodInfo* setMain = find_method(MatCls, "set_mainTexture", 1);
+                                    if (setMain) { void* sa[1] = { tex }; invoke_inst(setMain, mat, sa); LOGI("tex: mainTexture set %p", tex); }
+                                    else LOGE("tex: no set_mainTexture");
+                                } else {
+                                    LOGE("tex: tex=%p loadRaw=%p", tex, (void*)loadRaw);
+                                }
+                            }
+                        }
+                    }
+                    fclose(tf);
+                } else {
+                    LOGE("tex: no mmtex found");
+                }
+            }
         }
     }
 
