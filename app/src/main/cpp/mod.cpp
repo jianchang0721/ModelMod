@@ -1024,6 +1024,8 @@ static void probe_types() {
 static volatile int g_cube_done = 0;
 static volatile int g_replace_mode = 0;   // 1 = 隐藏原角色，用我们的模型顶替
 static Il2CppObject* g_player_root = nullptr;   // 玩家主控角色的根节点
+static volatile int g_hide_main_pending = 0;    // 替换开关切换后要立即刷一次隐藏
+static volatile int g_force_tick = 0;           // 刷新模型时跳过 3 秒节流
 static volatile int g_only_main = 1;            // 1 = 只隐藏主控，不动对面
 static Il2CppObject* g_last_model_go = nullptr;
 static Il2CppObject* g_model_go = nullptr;
@@ -1031,6 +1033,7 @@ static long g_lastGO = -1;
 
 // Instantiate hook：在主线程创建对象时插一脚
 static void main_tick();
+static void apply_replace_mode();
 static Il2CppObject* spawn_model_object(Il2CppObject* smr);
 static void ensure_model_visible();
 static Il2CppObject* find_role_root(Il2CppObject* smr);
@@ -1400,6 +1403,24 @@ static void do_patch_tick() {
     if (done > 0) LOGI("tick cube done=%d total=%zu", done, g_last_scan);
 }
 
+// 替换开关切换后立即生效：把主控角色下的所有 SMR 统一开/关
+static void apply_replace_mode() {
+    Il2CppClass* SMRCls = g_smrCls ? g_smrCls : find_class_any("UnityEngine", "SkinnedMeshRenderer");
+    if (!SMRCls) { LOGE("apply: no SMR class"); return; }
+    if (!g_player_root) { LOGE("apply: player root not locked yet"); return; }
+
+    std::vector<Fingerprint> list;
+    collect_fingerprints(SMRCls, list);
+    int n = 0;
+    for (auto& f : list) {
+        if (!under_player_root(f.smr)) continue;
+        uint8_t v = g_replace_mode ? 0 : 1;
+        void* a[1] = { &v };
+        if (g_setEnabled) { invoke_inst(g_setEnabled, f.smr, a); n++; }
+    }
+    LOGI("apply replace=%d -> %d smrs", (int)g_replace_mode, n);
+}
+
 // 节流 + 防重入 + 只主线程执行
 static void main_tick() {
     static thread_local int in_tick = 0;
@@ -1431,7 +1452,19 @@ static void main_tick() {
     syscall(__NR_clock_gettime, CLOCK_MONOTONIC, &now);   // 绕开自己的 hook
     long ms = (long)(now.tv_sec - last.tv_sec) * 1000L + (now.tv_nsec - last.tv_nsec) / 1000000L;
     ensure_model_visible();
-    if (last.tv_sec == 0 || ms >= 3000) {
+
+    // 开关切换：立即处理，不等 3 秒
+    if (g_hide_main_pending) {
+        g_hide_main_pending = 0;
+        apply_replace_mode();
+    }
+
+    // 刷新模型：跳过节流马上重建
+    if (g_force_tick) {
+        g_force_tick = 0;
+        last = now;
+        do_patch_tick();
+    } else if (last.tv_sec == 0 || ms >= 3000) {
         last = now;
         do_patch_tick();
     }
@@ -2527,7 +2560,9 @@ static void* worker(void*) {
 extern "C" JNIEXPORT void JNICALL
 Java_com_moss_modelmod_HookEntry_setReplaceMode(JNIEnv*, jclass, jint on) {
     g_replace_mode = (int)on;
-    g_cube_done = 0;   // 重建一次，让新位置生效
+    g_cube_done = 0;
+    g_force_tick = 1;
+    g_hide_main_pending = 1;   // 不等 tick，立即把主控角色开/关
     LOGI("replace mode = %d", (int)on);
 }
 
@@ -2540,7 +2575,8 @@ Java_com_moss_modelmod_HookEntry_getLayerInfo(JNIEnv* env, jclass) {
 extern "C" JNIEXPORT void JNICALL
 Java_com_moss_modelmod_HookEntry_reloadModel(JNIEnv*, jclass) {
     g_cube_done = 0;
-    LOGI("reload requested: cube_done reset");
+    g_force_tick = 1;          // 不跳 3 秒节流，下一 tick 立刻重建
+    LOGI("reload requested: force rebuild");
 }
 
 extern "C" JNIEXPORT void JNICALL
