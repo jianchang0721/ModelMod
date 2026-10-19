@@ -1996,6 +1996,28 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
     Il2CppObject* mr = invoke_inst(addComp, go, t2);
     LOGI("mmesh: MeshRenderer=%p", mr);
 
+    // 一次性地 dump 游戏骨骼名字，为后面把模型绑到游戏骨骼做准备
+    {
+        static int dumped = 0;
+        if (!dumped && smr) {
+            dumped = 1;
+            Il2CppClass* smrCls2 = g_api.object_get_class(smr);
+            const MethodInfo* getBones2 = find_method(smrCls2, "get_bones", 0);
+            Il2CppArray* bones = getBones2 ? (Il2CppArray*)invoke_inst(getBones2, smr, nullptr) : nullptr;
+            if (bones) {
+                LOGI("BONES count=%zu", bones->max_length);
+                size_t lim = bones->max_length > 90 ? 90 : bones->max_length;
+                for (size_t i = 0; i < lim; i++) {
+                    Il2CppObject* b = *(Il2CppObject**)array_addr(bones, sizeof(void*), i);
+                    if (!b) continue;
+                    LOGI("BONE %zu %s", i, obj_name(b).c_str());
+                }
+            } else {
+                LOGE("BONES: get_bones null");
+            }
+        }
+    }
+
     // 材质：优先自己建一个 unlit 纯色（借来的游戏材质不会对）
     if (mr) {
         Il2CppObject* mat = nullptr;
