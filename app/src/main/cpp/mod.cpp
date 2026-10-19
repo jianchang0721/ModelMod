@@ -1330,11 +1330,12 @@ static void do_patch_tick() {
         bool haveCam = false;
         Il2CppClass* CamClsP = find_class_any("UnityEngine", "Camera");
         Il2CppClass* TransClsP = find_class_any("UnityEngine", "Transform");
+        Il2CppClass* CompClsP = find_class_any("UnityEngine", "Component");
+        const MethodInfo* getTransC2 = CompClsP ? find_method(CompClsP, "get_transform", 0) : nullptr;
+        const MethodInfo* getPosP = TransClsP ? find_method(TransClsP, "get_position", 0) : nullptr;
         if (CamClsP && TransClsP) {
             const MethodInfo* getMainP = find_method(CamClsP, "get_main", 0);
             Il2CppObject* cam = getMainP ? invoke_static(getMainP, nullptr) : nullptr;
-            const MethodInfo* getTransC2 = find_method(find_class_any("UnityEngine", "Component"), "get_transform", 0);
-            const MethodInfo* getPosP = find_method(TransClsP, "get_position", 0);
             if (cam && getTransC2 && getPosP) {
                 Il2CppObject* ct = invoke_inst(getTransC2, cam, nullptr);
                 Il2CppObject* po = ct ? invoke_inst(getPosP, ct, nullptr) : nullptr;
@@ -1769,12 +1770,35 @@ static void ensure_model_visible() {
 
     Il2CppClass* CamCls = find_class_any("UnityEngine", "Camera");
     if (!CamCls) return;
-    const MethodInfo* getMain = find_method(CamCls, "get_main", 0);
-    Il2CppObject* cam = getMain ? invoke_static(getMain, nullptr) : nullptr;
-    if (!cam) return;
+    const MethodInfo* getAll = find_method(CamCls, "get_allCameras", 0);
     const MethodInfo* getMask = find_method(CamCls, "get_cullingMask", 0);
     const MethodInfo* setMask = find_method(CamCls, "set_cullingMask", 1);
     if (!getMask || !setMask) return;
+
+    // 遍历全部相机：战斗/主城可能不是 Camera.main 在渲染角色
+    Il2CppArray* cams = nullptr;
+    if (getAll) cams = (Il2CppArray*)invoke_static(getAll, nullptr);
+    if (cams) {
+        size_t n = cams->max_length > 16 ? 16 : cams->max_length;
+        for (size_t i = 0; i < n; i++) {
+            Il2CppObject* cam = *(Il2CppObject**)array_addr(cams, sizeof(void*), i);
+            if (!cam) continue;
+            Il2CppObject* r = invoke_inst(getMask, cam, nullptr);
+            if (!r) continue;
+            int cur = *(int*)((char*)r + 16);
+            if ((cur & (1 << g_model_layer)) != 0) continue;
+            int want = cur | (1 << g_model_layer);
+            void* a[1] = { &want };
+            invoke_inst(setMask, cam, a);
+            LOGI("cam[%zu] mask 0x%08X -> 0x%08X", i, cur, want);
+        }
+        return;
+    }
+
+    // 拿不到 allCameras 就退回 Camera.main
+    const MethodInfo* getMain = find_method(CamCls, "get_main", 0);
+    Il2CppObject* cam = getMain ? invoke_static(getMain, nullptr) : nullptr;
+    if (!cam) return;
     Il2CppObject* r = invoke_inst(getMask, cam, nullptr);
     if (!r) return;
     int cur = *(int*)((char*)r + 16);
