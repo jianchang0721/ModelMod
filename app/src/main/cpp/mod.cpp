@@ -2166,7 +2166,7 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
 
                                     // 关键：材质原来的 tint 是肉色，会和贴图相乘，刷成白色贴图才准
                                     const MethodInfo* setCol = find_method(MatCls, "set_color", 1);
-                                    if (setCol) { Color4 wcol = {1.0f, 0.0f, 0.0f, 1.0f}; void* ca[1] = { &wcol }; invoke_inst(setCol, mat, ca); LOGI("tex: tint red"); }
+                                    if (setCol) { Color4 wcol = {1.0f, 1.0f, 1.0f, 1.0f}; void* ca[1] = { &wcol }; invoke_inst(setCol, mat, ca); LOGI("tex: tint white"); }
 
                                     // 读回宽高确认纹理真的建出来了
                                     const MethodInfo* getW = find_method(TexCls, "get_width", 0);
