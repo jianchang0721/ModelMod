@@ -64,6 +64,9 @@ public class HookEntry implements IXposedHookLoadPackage {
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
         if (!TARGET.equals(lp.packageName)) return;
+        // 只处理主进程：子进程（:lebian.dns / :sandboxed_process1）也会进这里，
+        // 每个进程有自己的一份 static 变量，会在子进程里再弹一个窗
+        if (!TARGET.equals(lp.processName)) return;
         XposedBridge.log(TAG + "enter process: " + lp.processName);
 
         XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class,
@@ -251,9 +254,22 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+    private static View overlayRoot = null;
+
     private void showOverlay(Activity act) {
         XposedBridge.log(TAG + "showOverlay on " + act.getClass().getName());
         overlayActivity = act;
+
+        // 已经有一个就先拆掉，不管之前是谁挂的
+        if (overlayRoot != null) {
+            try {
+                ViewParent old = overlayRoot.getParent();
+                if (old instanceof ViewGroup) ((ViewGroup) old).removeView(overlayRoot);
+                XposedBridge.log(TAG + "overlay: removed previous root");
+            } catch (Throwable ignored) {
+            }
+            overlayRoot = null;
+        }
 
         final LinearLayout root = new LinearLayout(act);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -306,6 +322,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         flp.leftMargin = 36;
         flp.topMargin = 260;
         act.addContentView(root, flp);
+        overlayRoot = root;
         ViewGroup clip = root;
         ViewParent par2 = clip.getParent();
         if (par2 instanceof ViewGroup) {
