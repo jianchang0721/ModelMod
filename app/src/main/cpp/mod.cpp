@@ -74,6 +74,7 @@ static std::string g_log_path;
 static FILE* g_log_fp = nullptr;
 static std::map<std::string, Il2CppObject*> g_mesh_cache;
 static bool g_inplace_mode = false;
+static volatile int g_hide_mask = 0x3F;   // bit0 Body, 1 Face, 2 Hair, 3 Weapon, 4 PX, 5 NPC
 static const MethodInfo* g_setEnabled = nullptr;
 static std::map<void*, int> g_patched_meshes;
 
@@ -650,9 +651,27 @@ static bool path_has_id(const std::string& chain, const char* id) {
     return false;
 }
 
+static int part_bit(const std::string& chain) {
+    if (chain.find("Weapon") != std::string::npos) return 3;
+    if (chain.find("_PX") != std::string::npos) return 4;
+    if (chain.find("Hair") != std::string::npos) return 2;
+    if (chain.find("Face") != std::string::npos) return 1;
+    if (chain.find("Body") != std::string::npos) return 0;
+    return -1;
+}
+
+// 开关面板驱动：按部位 bit 判断要不要隐藏
 static bool rule_matches(const CharRule& r, const Fingerprint& f) {
-    if (!path_has_id(f.chain, r.id)) return false;
-    if (r.part && r.part[0] && !contains(f.chain, r.part)) return false;
+    (void)r;
+    int mask = g_hide_mask;
+
+    if (f.chain.compare(0, 9, "NPCRoot/") == 0) {
+        if (!(mask & (1 << 5))) return false;
+    }
+
+    int bit = part_bit(f.chain);
+    if (bit < 0) return false;
+    if (!(mask & (1 << bit))) return false;
     return true;
 }
 
@@ -1486,6 +1505,12 @@ static void* worker(void*) {
 
 // ================= 入口 =================
 // Java 层把游戏的 files 目录传进来，保证日志一定写得出去
+extern "C" JNIEXPORT void JNICALL
+Java_com_moss_modelmod_HookEntry_setHideMask(JNIEnv*, jclass, jint mask) {
+    g_hide_mask = (int)mask;
+    LOGI("hide mask = 0x%x", (unsigned)mask);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_moss_modelmod_HookEntry_setLogPath(JNIEnv* env, jclass, jstring path) {
     if (!path) return;
