@@ -48,6 +48,8 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static native String getTargets();
     private static native void selectTarget(int idx);
     private static native int selectedTarget();
+    private static native void setCustomEnabled(int on);
+    private static native int getCustomEnabled();
 
     private static final int REQ_PICK = 0x4D44;   // 自定义模型选择器
 
@@ -212,6 +214,19 @@ public class HookEntry implements IXposedHookLoadPackage {
             try { setReplaceMode(checked ? 1 : 0); } catch (Throwable ignored) { }
         });
         panel.addView(rep);
+
+        // 显示自定义模型总开关
+        Switch showCustom = new Switch(act);
+        showCustom.setText("显示自定义模型");
+        showCustom.setTextColor(0xFFFFD54F);
+        showCustom.setTextSize(12);
+        showCustom.setChecked(true);
+        try { showCustom.setChecked(getCustomEnabled() != 0); } catch (Throwable ignored) { }
+        showCustom.setOnCheckedChangeListener((btn, checked) -> {
+            try { setCustomEnabled(checked ? 1 : 0); toast(act, checked ? "已开启" : "已关闭"); }
+            catch (Throwable t) { }
+        });
+        panel.addView(showCustom);
 
         // layer 指示器
         final TextView info = new TextView(act);

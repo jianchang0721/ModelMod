@@ -1031,6 +1031,7 @@ static volatile int g_gpu_skin = 0;
 static volatile int g_gpu_tried = 0;
 static volatile int g_probed = 0;
 static std::set<Il2CppObject*> g_ourSmrs;
+static volatile int g_custom_on = 1;      // 1 = 显示我们自己的模型
 
 static volatile int g_replace_mode = 0;   // 1 = 隐藏原角色，用我们的模型顶替
 static Il2CppObject* g_player_root = nullptr;   // 玩家主控角色的根节点
@@ -4102,6 +4103,13 @@ static int spawn_parts_loop(Il2CppObject* smr) {
     Il2CppObject* roleRoot = find_role_root(smr);
     if (!roleRoot) { LOGE("parts: no roleRoot"); return 0; }
 
+    // 总开关关掉就直接不建
+    if (!g_custom_on) {
+        destroy_our_smrs();
+        LOGI("parts: custom model OFF, nothing spawned");
+        return 0;
+    }
+
     // v123: 先试刚性分段（每块挂到骨骼 Transform 下，不碰蒙皮）
     if (!g_gpu_skin) {
         int r = spawn_rigid_parts(smr);
@@ -4628,6 +4636,21 @@ Java_com_moss_modelmod_HookEntry_selectTarget(JNIEnv*, jclass, jint idx) {
     g_cube_done = 0;
     g_force_tick = 1;
     LOGI("target selected = %d, rebuild queued", (int)idx);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_moss_modelmod_HookEntry_setCustomEnabled(JNIEnv*, jclass, jint on) {
+    g_custom_on = (int)on;
+    destroy_our_smrs();
+    g_gpu_tried = 0;
+    g_cube_done = 0;
+    g_force_tick = 1;
+    LOGI("custom model = %s", on ? "ON" : "OFF");
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_moss_modelmod_HookEntry_getCustomEnabled(JNIEnv*, jclass) {
+    return (jint)g_custom_on;
 }
 
 extern "C" JNIEXPORT jint JNICALL
