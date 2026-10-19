@@ -66,10 +66,14 @@ static pid_t cur_tid() {
 }
 
 // UnityMain 线程的 tid 不等于 pid！只能靠线程名认
+// 缓存：clock_gettime 每秒几千次，不能每次都 prctl
 static bool is_unity_main() {
+    static thread_local int8_t cached = -1;
+    if (cached >= 0) return cached == 1;
     char name[16] = {0};
-    if (prctl(PR_GET_NAME, name) != 0) return false;
-    return strncmp(name, "UnityMain", 9) == 0;
+    if (prctl(PR_GET_NAME, name) != 0) { cached = 0; return false; }
+    cached = (strncmp(name, "UnityMain", 9) == 0) ? 1 : 0;
+    return cached == 1;
 }
 static std::string g_log_path;
 static FILE* g_log_fp = nullptr;
@@ -78,7 +82,7 @@ static bool g_inplace_mode = false;
 static volatile int g_hide_mask = 0;   // 默认全显示。bit0 Body 1 Face 2 Hair 3 Weapon 4 PX 5 NPC 6 Effect 7 Cloak
 
 // 每个 hook 入口的命中数，用来判断哪个真的在高频跑
-static volatile int g_hookcnt[10] = {0};
+static volatile int g_hookcnt[12] = {0};
 #define HC_TWEEN    0
 #define HC_CANVAS   1
 #define HC_SETACT   2
@@ -89,6 +93,7 @@ static volatile int g_hookcnt[10] = {0};
 #define HC_CSCALER  7
 #define HC_ASPECT   8
 #define HC_VOLUME   9
+#define HC_CGT      10
 static const MethodInfo* g_setEnabled = nullptr;
 static std::map<void*, int> g_patched_meshes;
 
@@ -985,6 +990,16 @@ static void hk_tween_update(void* self, void* m) {
     ((void(*)(void*, void*))g_orig_tween)(self, m);
 }
 
+// libc 的 clock_gettime：UnityMain 每秒调几千次，这才是真正的高频主线程入口
+static int (*g_orig_cgt)(clockid_t, struct timespec*) = nullptr;
+static int hk_cgt(clockid_t id, struct timespec* ts) {
+    if (is_unity_main()) {
+        g_hookcnt[HC_CGT]++;
+        main_tick();
+    }
+    return g_orig_cgt(id, ts);
+}
+
 // dotween 之外每帧必调的 MonoBehaviour 候选
 static void* g_orig_event  = nullptr;
 static void* g_orig_cscaler = nullptr;
@@ -1150,6 +1165,7 @@ static void main_tick() {
                  g_hookcnt[HC_TWEEN], g_hookcnt[HC_CANVAS], g_hookcnt[HC_SETACT],
                  g_hookcnt[HC_GETNAME], g_hookcnt[HC_GETTRANS], g_hookcnt[HC_GETPOS],
                  g_hookcnt[HC_EVENT], g_hookcnt[HC_CSCALER], g_hookcnt[HC_ASPECT], g_hookcnt[HC_VOLUME]);
+            LOGI("hookcnt2 cgt=%d", g_hookcnt[HC_CGT]);
         }
     }
 
@@ -1613,6 +1629,17 @@ static void* worker(void*) {
             }
         } else {
             LOGE("no DOTweenComponent");
+        }
+    }
+
+    // libc clock_gettime：实测 UnityMain 每秒 5000+ 次，这是真正的主线程 tick
+    {
+        void* shc = load_so_by_name("libshadowhook.so");
+        void* cgt = dlsym(RTLD_DEFAULT, "clock_gettime");
+        LOGI("clock_gettime addr=%p", cgt);
+        if (shc && cgt) {
+            void* o = try_hook(shc, cgt, (void*)hk_cgt, "clock_gettime");
+            if (o) { g_orig_cgt = (int(*)(clockid_t, struct timespec*))o; LOGI("cgt hook ok"); }
         }
     }
 
