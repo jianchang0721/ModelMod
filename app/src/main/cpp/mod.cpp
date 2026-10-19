@@ -1800,6 +1800,24 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
     Il2CppObject* go = g_api.object_new(GOCls);
     invoke_inst(goCtor, go, an);
 
+    // 关键：不设 layer 的话，相机 cullingMask 里没有 Default 层就什么都不渲染
+    // 直接把原角色 GameObject 的 layer 拄过来最稳
+    {
+        int layer = 0;
+        const MethodInfo* getGO = find_method(CompCls, "get_gameObject", 0);
+        Il2CppObject* sgo = (smr && getGO) ? invoke_inst(getGO, smr, nullptr) : nullptr;
+        if (sgo) {
+            const MethodInfo* getLayer = find_method(GOCls, "get_layer", 0);
+            if (getLayer) {
+                Il2CppObject* lr = invoke_inst(getLayer, sgo, nullptr);
+                if (lr) layer = *(int*)((char*)lr + 16);
+            }
+        }
+        LOGI("mmesh: source layer=%d", layer);
+        const MethodInfo* setLayer = find_method(GOCls, "set_layer", 1);
+        if (setLayer) { void* a[1] = { &layer }; invoke_inst(setLayer, go, a); LOGI("mmesh: layer set to %d", layer); }
+    }
+
     const MethodInfo* addComp = find_method(GOCls, "AddComponent", 1);
     if (!addComp) { LOGE("mmesh: no AddComponent"); return nullptr; }
 
