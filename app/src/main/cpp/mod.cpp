@@ -952,6 +952,13 @@ static void hk_canvasupdate(void* m) {
 }
 
 static void* g_orig_setactive = nullptr;
+static void* g_orig_tween = nullptr;
+
+// DOTween 的 Update：第三方 MonoBehaviour，虚表调用，不可能被内联
+static void hk_tween_update(void* self, void* m) {
+    main_tick();
+    ((void(*)(void*, void*))g_orig_tween)(self, m);
+}
 static void* g_orig_getname = nullptr;
 
 static Il2CppString* hk_getname(void* self, void* m) {
@@ -1346,6 +1353,27 @@ static void* worker(void*) {
     if (!SMRCls) { LOGE("SkinnedMeshRenderer not found"); return nullptr; }
     LOGI("SkinnedMeshRenderer: %p", SMRCls);
     find_updates();
+
+    // DOTween.Update：主线程每帧必调，拿到它就有主线程上下文
+    {
+        Il2CppClass* TC = find_class_any("DG.Tweening.Core", "DOTweenComponent");
+        if (TC) {
+            const MethodInfo* up = find_method(TC, "Update", 0);
+            LOGI("DOTween.Update=%p", (void*)up);
+            if (up) {
+                void* sh = load_so_by_name("libshadowhook.so");
+                if (sh) {
+                    typedef int (*fn_init)(int, bool);
+                    fn_init init = (fn_init)dlsym(sh, "shadowhook_init");
+                    if (init) init(0, false);
+                    void* o = try_hook(sh, *(void**)up, (void*)hk_tween_update, "DOTween.Update");
+                    if (o) { g_orig_tween = o; LOGI("tween hook ok"); }
+                }
+            }
+        } else {
+            LOGE("no DOTweenComponent");
+        }
+    }
 
     // UGUI 每帧必调的 CanvasUpdateRegistry.PerformUpdate（主线程）
     {
