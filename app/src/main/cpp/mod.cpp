@@ -1847,12 +1847,30 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
     Il2CppObject* sp = (st && getParent) ? invoke_inst(getParent, st, nullptr) : nullptr;
     LOGI("mmesh: step st=%p sp=%p setParent=%p", st, sp, (void*)setParent);
 
-    if (gt && sp && setParent) {
-        void* a[1] = { sp };
+    // 找角色根节点：从 SMR 往上爬，停在 PlayerRoot / AvatarPoolRoot 的直接子节点，
+    // 那个节点才是会跟着角色跑的东西（挂到中间某层可能是个不动的池子节点）
+    Il2CppObject* roleRoot = st;
+    {
+        Il2CppObject* cur = st;
+        for (int i = 0; i < 8 && cur; i++) {
+            Il2CppObject* p = getParent ? invoke_inst(getParent, cur, nullptr) : nullptr;
+            if (!p) break;
+            std::string pn = obj_name(p);
+            LOGI("mmesh: up%d = %s", i, pn.c_str());
+            if (pn.find("PlayerRoot") != std::string::npos ||
+                pn.find("AvatarPoolRoot") != std::string::npos ||
+                pn.find("VisualPool") != std::string::npos) break;
+            cur = p;
+        }
+        if (cur) roleRoot = cur;
+    }
+
+    if (gt && roleRoot && setParent) {
+        void* a[1] = { roleRoot };
         invoke_inst(setParent, gt, a);
         if (setLScale) { Vec3 s = {20, 20, 20}; void* b[1] = { &s }; invoke_inst(setLScale, gt, b); }
         if (setLPos)   { Vec3 p = {0, 0, 0};    void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
-        LOGI("mmesh: parent ok");
+        LOGI("mmesh: parent set to role root %p", roleRoot);
     }
 
     LOGI("mmesh: done go=%p trans=%p parent=%p", go, gt, sp);
