@@ -3138,6 +3138,37 @@ static int rewrite_original_mesh(Il2CppObject* mesh,
     LOGI("gpu: rewrite nv=%u ni=%u bones=%d/%u targetBones=%d", nv, ni, found, nb, N);
     if (outFound) *outFound = found;
 
+    // ===== 诊断：顶点空间范围、骨骼映射、样例顶点 =====
+    {
+        float mn[3] = {1e9f,1e9f,1e9f}, mx[3] = {-1e9f,-1e9f,-1e9f};
+        for (uint32_t i = 0; i < nv; i++) {
+            for (int c = 0; c < 3; c++) {
+                float v = pos[i*3+c];
+                if (v < mn[c]) mn[c] = v;
+                if (v > mx[c]) mx[c] = v;
+            }
+        }
+        LOGI("gpu: VERT BBOX x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f] height=%.3f k=%.5f",
+             mn[0],mx[0],mn[1],mx[1],mn[2],mx[2], mx[1]-mn[1], k);
+
+        for (uint32_t i = 0; i < nb && i < 22; i++) {
+            int gi = gidx[i];
+            const float* m = &ibm[(size_t)i*16];
+            LOGI("gpu: map[%u] %s -> gidx=%d target=%s  ibmT=(%.2f,%.2f,%.2f)",
+                 i, names[i].c_str(), gi,
+                 (gi >= 0 && gi < (int)gameNorm.size()) ? gameNorm[gi].c_str() : "?",
+                 -m[12], -m[13], -m[14]);
+        }
+        for (int v = 0; v < 3 && v < (int)nv; v++) {
+            LOGI("gpu: vert[%d] pos=(%.2f,%.2f,%.2f) j=%d,%d,%d,%d w=%.2f,%.2f,%.2f,%.2f -> g=%d,%d,%d,%d",
+                 v, pos[v*3],pos[v*3+1],pos[v*3+2],
+                 joints[v*4],joints[v*4+1],joints[v*4+2],joints[v*4+3],
+                 weights[v*4],weights[v*4+1],weights[v*4+2],weights[v*4+3],
+                 gidx[joints[v*4]], gidx[joints[v*4+1]],
+                 gidx[joints[v*4+2]], gidx[joints[v*4+3]]);
+        }
+    }
+
     // submesh 收成 1 个
     const MethodInfo* setSub = find_method_any(MeshCls, "set_subMeshCount");
     if (setSub) { int one = 1; void* a[1] = { &one }; invoke_inst(setSub, mesh, a); }
@@ -3478,6 +3509,34 @@ static int replace_original_smr(Il2CppObject* SMRCls_unused, Il2CppObject* smr,
             LOGI("gpu: step3 renderer re-enabled");
         } else {
             LOGI("gpu: no set_enabled, skipping rebuild");
+        }
+
+        // 诊断：把实际参与蒙皮的骨骼世界位置打出来，和 bindpose 对照
+        {
+            Il2CppClass* TrCls = find_class_any("UnityEngine", "Transform");
+            const MethodInfo* gb3 = SMRCls ? find_method_any(SMRCls, "get_bones") : nullptr;
+            const MethodInfo* l2w = TrCls ? find_method_any(TrCls, "get_localToWorldMatrix") : nullptr;
+            Il2CppArray* ba = gb3 ? (Il2CppArray*)invoke_inst(gb3, smr, nullptr) : nullptr;
+            int shown = 0;
+            for (int bi = 0; bi < N && shown < 6; bi++) {
+                if (bi >= nb) break;
+                int tgt = -1;
+                std::vector<int> gidx2;
+                (void)gidx2;
+                // 找这个槽位对应哪根目标骨骼：用 map_bones 反查
+                for (int k = 0; k < nb; k++) {
+                    if (k == bi) { tgt = bi; break; }
+                }
+                (void)tgt;
+                Il2CppObject* bone = ba ? *(Il2CppObject**)array_addr(ba, 8, (size_t)bi) : nullptr;
+                if (!bone || !l2w) continue;
+                Il2CppObject* mtx = invoke_inst(l2w, bone, nullptr);
+                if (!mtx) continue;
+                const float* mm = (const float*)((char*)mtx + 16);
+                LOGI("gpu: bone[%d] %s worldPos=(%.3f, %.3f, %.3f)",
+                     bi, gameNorm[bi].c_str(), mm[12], mm[13], mm[14]);
+                shown++;
+            }
         }
 
         // 材质先不动：retint_material 里有 fopen，正是 v112 fdsan 的老病根。
