@@ -21,9 +21,16 @@ import android.widget.LinearLayout;
 import android.widget.Switch;
 import android.widget.TextView;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.Arrays;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -293,22 +300,138 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     private void copyUriToFiles(Context ctx, Uri uri) {
-        InputStream in = null;
-        FileOutputStream out = null;
         try {
-            in = ctx.getContentResolver().openInputStream(uri);
+            byte[] data = readAll(ctx, uri);
+            if (data == null || data.length < 24) { XposedBridge.log(TAG + "file too small"); return; }
+
+            byte[] out;
+            if (data[0] == 'g' && data[1] == 'l' && data[2] == 'T' && data[3] == 'F') {
+                out = glbToMmesh(data);
+                if (out == null) { XposedBridge.log(TAG + "glb convert failed"); return; }
+                XposedBridge.log(TAG + "glb converted: " + out.length + " bytes");
+            } else if (data[0] == 'M' && data[1] == 'M' && data[2] == 'S' && data[3] == 'H') {
+                out = data;
+                XposedBridge.log(TAG + "already mmesh: " + out.length + " bytes");
+            } else {
+                XposedBridge.log(TAG + "unknown format, first4=" + data[0] + "," + data[1] + "," + data[2] + "," + data[3]);
+                return;
+            }
+
             File dst = new File(ctx.getFilesDir(), "custom.mmesh");
-            out = new FileOutputStream(dst);
-            byte[] buf = new byte[65536];
-            int n;
-            long total = 0;
-            while ((n = in.read(buf)) > 0) { out.write(buf, 0, n); total += n; }
-            XposedBridge.log(TAG + "model copied: " + dst.getAbsolutePath() + " size=" + total);
+            FileOutputStream fos = new FileOutputStream(dst);
+            fos.write(out);
+            fos.close();
+            XposedBridge.log(TAG + "model ready: " + dst.getAbsolutePath() + " size=" + out.length);
         } catch (Throwable t) {
             XposedBridge.log(TAG + "copy fail: " + t);
-        } finally {
-            try { if (out != null) out.close(); } catch (Throwable ignored) { }
-            try { if (in != null) in.close(); } catch (Throwable ignored) { }
+        }
+    }
+
+    private byte[] readAll(Context ctx, Uri uri) throws Exception {
+        InputStream in = ctx.getContentResolver().openInputStream(uri);
+        if (in == null) return null;
+        ByteArrayOutputStream bo = new ByteArrayOutputStream();
+        byte[] buf = new byte[65536];
+        int n;
+        while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+        in.close();
+        return bo.toByteArray();
+    }
+
+    private static void wInt(ByteArrayOutputStream o, int v) {
+        o.write(v & 0xFF);
+        o.write((v >> 8) & 0xFF);
+        o.write((v >> 16) & 0xFF);
+        o.write((v >> 24) & 0xFF);
+    }
+
+    private static void wFloat(ByteArrayOutputStream o, float f) {
+        wInt(o, Float.floatToIntBits(f));
+    }
+
+    private static ByteBuffer viewOf(byte[] bin, JSONArray bvs, JSONObject acc) throws Exception {
+        JSONObject bv = bvs.getJSONObject(acc.getInt("bufferView"));
+        int bvOff  = bv.optInt("byteOffset", 0);
+        int accOff = acc.optInt("byteOffset", 0);
+        int start  = bvOff + accOff;
+        return ByteBuffer.wrap(bin, start, bin.length - start).order(ByteOrder.LITTLE_ENDIAN);
+    }
+
+    // glTF 二进制 -> mmesh（只取第一个 mesh 的第一个 primitive）
+    private byte[] glbToMmesh(byte[] d) {
+        try {
+            ByteBuffer bb = ByteBuffer.wrap(d).order(ByteOrder.LITTLE_ENDIAN);
+            int total = bb.getInt(8);
+            int off = 12;
+            JSONObject js = null;
+            byte[] bin = null;
+            while (off + 8 <= d.length && off < total) {
+                int clen = bb.getInt(off);
+                int ctype = bb.getInt(off + 4);
+                if (clen < 0 || off + 8 + clen > d.length) break;
+                if (ctype == 0x4E4F534A) {
+                    js = new JSONObject(new String(d, off + 8, clen, "UTF-8"));
+                } else if (ctype == 0x004E4942) {
+                    bin = Arrays.copyOfRange(d, off + 8, off + 8 + clen);
+                }
+                off += 8 + clen;
+            }
+            if (js == null || bin == null) return null;
+
+            JSONArray meshes = js.getJSONArray("meshes");
+            JSONObject prim = meshes.getJSONObject(0).getJSONArray("primitives").getJSONObject(0);
+            JSONObject attrs = prim.getJSONObject("attributes");
+            JSONArray accs = js.getJSONArray("accessors");
+            JSONArray bvs  = js.getJSONArray("bufferViews");
+
+            JSONObject posAcc = accs.getJSONObject(attrs.getInt("POSITION"));
+            int nv = posAcc.getInt("count");
+            float[] pos = new float[nv * 3];
+            ByteBuffer pb = viewOf(bin, bvs, posAcc);
+            for (int i = 0; i < nv * 3; i++) pos[i] = pb.getFloat();
+
+            float[] nrm = new float[nv * 3];
+            if (attrs.has("NORMAL")) {
+                ByteBuffer nb = viewOf(bin, bvs, accs.getJSONObject(attrs.getInt("NORMAL")));
+                for (int i = 0; i < nv * 3; i++) nrm[i] = nb.getFloat();
+            }
+
+            float[] uv = new float[nv * 2];
+            if (attrs.has("TEXCOORD_0")) {
+                ByteBuffer ub = viewOf(bin, bvs, accs.getJSONObject(attrs.getInt("TEXCOORD_0")));
+                for (int i = 0; i < nv * 2; i++) uv[i] = ub.getFloat();
+            }
+
+            int ni = 0;
+            int[] idx = new int[0];
+            if (prim.has("indices")) {
+                JSONObject ia = accs.getJSONObject(prim.getInt("indices"));
+                ni = ia.getInt("count");
+                int ct = ia.getInt("componentType");
+                ByteBuffer ib = viewOf(bin, bvs, ia);
+                idx = new int[ni];
+                for (int i = 0; i < ni; i++) {
+                    if (ct == 5125)      idx[i] = ib.getInt();
+                    else if (ct == 5123) idx[i] = ib.getShort() & 0xFFFF;
+                    else                 idx[i] = ib.get() & 0xFF;
+                }
+            } else {
+                ni = nv;
+                idx = new int[ni];
+                for (int i = 0; i < ni; i++) idx[i] = i;
+            }
+
+            ByteArrayOutputStream o = new ByteArrayOutputStream(16 + nv * 32 + ni * 4);
+            o.write(new byte[]{'M','M','S','H'});
+            wInt(o, nv); wInt(o, ni); wInt(o, 7);
+            for (float f : pos) wFloat(o, f);
+            for (float f : nrm) wFloat(o, f);
+            for (float f : uv)  wFloat(o, f);
+            for (int v : idx)   wInt(o, v);
+            return o.toByteArray();
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "glb parse fail: " + t);
+            return null;
         }
     }
 }

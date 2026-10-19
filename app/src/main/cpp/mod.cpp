@@ -1708,11 +1708,19 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
     FILE* f = nullptr;
     for (auto p : kMmeshPaths) {
         f = fopen(p, "rb");
-        if (f) { LOGI("mmesh: opened %s", p); break; }
+        if (!f) continue;
+        char m[4];
+        if (fread(m, 1, 4, f) != 4 || memcmp(m, "MMSH", 4) != 0) {
+            LOGE("mmesh: bad magic in %s, skip", p);
+            fclose(f); f = nullptr;
+            continue;
+        }
+        fseek(f, 0, SEEK_SET);
+        LOGI("mmesh: opened %s", p);
+        break;
     }
-    if (!f) { LOGE("mmesh: all paths failed"); return nullptr; }
+    if (!f) { LOGE("mmesh: no usable file"); return nullptr; }
     char magic[4]; uint32_t nv = 0, ni = 0, flags = 0;
-    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MMSH", 4) != 0) { fclose(f); LOGE("mmesh: bad magic"); return nullptr; }
     fread(&nv, 4, 1, f); fread(&ni, 4, 1, f); fread(&flags, 4, 1, f);
     LOGI("mmesh: nv=%u ni=%u flags=%u", nv, ni, flags);
     if (nv == 0 || nv > 300000 || ni == 0) { fclose(f); return nullptr; }
