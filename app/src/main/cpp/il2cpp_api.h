@@ -60,6 +60,7 @@ typedef const char*           (*fn_field_get_name)(FieldInfo*);
 typedef size_t                (*fn_field_get_offset)(FieldInfo*);
 typedef const Il2CppType*     (*fn_field_get_type)(FieldInfo*);
 typedef char*                 (*fn_type_get_name)(const Il2CppType*);
+typedef int32_t               (*fn_class_array_element_size)(const Il2CppClass*);
 
 struct Il2CppApi {
     fn_domain_get                domain_get;
@@ -91,6 +92,7 @@ struct Il2CppApi {
     fn_field_get_offset          field_get_offset;
     fn_field_get_type            field_get_type;
     fn_type_get_name             type_get_name;
+    fn_class_array_element_size  class_array_element_size;
 };
 
 extern Il2CppApi g_api;
