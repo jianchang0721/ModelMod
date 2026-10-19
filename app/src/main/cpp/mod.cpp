@@ -423,11 +423,11 @@ static bool bind_api(uintptr_t base) {
 #undef B
 
     // 字段相关（可选，缺了不影响主流程）
-    g_api.class_get_fields = (fn_class_get_fields)dlsym(h, "il2cpp_class_get_fields");
-    g_api.field_get_name   = (fn_field_get_name)  dlsym(h, "il2cpp_field_get_name");
-    g_api.field_get_offset = (fn_field_get_offset)dlsym(h, "il2cpp_field_get_offset");
-    g_api.field_get_type   = (fn_field_get_type)  dlsym(h, "il2cpp_field_get_type");
-    g_api.type_get_name    = (fn_type_get_name)   dlsym(h, "il2cpp_type_get_name");
+    g_api.class_get_fields = (fn_class_get_fields)elf_sym(base, "il2cpp_class_get_fields");
+    g_api.field_get_name   = (fn_field_get_name)  elf_sym(base, "il2cpp_field_get_name");
+    g_api.field_get_offset = (fn_field_get_offset)elf_sym(base, "il2cpp_field_get_offset");
+    g_api.field_get_type   = (fn_field_get_type)  elf_sym(base, "il2cpp_field_get_type");
+    g_api.type_get_name    = (fn_type_get_name)   elf_sym(base, "il2cpp_type_get_name");
     LOGI("field api: %p %p %p %p %p", (void*)g_api.class_get_fields, (void*)g_api.field_get_name,
          (void*)g_api.field_get_offset, (void*)g_api.field_get_type, (void*)g_api.type_get_name);
     return true;
