@@ -3926,28 +3926,34 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
             void* t2[1] = { g_api.type_get_object(g_api.class_get_type(MRCls)) };
             Il2CppObject* mr = invoke_inst(addComp, go, t2);
 
-            // 材质
+            // 材质：优先用 Unlit/Texture（标准 _MainTex），
+            // 游戏自己的 OP/Char/Models_V2_Proxy 可能读 _BaseMap 之类别的属性，
+            // 把贴图塞进 _MainTex 它根本不采样 -> 贴图混乱/纯色
             if (mr) {
                 Il2CppObject* mat = nullptr;
-                if (srcShader) {
-                    mat = g_api.object_new(MatCls);
-                    const MethodInfo* c1 = find_method(MatCls, ".ctor", 1);
-                    if (c1) { void* b[1]={srcShader}; invoke_inst(c1, mat, b); }
-                }
-                if (!mat && ShCls) {
+                const char* usedShader = "none";
+                if (ShCls) {
                     const MethodInfo* sf = find_method(ShCls, "Find", 1);
                     if (sf) {
-                        const char* sn[] = {"Unlit/Texture", "Sprites/Default"};
-                        for (int q = 0; q < 2 && !mat; q++) {
+                        const char* sn[] = {"Unlit/Texture", "Sprites/Default", "Mobile/Diffuse"};
+                        for (int q = 0; q < 3 && !mat; q++) {
                             void* a[1] = { g_api.string_new(sn[q]) };
                             Il2CppObject* sh = invoke_static(sf, a);
                             if (!sh) continue;
                             mat = g_api.object_new(MatCls);
                             const MethodInfo* c1 = find_method(MatCls, ".ctor", 1);
                             if (c1) { void* b[1]={sh}; invoke_inst(c1, mat, b); }
+                            if (mat) usedShader = sn[q];
                         }
                     }
                 }
+                if (!mat && srcShader) {
+                    mat = g_api.object_new(MatCls);
+                    const MethodInfo* c1 = find_method(MatCls, ".ctor", 1);
+                    if (c1) { void* b[1]={srcShader}; invoke_inst(c1, mat, b); }
+                    if (mat) usedShader = "orig";
+                }
+                if (mat) LOGI("rigid: mat shader=%s part=%d", usedShader, part);
                 if (mat) {
                     void* a[1]={mat}; invoke_inst(setMat, mr, a);
                     const MethodInfo* sc = find_method(MatCls, "set_color", 1);
@@ -3976,7 +3982,13 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
                                     void* la[1]={bar}; invoke_inst(lr, tex, la);
                                     if (ap) { bool u=false; void* aa[1]={&u}; invoke_inst(ap, tex, aa); }
                                     const MethodInfo* sm2 = find_method(MatCls, "set_mainTexture", 1);
-                                    if (sm2) { void* sa[1]={tex}; invoke_inst(sm2, mat, sa); }
+                                    if (sm2) {
+                                        void* sa[1]={tex}; invoke_inst(sm2, mat, sa);
+                                        const MethodInfo* gm2 = find_method(MatCls, "get_mainTexture");
+                                        Il2CppObject* back = gm2 ? invoke_inst(gm2, mat, nullptr) : nullptr;
+                                        LOGI("rigid: tex part=%d %ux%u readback=%s", part, tw, th,
+                                             back == tex ? "OK" : "MISMATCH");
+                                    }
                                 }
                             }
                         }
