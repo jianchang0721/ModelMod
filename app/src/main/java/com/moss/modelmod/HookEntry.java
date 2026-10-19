@@ -5,20 +5,18 @@ import android.app.Application;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
 import android.graphics.Color;
-import android.graphics.PixelFormat;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
-import android.view.WindowManager;
+import android.view.ViewGroup;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.Switch;
 import android.widget.TextView;
 
 import java.io.File;
-import java.io.FileWriter;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -37,19 +35,6 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static boolean overlayShown = false;
     private static int hideMask = 0x3F;
-    private static String hookLogPath = null;
-
-    private static void log(String msg) {
-        XposedBridge.log(TAG + msg);
-        if (hookLogPath != null) {
-            try {
-                FileWriter fw = new FileWriter(hookLogPath, true);
-                fw.write(msg + "\n");
-                fw.close();
-            } catch (Throwable ignored) {
-            }
-        }
-    }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
@@ -62,42 +47,34 @@ public class HookEntry implements IXposedHookLoadPackage {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         Context ctx = (Context) param.args[0];
-                        if (ctx == null) return;
-                        try {
-                            hookLogPath = new File(ctx.getFilesDir(), "hook.log").getAbsolutePath();
-                        } catch (Throwable ignored) {
-                        }
-                        log("attach, logPath=" + hookLogPath);
-                        loadNative(ctx);
+                        if (ctx != null) loadNative(ctx);
                     }
                 });
 
-        XposedHelpers.findAndHookMethod(Activity.class, "onCreate", Bundle.class,
-                new XC_MethodHook() {
+        XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                final Activity act = (Activity) param.thisObject;
+                if (act == null || overlayShown) return;
+                String cn = act.getClass().getName();
+                if (cn.toLowerCase().contains("splash")) return;
+
+                new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
                     @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        final Activity act = (Activity) param.thisObject;
-                        if (act == null) return;
-                        log("activity onCreate: " + act.getClass().getName());
-                        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
-                            @Override
-                            public void run() {
-                                if (overlayShown) return;
-                                overlayShown = true;
-                                try {
-                                    showOverlay(act);
-                                } catch (Throwable t) {
-                                    log("overlay fail: " + t);
-                                    StringBuilder sb = new StringBuilder();
-                                    for (StackTraceElement e : t.getStackTrace()) {
-                                        sb.append("\n  at ").append(e.toString());
-                                    }
-                                    log(sb.toString());
-                                }
-                            }
-                        }, 6000);
+                    public void run() {
+                        if (overlayShown) return;
+                        if (act.isFinishing()) return;
+                        overlayShown = true;
+                        try {
+                            showOverlay(act);
+                        } catch (Throwable t) {
+                            overlayShown = false;
+                            XposedBridge.log(TAG + "overlay fail: " + t);
+                        }
                     }
-                });
+                }, 1500);
+            }
+        });
     }
 
     private void loadNative(Context ctx) {
@@ -105,24 +82,18 @@ public class HookEntry implements IXposedHookLoadPackage {
             ApplicationInfo ai = ctx.getPackageManager().getApplicationInfo(SELF, 0);
             String so = ai.nativeLibraryDir + "/libmodelmod.so";
             System.load(so);
-            log("native loaded: " + so);
+            XposedBridge.log(TAG + "native loaded: " + so);
 
             String logPath = new File(ctx.getFilesDir(), "modelmod.log").getAbsolutePath();
             setLogPath(logPath);
             setHideMask(hideMask);
         } catch (Throwable t) {
-            log("native load failed: " + t);
+            XposedBridge.log(TAG + "native load failed: " + t);
         }
     }
 
     private void showOverlay(Activity act) {
-        log("showOverlay start, act=" + act.getClass().getName());
-
-        WindowManager wm = (WindowManager) act.getSystemService(Context.WINDOW_SERVICE);
-        if (wm == null) {
-            log("showOverlay: no WindowManager");
-            return;
-        }
+        XposedBridge.log(TAG + "showOverlay on " + act.getClass().getName());
 
         LinearLayout root = new LinearLayout(act);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -149,57 +120,38 @@ public class HookEntry implements IXposedHookLoadPackage {
                 else hideMask &= ~(1 << bit);
                 try {
                     setHideMask(hideMask);
-                    log("mask -> 0x" + Integer.toHexString(hideMask));
-                } catch (Throwable t) {
-                    log("setHideMask fail: " + t);
+                } catch (Throwable ignored) {
                 }
             });
             root.addView(sw);
         }
 
-        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                PixelFormat.TRANSLUCENT);
-        lp.gravity = Gravity.TOP | Gravity.START;
-        lp.x = 40;
-        lp.y = 240;
-
-        View decor = act.getWindow().getDecorView();
-        if (decor != null) {
-            lp.token = decor.getWindowToken();
-            log("token=" + lp.token);
-        }
+        FrameLayout.LayoutParams flp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        flp.leftMargin = 40;
+        flp.topMargin = 260;
 
         title.setOnTouchListener(new View.OnTouchListener() {
-            private int sx, sy;
             private float dx, dy;
 
             @Override
             public boolean onTouch(View v, MotionEvent e) {
                 switch (e.getAction()) {
                     case MotionEvent.ACTION_DOWN:
-                        sx = lp.x;
-                        sy = lp.y;
-                        dx = e.getRawX();
-                        dy = e.getRawY();
+                        dx = e.getRawX() - root.getX();
+                        dy = e.getRawY() - root.getY();
                         return true;
                     case MotionEvent.ACTION_MOVE:
-                        lp.x = sx + (int) (e.getRawX() - dx);
-                        lp.y = sy + (int) (e.getRawY() - dy);
-                        try {
-                            wm.updateViewLayout(root, lp);
-                        } catch (Throwable ignored) {
-                        }
+                        root.setX(e.getRawX() - dx);
+                        root.setY(e.getRawY() - dy);
                         return true;
                 }
                 return false;
             }
         });
 
-        wm.addView(root, lp);
-        log("overlay shown OK");
+        act.addContentView(root, flp);
+        XposedBridge.log(TAG + "overlay added via addContentView");
     }
 }
