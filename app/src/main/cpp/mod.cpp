@@ -2657,21 +2657,25 @@ static Il2CppObject* spawn_one_part(Il2CppObject* smr, Il2CppObject* roleRoot,
 // 一次加载 custom_0..custom_3
 
 
+
 // =====================================================================
-// v115 GPU 蒙皮：克隆原角色 SMR，让 Unity 自己每帧算蒙皮
+// v116：不克隆了，直接改原角色的 SkinnedMeshRenderer
 //
-// v114 学到的三个教训（都修了）：
-//  1) BoneWeight 不能用猜的字节数。v114 按 48 走，实际数组元素是别的尺寸，
-//     7997 顶点越界写把 GC 堆写烂 → 闪退。现在用 il2cpp_class_array_element_size
-//     拿真实步长，再按字段名逐个写 int/float。
-//  2) 挑 SMR 不能看路径里有没有 "Body"。v114 挑到脸骨 SMR（72 根里只有 8 根 Bip001），
-//     现在遍历所有候选、按「我们的骨骼名命中数」挑最优。
-//  3) set_sharedMesh 被 strip，只能写 native 槽。v114 只写一个偏移且没验证，
-//     现在扫到所有匹配位置全写 + 读回确认。
+// v114/v115 一直在克隆的 SMR 上换 mesh，每次都 readback=FAIL。
+// 克隆对象是新建的，native 侧可能半初始化；而原 SMR 是活的、骨骼齐全、
+// 材质槽和蒙皮 shader 都是现成的 —— 直接在它上面动手才对。
+//
+// 流程：
+//   1. 挑骨骼匹配最好的那个原 SMR（用 get_bones() 统计我们的骨骼名命中数）
+//   2. 造一个带 bindposes + boneWeights 的 Mesh（长度对齐原 SMR 的骨骼数）
+//   3. 把 native 结构里所有等于旧 mesh 指针的槽全写成新 mesh
+//   4. get_sharedMesh 读回确认；失败就把旧指针全还原，绝不留下半坏状态
+//
+// 蒙皮公式：bindposes[gidx[i]] = Scale(k) * R_y180 * inverseBindMatrix[i]
 // =====================================================================
 
 #ifndef GPU_MAX_PARTS
-#define GPU_MAX_PARTS 4      // 先跑 4 个部位；调试时可以改成 1 只跑身体
+#define GPU_MAX_PARTS 4
 #endif
 
 static const MethodInfo* find_method_any(Il2CppClass* klass, const char* name) {
@@ -2690,7 +2694,6 @@ static const MethodInfo* find_method_any(Il2CppClass* klass, const char* name) {
     return found;
 }
 
-// 只查本类自己的字段，绝不往父类爬（BoneWeight 是 struct，爬到 Object 就把尺寸算成 48）
 static FieldInfo* find_own_field(Il2CppClass* klass, const char* name) {
     if (!klass || !g_api.class_get_fields) return nullptr;
     pthread_mutex_lock(&g_find_mtx);
@@ -2715,7 +2718,6 @@ static Il2CppObject* invoke_chk(const MethodInfo* m, Il2CppObject* self, void** 
     return r;
 }
 
-// 数组元素的真实步长：问 il2cpp 要，问不到才用推断值
 static int array_elem_size(Il2CppClass* k, int fallback) {
     if (k && g_api.class_array_element_size) {
         int n = (int)g_api.class_array_element_size(k);
@@ -2724,7 +2726,6 @@ static int array_elem_size(Il2CppClass* k, int fallback) {
     return fallback;
 }
 
-// BoneWeight 的内存布局：按字段名挨个拿偏移，不猜
 struct BwLayout { int idx[4]; int wgt[4]; int size; bool ok; };
 static BwLayout g_bw_layout = {{0,0,0,0},{0,0,0,0},0,false};
 
@@ -2737,22 +2738,58 @@ static BwLayout bw_layout(Il2CppClass* BW) {
     for (int k = 0; k < 4; k++) {
         FieldInfo* a = find_own_field(BW, in[k]);
         FieldInfo* b = find_own_field(BW, wn[k]);
-        if (!a || !b) { LOGE("gpu: BoneWeight missing field %s / %s", in[k], wn[k]); return L; }
+        if (!a || !b) { LOGE("gpu: BoneWeight missing %s/%s", in[k], wn[k]); return L; }
         L.idx[k] = (int)g_api.field_get_offset(a);
         L.wgt[k] = (int)g_api.field_get_offset(b);
         if (L.idx[k] + 4 > mx) mx = L.idx[k] + 4;
         if (L.wgt[k] + 4 > mx) mx = L.wgt[k] + 4;
     }
-    L.size = mx;
-    L.ok = true;
-    LOGI("gpu: BW layout i0=%d w0=%d i3=%d w3=%d fieldSpan=%d arrayStride=%d",
+    L.size = mx; L.ok = true;
+    LOGI("gpu: BW layout i0=%d w0=%d i3=%d w3=%d span=%d stride=%d",
          L.idx[0], L.wgt[0], L.idx[3], L.wgt[3], L.size, array_elem_size(BW, L.size));
     g_bw_layout = L;
     return L;
 }
 
 // ---------------------------------------------------------------
-// 只读 mmesh 头里的骨骼名，用来挑最合适的 SMR
+static void probe_unity_api() {
+    LOGI("=== PROBE BEGIN ===");
+    Il2CppClass* SMR = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+    Il2CppClass* M   = find_class_any("UnityEngine", "Mesh");
+    Il2CppClass* MPB = find_class_any("UnityEngine", "MaterialPropertyBlock");
+    Il2CppClass* AB  = find_class_any("UnityEngine", "AssetBundle");
+    if (M) {
+        const char* w[] = {"set_bindposes","set_boneWeights","set_vertices","set_normals",
+                           "set_uv","set_triangles","set_subMeshCount","get_subMeshCount",
+                           "RecalculateBounds","SetTriangles","SetVertices","SetNormals"};
+        for (size_t i = 0; i < sizeof(w)/sizeof(w[0]); i++) {
+            const MethodInfo* m2 = find_method_any(M, w[i]);
+            LOGI("Mesh.%s = %p argc=%u", w[i], (void*)m2,
+                 m2 ? g_api.method_get_param_count(m2) : 0);
+        }
+        LOGI("Matrix4x4 stride=%d  BoneWeight stride=%d",
+             array_elem_size(find_class_any("UnityEngine","Matrix4x4"), 64),
+             array_elem_size(find_class_any("UnityEngine","BoneWeight"), 32));
+        bw_layout(find_class_any("UnityEngine","BoneWeight"));
+    }
+    if (SMR) {
+        const char* w[] = {"get_bones","get_sharedMesh","get_sharedMaterials","set_sharedMaterials"};
+        for (size_t i = 0; i < sizeof(w)/sizeof(w[0]); i++)
+            LOGI("SMR.%s = %p", w[i], (void*)find_method_any(SMR, w[i]));
+    }
+    if (MPB) {
+        LOGI("MPB.SetMatrixArray = %p", (void*)find_method_any(MPB, "SetMatrixArray"));
+        LOGI("MPB.SetVectorArray = %p", (void*)find_method_any(MPB, "SetVectorArray"));
+    }
+    if (AB) {
+        LOGI("AssetBundle.LoadFromFile = %p", (void*)find_method_any(AB, "LoadFromFile"));
+        LOGI("AssetBundle.LoadFromMemory = %p", (void*)find_method_any(AB, "LoadFromMemory"));
+    }
+    LOGI("=== PROBE END ===");
+}
+
+// ---------------------------------------------------------------
+// 读 mmesh 的骨骼名（只读头，够用来挑 SMR）
 // ---------------------------------------------------------------
 static bool read_mm2_names(const char* path, std::vector<std::string>& out) {
     FILE* f = fopen(path, "rb");
@@ -2778,71 +2815,10 @@ static bool read_mm2_names(const char* path, std::vector<std::string>& out) {
 }
 
 // ---------------------------------------------------------------
-// 探针
+// 挑骨骼命中数最多的原 SMR
 // ---------------------------------------------------------------
-static void probe_unity_api() {
-    LOGI("=== PROBE BEGIN ===");
-    Il2CppClass* SMR = find_class_any("UnityEngine", "SkinnedMeshRenderer");
-    Il2CppClass* M   = find_class_any("UnityEngine", "Mesh");
-    if (!SMR) { LOGE("probe: no SMR class"); return; }
-
-    {
-        const char* w[] = {"set_bones","get_bones","set_rootBone","get_rootBone",
-                           "set_sharedMesh","get_sharedMesh","set_sharedMaterials",
-                           "get_sharedMaterials","BakeMesh","set_bounds","get_bounds"};
-        for (size_t i = 0; i < sizeof(w)/sizeof(w[0]); i++)
-            LOGI("SMR.%s = %p", w[i], (void*)find_method_any(SMR, w[i]));
-    }
-    if (M) {
-        const char* w[] = {"set_bindposes","get_bindposes","set_boneWeights","get_boneWeights",
-                           "set_vertices","set_triangles","RecalculateBounds","set_subMeshCount"};
-        for (size_t i = 0; i < sizeof(w)/sizeof(w[0]); i++)
-            LOGI("Mesh.%s = %p", w[i], (void*)find_method_any(M, w[i]));
-        Il2CppClass* M4 = find_class_any("UnityEngine", "Matrix4x4");
-        Il2CppClass* BW = find_class_any("UnityEngine", "BoneWeight");
-        LOGI("Matrix4x4 arrayStride = %d", array_elem_size(M4, 64));
-        LOGI("BoneWeight arrayStride = %d", array_elem_size(BW, 32));
-        if (BW) bw_layout(BW);
-    }
-    Il2CppClass* ObjectCls = find_class_any("UnityEngine", "Object");
-    if (ObjectCls)
-        LOGI("Object.Instantiate/1 = %p", (void*)find_method(ObjectCls, "Instantiate", 1));
-
-    std::vector<Fingerprint> list;
-    collect_fingerprints(SMR, list);
-    Il2CppObject* orig = nullptr;
-    for (size_t i = 0; i < list.size(); i++)
-        if (list[i].chain.find("Body") != std::string::npos) { orig = list[i].smr; break; }
-    if (orig) {
-        Il2CppClass* RCls = find_class_any("UnityEngine", "Renderer");
-        Il2CppClass* MatCls = find_class_any("UnityEngine", "Material");
-        Il2CppClass* ShCls = find_class_any("UnityEngine", "Shader");
-        const MethodInfo* gm = RCls ? find_method_any(RCls, "get_sharedMaterial") : nullptr;
-        const MethodInfo* gs = MatCls ? find_method_any(MatCls, "get_shader") : nullptr;
-        const MethodInfo* gn = ShCls ? find_method_any(ShCls, "get_name") : nullptr;
-        if (gm && gs && gn) {
-            Il2CppObject* mt = invoke_inst(gm, orig, nullptr);
-            if (mt) {
-                Il2CppObject* sh = invoke_inst(gs, mt, nullptr);
-                if (sh) LOGI("ORIG SHADER = %s",
-                    to_utf8((Il2CppString*)invoke_inst(gn, sh, nullptr)).c_str());
-            }
-        }
-        const MethodInfo* gb = find_method_any(SMR, "get_bones");
-        if (gb) {
-            Il2CppArray* a = (Il2CppArray*)invoke_inst(gb, orig, nullptr);
-            LOGI("ORIG BONES len = %d", a ? (int)a->max_length : -1);
-        }
-    } else {
-        LOGE("probe: no Body smr in scene yet");
-    }
-    LOGI("=== PROBE END ===");
-}
-
-// ---------------------------------------------------------------
-// 遍历所有候选 SMR，按「我们的骨骼名命中数」挑最优的来克隆
-// ---------------------------------------------------------------
-static Il2CppObject* pick_best_smr(Il2CppClass* SMRCls, const std::vector<std::string>& names) {
+static Il2CppObject* pick_best_smr(Il2CppClass* SMRCls, const std::vector<std::string>& names,
+                                   std::vector<Il2CppObject*>* outBones) {
     std::vector<Fingerprint> list;
     collect_fingerprints(SMRCls, list);
     const MethodInfo* gb = find_method_any(SMRCls, "get_bones");
@@ -2851,8 +2827,7 @@ static Il2CppObject* pick_best_smr(Il2CppClass* SMRCls, const std::vector<std::s
     int bestN = 0;
     for (size_t i = 0; i < list.size(); i++) {
         Il2CppObject* s = list[i].smr;
-        if (!s) continue;
-        if (!*(void**)((char*)s + 16)) continue;          // 引擎已销毁
+        if (!s || !*(void**)((char*)s + 16)) continue;
         Il2CppArray* a = (Il2CppArray*)invoke_inst(gb, s, nullptr);
         if (!a) continue;
         int n = 0;
@@ -2866,83 +2841,80 @@ static Il2CppObject* pick_best_smr(Il2CppClass* SMRCls, const std::vector<std::s
             }
         }
         if (n >= 4) LOGI("gpu: cand %s bones=%d matched=%d", list[i].chain.c_str(), (int)a->max_length, n);
-        if (n > bestN) { bestN = n; best = s; }
+        if (n > bestN) {
+            bestN = n; best = s;
+            if (outBones) {
+                outBones->clear();
+                for (size_t j = 0; j < a->max_length; j++)
+                    outBones->push_back(*(Il2CppObject**)array_addr(a, 8, j));
+            }
+        }
     }
-    LOGI("gpu: BEST smr matched=%d/%d", bestN, (int)names.size());
-    if (!best || bestN * 4 < (int)names.size() * 3) return nullptr;   // 至少 75%
+    LOGI("gpu: BEST matched=%d/%d", bestN, (int)names.size());
+    if (!best || bestN * 4 < (int)names.size() * 3) return nullptr;
     return best;
 }
 
 // ---------------------------------------------------------------
-// 换 mesh：set_sharedMesh 被 strip，只能写 native 槽。
-// 扫出所有等于旧 mesh 指针的位置全写一遍，再读回确认。
+// 交换 native 里的 mesh 槽（记录写过的偏移，失败可还原）
 // ---------------------------------------------------------------
+static int g_swapped_offs[16];
+static int g_swapped_n = 0;
+
 static int swap_mesh_native(Il2CppObject* node, void* oldNat, void* newNat, const char* tag) {
+    g_swapped_n = 0;
     void* nat = *(void**)((char*)node + 16);
     if (!nat || !oldNat || !newNat) {
         LOGE("gpu: %s swap skipped (nat=%p old=%p new=%p)", tag, nat, oldNat, newNat);
         return 0;
     }
-    int hits = 0;
     for (int off = 0x40; off < 0x600; off += 8) {
         if (*(void**)((char*)nat + off) == oldNat) {
             *(void**)((char*)nat + off) = newNat;
-            LOGI("gpu: %s native slot 0x%x <- new mesh", tag, off);
-            hits++;
-            if (hits >= 12) break;
+            LOGI("gpu: %s native[0x%x] <- new mesh", tag, off);
+            if (g_swapped_n < 16) g_swapped_offs[g_swapped_n++] = off;
         }
     }
-    if (!hits) LOGE("gpu: %s no native slot held the old mesh", tag);
-    return hits;
+    if (!g_swapped_n) LOGE("gpu: %s no slot held old mesh (0x40..0x600)", tag);
+    return g_swapped_n;
 }
 
-static void destroy_one_obj(Il2CppObject* o) {
-    if (!o) return;
-    if (!*(void**)((char*)o + 16)) return;
-    Il2CppClass* ObjectCls = find_class_any("UnityEngine", "Object");
-    const MethodInfo* destroy = ObjectCls ? find_method(ObjectCls, "Destroy", 1) : nullptr;
-    if (!destroy) return;
-    void* a[1] = { o };
-    invoke_inst(destroy, nullptr, a);
+static void restore_mesh_native(Il2CppObject* node, void* backTo) {
+    void* nat = *(void**)((char*)node + 16);
+    if (!nat) return;
+    for (int i = 0; i < g_swapped_n; i++)
+        *(void**)((char*)nat + g_swapped_offs[i]) = backTo;
+    LOGI("gpu: restored %d slots -> %p", g_swapped_n, backTo);
+    g_swapped_n = 0;
 }
 
-static Il2CppObject* g_orphan_clone = nullptr;
-
 // ---------------------------------------------------------------
-// 一个部位
+// 造一个带骨架绑定的 Mesh
+//   name2idx: 我们的骨骼名 -> 目标 SMR 骨骼数组下标
+//   N: 目标 SMR 的骨骼总数（bindposes 必须这个长度）
 // ---------------------------------------------------------------
-static Il2CppObject* spawn_gpu_part_inner(Il2CppObject* baseSmr, Il2CppObject* roleRoot,
-                                          const char* meshPath, const char* texPath, float k) {
+static Il2CppObject* build_skinned_mesh(const char* meshPath,
+                                        const std::map<std::string,int>& name2idx,
+                                        int N, int fallback, float k,
+                                        int* outNv, int* outFound) {
     Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
     Il2CppClass* V3Cls   = find_class_any("UnityEngine", "Vector3");
     Il2CppClass* V2Cls   = find_class_any("UnityEngine", "Vector2");
     Il2CppClass* I32Cls  = find_class_any("System", "Int32");
-    Il2CppClass* ByteCls = find_class_any("System", "Byte");
     Il2CppClass* BWCls   = find_class_any("UnityEngine", "BoneWeight");
     Il2CppClass* M4Cls   = find_class_any("UnityEngine", "Matrix4x4");
-    Il2CppClass* TransCls= find_class_any("UnityEngine", "Transform");
-    Il2CppClass* SMRCls  = find_class_any("UnityEngine", "SkinnedMeshRenderer");
-    Il2CppClass* MatCls  = find_class_any("UnityEngine", "Material");
-    Il2CppClass* TexCls  = find_class_any("UnityEngine", "Texture2D");
-    Il2CppClass* RCls    = find_class_any("UnityEngine", "Renderer");
-    Il2CppClass* ObjectCls = find_class_any("UnityEngine", "Object");
-    if (!MeshCls || !V3Cls || !V2Cls || !I32Cls || !BWCls || !M4Cls ||
-        !TransCls || !SMRCls || !MatCls || !RCls || !ObjectCls) {
-        LOGE("gpu: class missing");
-        return nullptr;
+    if (!MeshCls || !V3Cls || !V2Cls || !I32Cls || !BWCls || !M4Cls) {
+        LOGE("gpu: mesh class missing"); return nullptr;
     }
     BwLayout bwL = bw_layout(BWCls);
-    if (!bwL.ok) { LOGE("gpu: BoneWeight layout unknown -> abort"); return nullptr; }
+    if (!bwL.ok) { LOGE("gpu: BW layout unknown"); return nullptr; }
 
-    // ---- 读文件 ----
     FILE* f = fopen(meshPath, "rb");
     if (!f) { LOGE("gpu: open fail %s", meshPath); return nullptr; }
     char magic[4]; uint32_t nv = 0, ni = 0, flags = 0;
-    if (fread(magic,1,4,f) != 4 || memcmp(magic,"MMS2",4) != 0) {
-        LOGE("gpu: %s not MMS2", meshPath); fclose(f); return nullptr;
-    }
+    if (fread(magic,1,4,f) != 4 || memcmp(magic,"MMS2",4) != 0) { fclose(f); return nullptr; }
     if (fread(&nv,4,1,f) != 1 || fread(&ni,4,1,f) != 1 || fread(&flags,4,1,f) != 1) { fclose(f); return nullptr; }
-    if (nv == 0 || nv > 600000 || ni == 0) { LOGE("gpu: bad size %u/%u", nv, ni); fclose(f); return nullptr; }
+    if (nv == 0 || nv > 600000 || ni == 0) { fclose(f); return nullptr; }
 
     std::vector<float> pos((size_t)nv*3), nrm((size_t)nv*3), uv((size_t)nv*2);
     std::vector<uint32_t> idx(ni);
@@ -2957,7 +2929,7 @@ static Il2CppObject* spawn_gpu_part_inner(Il2CppObject* baseSmr, Il2CppObject* r
     for (uint32_t i = 0; i < nb; i++) {
         uint32_t len = 0;
         if (fread(&len,4,1,f) != 1 || len > 128) { fclose(f); return nullptr; }
-        std::vector<char> b(len+1,0);
+        std::vector<char> b(len + 1, 0);
         if (fread(b.data(),1,len,f) != len) { fclose(f); return nullptr; }
         names.push_back(std::string(b.data(), len));
     }
@@ -2974,77 +2946,50 @@ static Il2CppObject* spawn_gpu_part_inner(Il2CppObject* baseSmr, Il2CppObject* r
     if (fread(ibm.data(),4,(size_t)nb*16,f) != (size_t)nb*16) { fclose(f); return nullptr; }
     fclose(f);
 
-    // ---- 克隆 ----
-    const MethodInfo* inst1 = find_method(ObjectCls, "Instantiate", 1);
-    if (!inst1) { LOGE("gpu: Object.Instantiate STRIPPED"); return nullptr; }
-    void* ia[1] = { baseSmr };
-    Il2CppObject* clone = invoke_chk(inst1, nullptr, ia);
-    if (!clone) { LOGE("gpu: Instantiate failed"); return nullptr; }
-    g_orphan_clone = clone;
-
-    // 克隆会继承 enabled/active
-    {
-        Il2CppClass* BehCls = find_class_any("UnityEngine", "Behaviour");
-        const MethodInfo* setEn = BehCls ? find_method(BehCls, "set_enabled", 1) : nullptr;
-        if (setEn) { uint8_t t = 1; void* a[1] = { &t }; invoke_inst(setEn, clone, a); }
-    }
-
-    const MethodInfo* gb = find_method_any(SMRCls, "get_bones");
-    Il2CppArray* origBones = gb ? (Il2CppArray*)invoke_inst(gb, clone, nullptr) : nullptr;
-    int N = origBones ? (int)origBones->max_length : 0;
-    if (N <= 0) { LOGE("gpu: clone has 0 bones"); return nullptr; }
-
-    std::map<std::string,int> name2idx;
-    for (int i = 0; i < N; i++) {
-        Il2CppObject* t = *(Il2CppObject**)array_addr(origBones, 8, (size_t)i);
-        if (!t) continue;
-        std::string nm = obj_name(t);
-        if (!nm.empty() && name2idx.find(nm) == name2idx.end()) name2idx[nm] = i;
-    }
+    // 骨骼名 -> 目标数组下标
     std::vector<int> gidx(nb, -1);
-    int found = 0, fallback = -1;
+    int found = 0, fb = -1;
     for (uint32_t i = 0; i < nb; i++) {
-        std::map<std::string,int>::iterator it = name2idx.find(names[i]);
+        std::map<std::string,int>::const_iterator it = name2idx.find(names[i]);
         if (it != name2idx.end()) {
             gidx[i] = it->second; found++;
-            if (fallback < 0) fallback = gidx[i];
+            if (fb < 0) fb = gidx[i];
         }
     }
-    if (fallback < 0) fallback = 0;
-    for (uint32_t i = 0; i < nb; i++) if (gidx[i] < 0) gidx[i] = fallback;
-    LOGI("gpu: %s nv=%u nb=%u matched=%d/%u cloneBones=%d", meshPath, nv, nb, found, nb, N);
-    if (found * 4 < (int)nb * 3) { LOGE("gpu: bone match too low (%d/%u)", found, nb); return nullptr; }
+    if (fb < 0) fb = fallback;
+    for (uint32_t i = 0; i < nb; i++) if (gidx[i] < 0) gidx[i] = fb;
+    LOGI("gpu: %s nv=%u nb=%u matched=%d/%u targetBones=%d", meshPath, nv, nb, found, nb, N);
+    if (outFound) *outFound = found;
+    if (found * 4 < (int)nb * 3) { LOGE("gpu: bone match too low"); return nullptr; }
 
-    // ---- 建 Mesh ----
     Il2CppObject* mesh = g_api.object_new(MeshCls);
     const MethodInfo* mctor = find_method_any(MeshCls, ".ctor");
     if (mctor) invoke_inst(mctor, mesh, nullptr);
-    if (!*(void**)((char*)mesh + 16)) { LOGE("gpu: Mesh ctor produced no native object"); return nullptr; }
+    if (!*(void**)((char*)mesh + 16)) { LOGE("gpu: Mesh ctor gave no native"); return nullptr; }
 
     Il2CppArray* va = g_api.array_new(V3Cls, nv); memcpy(array_addr(va,12,0), pos.data(), (size_t)nv*12);
     Il2CppArray* na = g_api.array_new(V3Cls, nv); memcpy(array_addr(na,12,0), nrm.data(), (size_t)nv*12);
     Il2CppArray* ua = g_api.array_new(V2Cls, nv); memcpy(array_addr(ua, 8,0), uv.data(),  (size_t)nv*8);
-    Il2CppArray* ia2 = g_api.array_new(I32Cls, ni); memcpy(array_addr(ia2, 4,0), idx.data(), (size_t)ni*4);
+    Il2CppArray* ia = g_api.array_new(I32Cls, ni); memcpy(array_addr(ia, 4,0), idx.data(), (size_t)ni*4);
     const MethodInfo* setV = find_method_any(MeshCls, "set_vertices");
     const MethodInfo* setN = find_method_any(MeshCls, "set_normals");
     const MethodInfo* setU = find_method_any(MeshCls, "set_uv");
     const MethodInfo* setT = find_method_any(MeshCls, "set_triangles");
-    if (!setV || !setT) { LOGE("gpu: set_vertices/set_triangles missing"); return nullptr; }
+    if (!setV || !setT) { LOGE("gpu: set_vertices/triangles missing"); return nullptr; }
     { void* a[1] = { va }; invoke_inst(setV, mesh, a); }
     if (setN) { void* a[1] = { na }; invoke_inst(setN, mesh, a); }
     if (setU) { void* a[1] = { ua }; invoke_inst(setU, mesh, a); }
-    { void* a[1] = { ia2 }; invoke_inst(setT, mesh, a); }
+    { void* a[1] = { ia }; invoke_inst(setT, mesh, a); }
 
-    // ---- bindposes（长度必须 = 克隆骨骼数）----
+    // bindposes：长度必须 = N
     const MethodInfo* setBP = find_method_any(MeshCls, "set_bindposes");
     if (!setBP) { LOGE("gpu: set_bindposes stripped"); return nullptr; }
     {
-        int m4size = array_elem_size(M4Cls, 64);
-        if (m4size != 64) LOGI("gpu: Matrix4x4 stride=%d (expect 64)", m4size);
+        int m4 = array_elem_size(M4Cls, 64);
         Il2CppArray* bpa = g_api.array_new(M4Cls, (size_t)N);
-        if (!bpa) { LOGE("gpu: bindpose array null"); return nullptr; }
-        float* d = (float*)array_addr(bpa, (size_t)m4size, 0);
-        for (int i = 0; i < N*16; i++) d[i] = ((i % 5) == 0) ? 1.0f : 0.0f;   // 列主序单位阵
+        if (!bpa) return nullptr;
+        float* d = (float*)array_addr(bpa, (size_t)m4, 0);
+        for (int i = 0; i < N*16; i++) d[i] = ((i % 5) == 0) ? 1.0f : 0.0f;  // 列主序单位阵
         for (uint32_t i = 0; i < nb; i++) {
             int gi = gidx[i];
             if (gi < 0 || gi >= N) continue;
@@ -3061,26 +3006,26 @@ static Il2CppObject* spawn_gpu_part_inner(Il2CppObject* baseSmr, Il2CppObject* r
         if (g_last_exc) { LOGE("gpu: set_bindposes threw"); return nullptr; }
     }
 
-    // ---- boneWeights（步长问 il2cpp，字段按名写）----
+    // boneWeights：步长问 il2cpp，字段按名写
     const MethodInfo* setBW = find_method_any(MeshCls, "set_boneWeights");
     if (!setBW) { LOGE("gpu: set_boneWeights stripped"); return nullptr; }
     {
         int stride = array_elem_size(BWCls, bwL.size);
-        if (stride < bwL.size) { LOGE("gpu: stride %d < field span %d", stride, bwL.size); return nullptr; }
+        if (stride < bwL.size) { LOGE("gpu: stride %d < span %d", stride, bwL.size); return nullptr; }
         Il2CppArray* bwa = g_api.array_new(BWCls, (size_t)nv);
-        if (!bwa) { LOGE("gpu: boneweight array null"); return nullptr; }
+        if (!bwa) return nullptr;
         unsigned char* base = (unsigned char*)array_addr(bwa, (size_t)stride, 0);
         for (uint32_t i = 0; i < nv; i++) {
             int bi[4]; float bw[4]; float sum = 0;
             for (int q = 0; q < 4; q++) {
                 int ji = joints[i*4+q];
                 float w = weights[i*4+q];
-                if (w <= 0.0001f) { bi[q] = fallback; bw[q] = 0; continue; }
+                if (w <= 0.0001f) { bi[q] = fb; bw[q] = 0; continue; }
                 if (ji < 0 || (uint32_t)ji >= nb) ji = 0;
-                bi[q] = (gidx[ji] >= 0) ? gidx[ji] : fallback;
+                bi[q] = (gidx[ji] >= 0) ? gidx[ji] : fb;
                 bw[q] = w; sum += w;
             }
-            if (sum <= 0.00001f) { bi[0]=fallback; bw[0]=1; sum=1; for (int q=1;q<4;q++){bi[q]=fallback;bw[q]=0;} }
+            if (sum <= 0.00001f) { bi[0]=fb; bw[0]=1; sum=1; for (int q=1;q<4;q++){bi[q]=fb;bw[q]=0;} }
             for (int q = 0; q < 4; q++) bw[q] /= sum;
             unsigned char* e = base + (size_t)i * (size_t)stride;
             for (int q = 0; q < 4; q++) {
@@ -3096,148 +3041,133 @@ static Il2CppObject* spawn_gpu_part_inner(Il2CppObject* baseSmr, Il2CppObject* r
     const MethodInfo* recalc = find_method_any(MeshCls, "RecalculateBounds");
     if (recalc) invoke_inst(recalc, mesh, nullptr);
 
-    // ---- 换 mesh ----
-    const MethodInfo* getSM = find_method_any(SMRCls, "get_sharedMesh");
-    void* oldNat = nullptr;
-    if (getSM) {
-        Il2CppObject* cur = invoke_inst(getSM, clone, nullptr);
-        if (cur) oldNat = *(void**)((char*)cur + 16);
-    }
-    void* newNat = *(void**)((char*)mesh + 16);
-    LOGI("gpu: mesh swap oldNat=%p newNat=%p", oldNat, newNat);
-    if (getSM) swap_mesh_native(clone, oldNat, newNat, "mesh");
-    bool meshOk = false;
-    if (getSM) {
-        Il2CppObject* back = invoke_inst(getSM, clone, nullptr);
-        meshOk = (back == mesh);
-        LOGI("gpu: sharedMesh readback=%p want=%p -> %s", back, mesh, meshOk ? "OK" : "FAIL");
-    } else {
-        meshOk = true;
-    }
-    if (!meshOk) { LOGE("gpu: cannot swap mesh"); return nullptr; }
-
-    // ---- 材质：克隆自带 OP/Char/Models_V2_Proxy，复制一份换贴图 ----
-    {
-        Il2CppObject* mat = nullptr;
-        Il2CppObject* srcMat = nullptr;
-        const MethodInfo* gm = find_method_any(RCls, "get_sharedMaterial");
-        if (gm) srcMat = invoke_inst(gm, clone, nullptr);
-        if (srcMat) {
-            mat = g_api.object_new(MatCls);
-            const MethodInfo* mctor1 = find_method(MatCls, ".ctor", 1);
-            if (mctor1) { void* b[1] = { srcMat }; invoke_inst(mctor1, mat, b); }
-        }
-        if (mat) {
-            const MethodInfo* setMat = find_method(RCls, "set_sharedMaterial", 1);
-            if (setMat) { void* a[1] = { mat }; invoke_inst(setMat, clone, a); }
-            const MethodInfo* setCol = find_method(MatCls, "set_color", 1);
-            if (setCol) { Color4 wc = {1,1,1,1}; void* ca[1] = { &wc }; invoke_inst(setCol, mat, ca); }
-
-            FILE* tf = fopen(texPath, "rb");
-            if (tf) {
-                char tm[4]; uint32_t tw = 0, th = 0;
-                if (fread(tm,1,4,tf) == 4 && memcmp(tm,"MMTX",4) == 0 &&
-                    fread(&tw,4,1,tf) == 1 && fread(&th,4,1,tf) == 1) {
-                    if (tw > 0 && th > 0 && tw <= 4096 && th <= 4096) {
-                        size_t nbytes = (size_t)tw * th * 4;
-                        std::vector<unsigned char> px(nbytes);
-                        if (fread(px.data(),1,nbytes,tf) == nbytes && TexCls && ByteCls) {
-                            const MethodInfo* tctor4 = find_method(TexCls, ".ctor", 4);
-                            Il2CppObject* tex = g_api.object_new(TexCls);
-                            if (tctor4) {
-                                int wi = (int)tw, hi = (int)th, fmt = 4; bool mip = false;
-                                void* ta[4] = { &wi, &hi, &fmt, &mip };
-                                invoke_inst(tctor4, tex, ta);
-                            }
-                            const MethodInfo* loadRaw = find_method(TexCls, "LoadRawTextureData", 1);
-                            const MethodInfo* apply1 = find_method(TexCls, "Apply", 1);
-                            if (tex && loadRaw) {
-                                Il2CppArray* barr = g_api.array_new(ByteCls, nbytes);
-                                memcpy(array_addr(barr,1,0), px.data(), nbytes);
-                                void* la[1] = { barr };
-                                invoke_inst(loadRaw, tex, la);
-                                if (apply1) { bool upd = false; void* aa[1] = { &upd }; invoke_inst(apply1, tex, aa); }
-                                const MethodInfo* setMain = find_method(MatCls, "set_mainTexture", 1);
-                                if (setMain) { void* sa[1] = { tex }; invoke_inst(setMain, mat, sa); }
-                                LOGI("gpu: tex ok %ux%u", tw, th);
-                            }
-                        }
-                    }
-                }
-                fclose(tf);
-            }
-        } else {
-            LOGE("gpu: no material on clone");
-        }
-    }
-
-    // ---- 挂到角色根节点 ----
-    Il2CppClass* CompCls = find_class_any("UnityEngine", "Component");
-    Il2CppClass* GOCls   = find_class_any("UnityEngine", "GameObject");
-    const MethodInfo* getGO = CompCls ? find_method_any(CompCls, "get_gameObject") : nullptr;
-    const MethodInfo* getTr = GOCls ? find_method_any(GOCls, "get_transform") : nullptr;
-    Il2CppObject* cgo = (getGO) ? invoke_inst(getGO, clone, nullptr) : nullptr;
-    Il2CppObject* gt  = (cgo && getTr) ? invoke_inst(getTr, cgo, nullptr) : nullptr;
-    if (!gt) { LOGE("gpu: clone transform null"); return nullptr; }
-
-    if (GOCls && cgo) {
-        const MethodInfo* setAct = find_method_any(GOCls, "SetActive");
-        if (setAct) { uint8_t t = 1; void* a[1] = { &t }; invoke_inst(setAct, cgo, a); }
-    }
-    // 克隆上带的 Animator 会跟原角色抢同一套骨骼，关掉
-    {
-        Il2CppClass* AnimCls = find_class_any("UnityEngine", "Animator");
-        const MethodInfo* getComp = CompCls ? find_method(CompCls, "GetComponent", 1) : nullptr;
-        if (AnimCls && getComp && g_setEnabled) {
-            void* a[1] = { g_api.type_get_object(g_api.class_get_type(AnimCls)) };
-            Il2CppObject* an = invoke_inst(getComp, clone, a);
-            if (an) { uint8_t f = 0; void* b[1] = { &f }; invoke_inst(g_setEnabled, an, b); LOGI("gpu: clone Animator off"); }
-        }
-    }
-
-    const MethodInfo* setParent = find_method_any(TransCls, "SetParent");
-    const MethodInfo* setLPos   = find_method_any(TransCls, "set_localPosition");
-    const MethodInfo* setLScale = find_method_any(TransCls, "set_localScale");
-    const MethodInfo* setLRot   = find_method_any(TransCls, "set_localRotation");
-    if (roleRoot && setParent) { void* a[1] = { roleRoot }; invoke_inst(setParent, gt, a); }
-    if (setLScale) { Vec3 s2 = {1,1,1}; void* b[1] = { &s2 }; invoke_inst(setLScale, gt, b); }
-    if (setLRot) { Quat q = {0,0,0,1}; void* b[1] = { &q }; invoke_inst(setLRot, gt, b); }
-    if (setLPos) { Vec3 p = {0,0,0}; void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
-
-    g_orphan_clone = nullptr;
-    g_ourSmrs.insert(clone);
-    LOGI("gpu: PART OK %s clone=%p mesh=%p", meshPath, clone, mesh);
-    return clone;
+    if (outNv) *outNv = (int)nv;
+    LOGI("gpu: mesh built nv=%u ni=%u", nv, ni);
+    return mesh;
 }
 
-static Il2CppObject* spawn_gpu_part(Il2CppObject* baseSmr, Il2CppObject* roleRoot,
-                                    const char* meshPath, const char* texPath, float k) {
-    g_orphan_clone = nullptr;
-    Il2CppObject* r = spawn_gpu_part_inner(baseSmr, roleRoot, meshPath, texPath, k);
-    if (!r && g_orphan_clone) {
-        destroy_one_obj(g_orphan_clone);
-        LOGI("gpu: cleaned orphan clone %p", g_orphan_clone);
-        g_orphan_clone = nullptr;
+// ---------------------------------------------------------------
+// 给原 SMR 换材质（克隆它自己的材质再换贴图）
+// ---------------------------------------------------------------
+static bool retint_material(Il2CppObject* smr, const char* texPath) {
+    Il2CppClass* MatCls = find_class_any("UnityEngine", "Material");
+    Il2CppClass* TexCls = find_class_any("UnityEngine", "Texture2D");
+    Il2CppClass* ByteCls = find_class_any("System", "Byte");
+    Il2CppClass* RCls = find_class_any("UnityEngine", "Renderer");
+    if (!MatCls || !RCls) return false;
+    const MethodInfo* gm = find_method_any(RCls, "get_sharedMaterial");
+    Il2CppObject* src = gm ? invoke_inst(gm, smr, nullptr) : nullptr;
+    if (!src) { LOGE("gpu: no source material"); return false; }
+
+    Il2CppObject* mat = g_api.object_new(MatCls);
+    const MethodInfo* mctor1 = find_method(MatCls, ".ctor", 1);
+    if (mctor1) { void* b[1] = { src }; invoke_inst(mctor1, mat, b); }
+    const MethodInfo* setMat = find_method(RCls, "set_sharedMaterial", 1);
+    if (setMat) { void* a[1] = { mat }; invoke_inst(setMat, smr, a); }
+    const MethodInfo* setCol = find_method(MatCls, "set_color", 1);
+    if (setCol) { Color4 wc = {1,1,1,1}; void* ca[1] = { &wc }; invoke_inst(setCol, mat, ca); }
+
+    FILE* tf = fopen(texPath, "rb");
+    if (!tf) { LOGE("gpu: tex open fail %s", texPath); return true; }
+    char tm[4]; uint32_t tw = 0, th = 0;
+    if (fread(tm,1,4,tf) != 4 || memcmp(tm,"MMTX",4) != 0 ||
+        fread(&tw,4,1,tf) != 1 || fread(&th,4,1,tf) != 1) { fclose(tf); return true; }
+    if (tw == 0 || th == 0 || tw > 4096 || th > 4096) { fclose(tf); return true; }
+    size_t nbytes = (size_t)tw * th * 4;
+    std::vector<unsigned char> px(nbytes);
+    if (fread(px.data(),1,nbytes,tf) != nbytes) { fclose(tf); return true; }
+    fclose(tf);
+    if (!TexCls || !ByteCls) return true;
+
+    const MethodInfo* tctor4 = find_method(TexCls, ".ctor", 4);
+    Il2CppObject* tex = g_api.object_new(TexCls);
+    if (tctor4) {
+        int wi = (int)tw, hi = (int)th, fmt = 4; bool mip = false;
+        void* ta[4] = { &wi, &hi, &fmt, &mip };
+        invoke_inst(tctor4, tex, ta);
     }
-    return r;
+    const MethodInfo* loadRaw = find_method(TexCls, "LoadRawTextureData", 1);
+    const MethodInfo* apply1 = find_method(TexCls, "Apply", 1);
+    if (tex && loadRaw) {
+        Il2CppArray* barr = g_api.array_new(ByteCls, nbytes);
+        memcpy(array_addr(barr,1,0), px.data(), nbytes);
+        void* la[1] = { barr };
+        invoke_inst(loadRaw, tex, la);
+        if (apply1) { bool upd = false; void* aa[1] = { &upd }; invoke_inst(apply1, tex, aa); }
+        const MethodInfo* setMain = find_method(MatCls, "set_mainTexture", 1);
+        if (setMain) { void* sa[1] = { tex }; invoke_inst(setMain, mat, sa); }
+        LOGI("gpu: tex ok %ux%u", tw, th);
+    }
+    return true;
+}
+
+static Il2CppObject* g_replacedSmr = nullptr;
+
+static void destroy_one_obj(Il2CppObject* o) {
+    if (!o) return;
+    if (!*(void**)((char*)o + 16)) return;
+    Il2CppClass* ObjectCls = find_class_any("UnityEngine", "Object");
+    const MethodInfo* destroy = ObjectCls ? find_method(ObjectCls, "Destroy", 1) : nullptr;
+    if (!destroy) return;
+    void* a[1] = { o };
+    invoke_inst(destroy, nullptr, a);
 }
 
 static void destroy_our_smrs() {
-    if (g_ourSmrs.empty()) return;
-    int n = 0;
-    for (std::set<Il2CppObject*>::iterator it = g_ourSmrs.begin(); it != g_ourSmrs.end(); ++it) {
-        destroy_one_obj(*it); n++;
-    }
+    // v116 不再克隆，只有还原逻辑；这里保留接口给外部调用
+    g_replacedSmr = nullptr;
     g_ourSmrs.clear();
-    LOGI("gpu: destroyed %d old smrs", n);
 }
 
+// ---------------------------------------------------------------
+// 直接在原 SMR 上换 mesh
+// ---------------------------------------------------------------
+static int replace_original_smr(Il2CppObject* SMRCls_unused, Il2CppObject* smr,
+                                const char* meshPath, const char* texPath,
+                                int N, const std::map<std::string,int>& name2idx,
+                                float k) {
+    (void)SMRCls_unused;
+    Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+    const MethodInfo* getSM = SMRCls ? find_method_any(SMRCls, "get_sharedMesh") : nullptr;
+    if (!getSM) { LOGE("gpu: no get_sharedMesh"); return 0; }
+
+    Il2CppObject* origMesh = invoke_inst(getSM, smr, nullptr);
+    void* origNat = origMesh ? *(void**)((char*)origMesh + 16) : nullptr;
+    LOGI("gpu: original mesh=%p nat=%p", origMesh, origNat);
+
+    int nv = 0, found = 0;
+    Il2CppObject* ours = build_skinned_mesh(meshPath, name2idx, N, 0, k, &nv, &found);
+    if (!ours) { LOGE("gpu: build_skinned_mesh failed"); return 0; }
+    void* oursNat = *(void**)((char*)ours + 16);
+    LOGI("gpu: our mesh=%p nat=%p", ours, oursNat);
+
+    if (!origNat) {
+        LOGE("gpu: original mesh has no native ptr, cannot restore on failure");
+    }
+
+    int hits = swap_mesh_native(smr, origNat, oursNat, "replace");
+    if (!hits) {
+        LOGE("gpu: nothing patched -> abort");
+        return 0;
+    }
+
+    Il2CppObject* back = invoke_inst(getSM, smr, nullptr);
+    if (back == ours) {
+        LOGI("gpu: *** REPLACE OK *** nv=%d bones=%d/%d", nv, found, N);
+        retint_material(smr, texPath);
+        g_replacedSmr = smr;
+        return 1;
+    }
+
+    LOGE("gpu: readback=%p want=%p -> REPLACE FAIL, restoring", back, ours);
+    if (origNat) restore_mesh_native(smr, origNat);
+    return 0;
+}
+
+// ---------------------------------------------------------------
 static int spawn_gpu_parts(Il2CppObject* origSmr) {
     if (g_gpu_tried) return g_gpu_skin ? 1 : 0;
     g_gpu_tried = 1;
-    destroy_our_smrs();
-    Il2CppObject* roleRoot = find_role_root(origSmr);
-    if (!roleRoot) { LOGE("gpu: no roleRoot"); return 0; }
 
     const char* b1[] = {
         "/data/user/0/com.hermes.h1game/files/custom_%d.mmesh",
@@ -3259,33 +3189,31 @@ static int spawn_gpu_parts(Il2CppObject* origSmr) {
     if (!p0[0]) { LOGE("gpu: custom_0.mmesh not found"); return 0; }
 
     std::vector<std::string> names;
-    if (!read_mm2_names(p0, names)) { LOGE("gpu: cannot read bone names from custom_0"); return 0; }
-    LOGI("gpu: base part has %d bone names", (int)names.size());
+    if (!read_mm2_names(p0, names)) { LOGE("gpu: cannot read bone names"); return 0; }
+    LOGI("gpu: our part has %d bone names", (int)names.size());
 
     Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
     if (!SMRCls) { LOGE("gpu: no SMR class"); return 0; }
-    Il2CppObject* baseSmr = pick_best_smr(SMRCls, names);
-    if (!baseSmr) { LOGE("gpu: no SMR has enough of our bones"); return 0; }
+
+    std::vector<Il2CppObject*> bones;
+    Il2CppObject* target = pick_best_smr(SMRCls, names, &bones);
+    if (!target) { LOGE("gpu: no SMR matches our bones"); return 0; }
+    int N = (int)bones.size();
+    LOGI("gpu: target smr=%p bones=%d", target, N);
+
+    std::map<std::string,int> name2idx;
+    for (int i = 0; i < N; i++) {
+        Il2CppObject* t = bones[i];
+        if (!t) continue;
+        std::string nm = obj_name(t);
+        if (!nm.empty() && name2idx.find(nm) == name2idx.end()) name2idx[nm] = i;
+    }
 
     float k = 1.7f / 20.214f;
-    int made = 0, want = GPU_MAX_PARTS;
-    for (int i = 0; i < want && i < 4; i++) {
-        char mp[256], tp[256];
-        bool ok = false;
-        for (int b = 0; b < 2 && !ok; b++) {
-            snprintf(mp, sizeof(mp), b1[b], i);
-            FILE* tf = fopen(mp, "rb");
-            if (!tf) continue;
-            fclose(tf);
-            snprintf(tp, sizeof(tp), b2[b], i);
-            ok = true;
-        }
-        if (!ok) { LOGI("gpu: custom_%d.mmesh missing", i); continue; }
-        if (spawn_gpu_part(baseSmr, roleRoot, mp, tp, k)) made++;
-    }
-    LOGI("gpu: spawned %d/%d", made, want);
-    if (made > 0) g_gpu_skin = 1;
-    return made;
+    int ok = replace_original_smr(nullptr, target, p0, t0, N, name2idx, k);
+    if (ok) { g_gpu_skin = 1; LOGI("gpu: GPU skinning ACTIVE"); }
+    else     { LOGE("gpu: falling back to static path"); }
+    return ok;
 }
 
 static int spawn_parts_loop(Il2CppObject* smr) {
