@@ -58,6 +58,8 @@ static CharRule g_rules[] = {
 };
 static const int RULE_COUNT = (int)(sizeof(g_rules) / sizeof(g_rules[0]));
 
+struct Vec3 { float x, y, z; };
+
 Il2CppApi g_api{};
 static JavaVM* g_vm = nullptr;
 static Il2CppDomain* g_domain = nullptr;
@@ -800,6 +802,24 @@ static Il2CppObject* spawn_cube_for(Il2CppObject* smr) {
         void* a2[1] = { sp };
         invoke_inst(setParent, ct, a2);
     }
+
+    // 放大 + 抬到头顶，不然埋在模型里看不见
+    if (ct) {
+        const MethodInfo* setScale = find_method(TransCls, "set_localScale", 1);
+        const MethodInfo* setLPos   = find_method(TransCls, "set_localPosition", 1);
+        if (setScale) {
+            Vec3 s = {3.0f, 3.0f, 3.0f};
+            void* a[1] = { &s };
+            invoke_inst(setScale, ct, a);
+            LOGI("cube: scale set");
+        }
+        if (setLPos) {
+            Vec3 p = {0.0f, 2.0f, 0.0f};
+            void* a[1] = { &p };
+            invoke_inst(setLPos, ct, a);
+            LOGI("cube: pos set");
+        }
+    }
     return cube;
 }
 
@@ -1329,7 +1349,7 @@ static int hk_framecount(void* method) {
 }
 
 // ---- 实例方法 hook：AOT 签名 (void* self, MethodInfo* m) ----
-struct Vec3 { float x, y, z; };
+// struct Vec3 提到顶部了
 
 static void* g_orig_name = nullptr;
 static void* g_orig_gettrans = nullptr;
