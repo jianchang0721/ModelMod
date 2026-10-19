@@ -2115,9 +2115,24 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
                             Il2CppClass* TexCls = find_class_any("UnityEngine", "Texture2D");
                             Il2CppClass* ByteCls = find_class_any("System", "Byte");
                             if (TexCls && ByteCls) {
+                                // 必须用 mipChain=false 的构造函数：默认 ctor(w,h) 带 mipmap，
+                                // 而 LoadRawTextureData 只喂了 mip0，渲染时采样到垃圾 mip 就会显示灰/白
+                                const MethodInfo* tctor4 = find_method(TexCls, ".ctor", 4);
                                 const MethodInfo* tctor = find_method(TexCls, ".ctor", 2);
                                 Il2CppObject* tex = g_api.object_new(TexCls);
-                                if (tctor) { int wi = (int)tw, hi = (int)th; void* ta[2] = { &wi, &hi }; invoke_inst(tctor, tex, ta); }
+                                if (tctor4) {
+                                    int wi = (int)tw, hi = (int)th;
+                                    int fmt = 4;          // TextureFormat.RGBA32
+                                    bool mipChain = false;
+                                    void* ta[4] = { &wi, &hi, &fmt, &mipChain };
+                                    invoke_inst(tctor4, tex, ta);
+                                    LOGI("tex: ctor4 used (RGBA32, no mip)");
+                                } else if (tctor) {
+                                    int wi = (int)tw, hi = (int)th;
+                                    void* ta[2] = { &wi, &hi };
+                                    invoke_inst(tctor, tex, ta);
+                                    LOGI("tex: ctor2 fallback");
+                                }
                                 const MethodInfo* loadRaw = find_method(TexCls, "LoadRawTextureData", 1);
                                 const MethodInfo* apply = find_method(TexCls, "Apply", 0);
                                 if (tex && loadRaw) {
@@ -2125,7 +2140,12 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
                                     memcpy(array_addr(barr, 1, 0), px.data(), nbytes);
                                     void* la[1] = { barr };
                                     invoke_inst(loadRaw, tex, la);
-                                    if (apply) invoke_inst(apply, tex, nullptr);
+                                    if (apply) {
+                                        const MethodInfo* apply1 = find_method(TexCls, "Apply", 1);
+                                        if (apply1) { bool upd = false; void* aa[1] = { &upd }; invoke_inst(apply1, tex, aa); }
+                                        else invoke_inst(apply, tex, nullptr);
+                                        LOGI("tex: applied");
+                                    }
                                     // 诊断：UV 样本
                                     {
                                         const MethodInfo* gm = find_method(MeshCls, "get_uv", 0);
@@ -2146,7 +2166,7 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
 
                                     // 关键：材质原来的 tint 是肉色，会和贴图相乘，刷成白色贴图才准
                                     const MethodInfo* setCol = find_method(MatCls, "set_color", 1);
-                                    if (setCol) { Color4 wcol = {1.0f, 1.0f, 1.0f, 1.0f}; void* ca[1] = { &wcol }; invoke_inst(setCol, mat, ca); LOGI("tex: tint white"); }
+                                    if (setCol) { Color4 wcol = {1.0f, 0.0f, 0.0f, 1.0f};   // 暂时刷成纯红，判断 tint 是否真的生效 void* ca[1] = { &wcol }; invoke_inst(setCol, mat, ca); LOGI("tex: tint white"); }
 
                                     // 读回宽高确认纹理真的建出来了
                                     const MethodInfo* getW = find_method(TexCls, "get_width", 0);
