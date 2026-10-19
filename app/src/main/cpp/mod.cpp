@@ -1307,20 +1307,29 @@ static void do_patch_tick() {
     if (list.empty()) return;
 
     // 不管 worker 是否已隐藏，前 3 个匹配的 SMR 直接造 cube（当前主线，安全）
-    int done = 0;
+    // 选靶子：优先真玩家角色（PlayerRoot），其次角色池，最后随便一个 Body
+    Il2CppObject* pick = nullptr;
+    const char* chainOf = nullptr;
     for (auto& f : list) {
-        if (done >= 1 || g_cube_done >= 1) break;
-
-        // 注意：不能走 rule_matches，那个是隐藏逻辑（看 g_hide_mask，默认为 0 = 全不匹配）
-        // 换模型只认名字：找第一个 Body 挂上去
         if (f.chain.find("Body") == std::string::npos) continue;
+        if (f.chain.find("PlayerRoot") != std::string::npos) { pick = f.smr; chainOf = f.chain.c_str(); break; }
+    }
+    if (!pick) for (auto& f : list) {
+        if (f.chain.find("Body") == std::string::npos) continue;
+        if (f.chain.find("AvatarPoolRoot") != std::string::npos) { pick = f.smr; chainOf = f.chain.c_str(); break; }
+    }
+    if (!pick) for (auto& f : list) {
+        if (f.chain.find("Body") == std::string::npos) continue;
+        pick = f.smr; chainOf = f.chain.c_str(); break;
+    }
 
+    int done = 0;
+    if (pick) {
         g_cube_done++;
-        LOGI("model: trying %s", f.chain.c_str());
-        Il2CppObject* cb = spawn_model_object(f.smr);
+        LOGI("model: trying %s", chainOf ? chainOf : "?");
+        Il2CppObject* cb = spawn_model_object(pick);
         LOGI("model: result=%p", cb);
         done++;
-        break;
     }
     if (done > 0) LOGI("tick cube done=%d total=%zu", done, g_last_scan);
 }
