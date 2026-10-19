@@ -1459,7 +1459,7 @@ static void main_tick() {
     // CPU 蒙皮：约 20fps 刷一次，全速跑太重
     {
         static int skinTick = 0;
-        if ((skinTick++ % 3) == 0) {
+        if ((skinTick++ % 10) == 0) {
             update_skin_parts();
         }
     }
@@ -2305,6 +2305,8 @@ struct SkinPart {
     std::vector<float> weights;      // nv*4
     std::vector<float> bindT;        // nb*3 每骨骼 bind 平移
     std::vector<Il2CppObject*> bones;// 游戏骨骼 Transform
+    Il2CppArray* varray = nullptr;   // 复用顶点数组，避免每帧 array_new 撑爆 GC
+    std::vector<float> outBuf;
 };
 static std::vector<SkinPart> g_skinParts;
 static std::vector<std::string> g_lastBoneNames;
@@ -2439,9 +2441,10 @@ static void update_skin_parts() {
             out[v*3+0] = ox; out[v*3+1] = oy; out[v*3+2] = oz;
         }
 
-        Il2CppArray* va = g_api.array_new(V3Cls, sp.nv);
-        memcpy(array_addr(va, 12, 0), out.data(), (size_t)sp.nv * 12);
-        void* a[1] = { va };
+        if (!sp.varray) sp.varray = g_api.array_new(V3Cls, sp.nv);
+        if (!sp.varray) continue;
+        memcpy(array_addr(sp.varray, 12, 0), out.data(), (size_t)sp.nv * 12);
+        void* a[1] = { sp.varray };
         invoke_inst(setVerts, sp.mesh, a);
     }
 }
