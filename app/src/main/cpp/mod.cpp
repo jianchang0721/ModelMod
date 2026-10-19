@@ -1894,9 +1894,23 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
     if (gt && roleRoot && setParent) {
         void* a[1] = { roleRoot };
         invoke_inst(setParent, gt, a);
-        if (setLScale) { Vec3 s = {20, 20, 20}; void* b[1] = { &s }; invoke_inst(setLScale, gt, b); }
-        if (setLPos)   { Vec3 p = {0, 0, 0};    void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
-        LOGI("mmesh: parent set to role root %p", roleRoot);
+
+        // 角色节点自带的缩放不是 1（很多游戏模型单位是厘米，节点缩放 0.01），
+        // 直接写 localScale=20 会被父级再乘一次，直接缩到看不见
+        const MethodInfo* getLossy = find_method(TransCls, "get_lossyScale", 0);
+        float psc = 1.0f;
+        if (getLossy) {
+            Il2CppObject* ls = invoke_inst(getLossy, roleRoot, nullptr);
+            if (ls) {
+                Vec3 v = *(Vec3*)((char*)ls + 16);
+                LOGI("mmesh: parent lossyScale = %f %f %f", v.x, v.y, v.z);
+                if (v.x > 0.00001f) psc = v.x;
+            }
+        }
+        float k = 20.0f / psc;
+        if (setLScale) { Vec3 s = {k, k, k}; void* b[1] = { &s }; invoke_inst(setLScale, gt, b); }
+        if (setLPos)   { Vec3 p = {0, 0, 0}; void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
+        LOGI("mmesh: parent set to role root %p localScale=%f", roleRoot, k);
     }
 
     LOGI("mmesh: done go=%p trans=%p parent=%p", go, gt, sp);
