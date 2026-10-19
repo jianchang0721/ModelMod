@@ -1774,11 +1774,16 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
     const MethodInfo* setLPos    = find_method(TransCls, "set_localPosition", 1);
     const MethodInfo* setLScale  = find_method(TransCls, "set_localScale", 1);
     Il2CppObject* gt = getTransGO ? invoke_inst(getTransGO, go, nullptr) : nullptr;
+    LOGI("mmesh: step gt=%p setLPos=%p setLScale=%p", gt, (void*)setLPos, (void*)setLScale);
+
+    if (gt && setLScale) { Vec3 s = {20, 20, 20}; void* a[1] = { &s }; invoke_inst(setLScale, gt, a); LOGI("mmesh: scale ok"); }
+    if (gt && setLPos)   { Vec3 p = {0, 0, 0};    void* a[1] = { &p }; invoke_inst(setLPos, gt, a);   LOGI("mmesh: pos ok"); }
+
     Il2CppObject* st = smr ? invoke_inst(getTransGO, smr, nullptr) : nullptr;
     Il2CppObject* sp = (st && getParent) ? invoke_inst(getParent, st, nullptr) : nullptr;
-    if (gt && sp && setParent) { void* a[1] = { sp }; invoke_inst(setParent, gt, a); }
-    if (gt && setLPos) { Vec3 p = {0, 0, 0}; void* a[1] = { &p }; invoke_inst(setLPos, gt, a); }
-    if (gt && setLScale) { Vec3 s = {20, 20, 20}; void* a[1] = { &s }; invoke_inst(setLScale, gt, a); }
+    LOGI("mmesh: step st=%p sp=%p setParent=%p", st, sp, (void*)setParent);
+    if (gt && sp && setParent) { void* a[1] = { sp }; invoke_inst(setParent, gt, a); LOGI("mmesh: parent ok"); }
+
     LOGI("mmesh: done go=%p trans=%p parent=%p", go, gt, sp);
     return go;
 }
