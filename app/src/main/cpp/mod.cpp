@@ -1858,20 +1858,26 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
 
     // 找角色根节点：从 SMR 往上爬，停在 PlayerRoot / AvatarPoolRoot 的直接子节点，
     // 那个节点才是会跟着角色跑的东西（挂到中间某层可能是个不动的池子节点）
+    // 角色实例的命名是 12011_U_1 / 15043_H_2 / 11055_C_1 这种，
+    // 池子根（VisualPool / VisualModelPool）不会动，挂在它下面就是个站桩
     Il2CppObject* roleRoot = st;
     {
         Il2CppObject* cur = st;
         for (int i = 0; i < 8 && cur; i++) {
+            std::string cn = obj_name(cur);
+            LOGI("mmesh: node[%d] = %s", i, cn.c_str());
+            bool isRole = cn.find("_U_") != std::string::npos ||
+                          cn.find("_H_") != std::string::npos ||
+                          cn.find("_C_") != std::string::npos;
+            if (isRole) {
+                roleRoot = cur;
+                LOGI("mmesh: roleRoot = %s", cn.c_str());
+                break;
+            }
             Il2CppObject* p = getParent ? invoke_inst(getParent, cur, nullptr) : nullptr;
             if (!p) break;
-            std::string pn = obj_name(p);
-            LOGI("mmesh: up%d = %s", i, pn.c_str());
-            if (pn.find("PlayerRoot") != std::string::npos ||
-                pn.find("AvatarPoolRoot") != std::string::npos ||
-                pn.find("VisualPool") != std::string::npos) break;
             cur = p;
         }
-        if (cur) roleRoot = cur;
     }
 
     if (gt && roleRoot && setParent) {
