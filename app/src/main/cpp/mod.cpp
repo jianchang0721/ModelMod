@@ -3415,8 +3415,25 @@ static int replace_original_smr(Il2CppObject* SMRCls_unused, Il2CppObject* smr,
         Il2CppObject* back = invoke_inst(getSM, smr, nullptr);
         LOGI("gpu: sharedMesh after rewrite = %p (same obj? %d)", back, back == origMesh);
         LOGI("gpu: *** REWRITE OK *** nv=%d bones=%d/%d", nv, found, N);
-        retint_material(smr, texPath);
+
+        // 关键：mesh 的顶点数/bindposes 数都变了，SMR 内部缓存的蒙皮缓冲要重建，
+        // 否则下一帧渲染会拿旧缓冲读新数据 -> 越界 -> SIGSEGV
+        Il2CppClass* BehCls = find_class_any("UnityEngine", "Behaviour");
+        const MethodInfo* setEn = BehCls ? find_method(BehCls, "set_enabled", 1) : nullptr;
+        if (setEn) {
+            LOGI("gpu: step1 disable renderer");
+            uint8_t off = 0; void* a1[1] = { &off }; invoke_inst(setEn, smr, a1);
+            LOGI("gpu: step2 enable renderer");
+            uint8_t on = 1;  void* a2[1] = { &on };  invoke_inst(setEn, smr, a2);
+            LOGI("gpu: step3 renderer re-enabled");
+        } else {
+            LOGI("gpu: no set_enabled, skipping rebuild");
+        }
+
+        // 材质先不动：retint_material 里有 fopen，正是 v112 fdsan 的老病根。
+        // 先确认 mesh 改动本身不崩，贴图下一步再上。
         g_replacedSmr = smr;
+        LOGI("gpu: REWRITE path finished (material left untouched)");
         return 1;
     }
     LOGE("gpu: rewrite on existing mesh failed, trying pointer swap");
