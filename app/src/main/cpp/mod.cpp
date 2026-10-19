@@ -1020,7 +1020,8 @@ static void probe_types() {
     }
 }
 
-static int g_cube_done = 0;
+static volatile int g_cube_done = 0;
+static Il2CppObject* g_last_model_go = nullptr;
 static long g_lastGO = -1;
 
 // Instantiate hook：在主线程创建对象时插一脚
@@ -1285,6 +1286,18 @@ static void do_patch_tick() {
 
     // 已经干完活就不再全量扫描，别再拖主线程
     if (g_cube_done >= 1) return;
+
+    // 上一版模型先干掉，免得刷新后叠一堆
+    if (g_last_model_go) {
+        Il2CppClass* ObjectCls2 = find_class_any("UnityEngine", "Object");
+        const MethodInfo* destroy = ObjectCls2 ? find_method(ObjectCls2, "Destroy", 1) : nullptr;
+        if (destroy) {
+            void* a[1] = { g_last_model_go };
+            invoke_static(destroy, a);
+            LOGI("model: old destroyed %p", g_last_model_go);
+        }
+        g_last_model_go = nullptr;
+    }
 
     std::vector<Fingerprint> list;
     collect_fingerprints(g_smrCls, list);
@@ -1683,6 +1696,8 @@ static void probe_native_mesh() {
 // 文件放在游戏私有目录，因为 app 读不了 /sdcard 上任意路径
 // ---------------------------------------------------------------
 static const char* kMmeshPaths[] = {
+    "/data/user/0/com.hermes.h1game/files/custom.mmesh",   // 用户从悬浮窗选的
+    "/data/data/com.hermes.h1game/files/custom.mmesh",
     "/sdcard/MT2/ModelMod/human.mmesh",
     "/storage/emulated/0/MT2/ModelMod/human.mmesh",
     "/data/user/0/com.hermes.h1game/files/human.mmesh",
@@ -1802,6 +1817,7 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
     if (gt && sp && setParent) { void* a[1] = { sp }; invoke_inst(setParent, gt, a); LOGI("mmesh: parent ok"); }
 
     LOGI("mmesh: done go=%p trans=%p parent=%p", go, gt, sp);
+    g_last_model_go = go;
     return go;
 }
 
@@ -2206,6 +2222,12 @@ static void* worker(void*) {
 
 // ================= 入口 =================
 // Java 层把游戏的 files 目录传进来，保证日志一定写得出去
+extern "C" JNIEXPORT void JNICALL
+Java_com_moss_modelmod_HookEntry_reloadModel(JNIEnv*, jclass) {
+    g_cube_done = 0;
+    LOGI("reload requested: cube_done reset");
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_moss_modelmod_HookEntry_setHideMask(JNIEnv*, jclass, jint mask) {
     g_hide_mask = (int)mask;
