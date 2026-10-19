@@ -70,7 +70,12 @@ static pid_t cur_tid() {
 
 // UnityMain 线程的 tid 不等于 pid！只能靠线程名认
 // 缓存：clock_gettime 每秒几千次，不能每次都 prctl
+// 游戏会建好几个叫 UnityMain 的线程，只有一个是真的：clock_gettime 频率最高的那个
+static volatile pid_t g_main_tid = 0;
+
 static bool is_unity_main() {
+    pid_t tid = cur_tid();
+    if (g_main_tid) return tid == g_main_tid;
     static thread_local int8_t cached = 0;
     if (cached == 1) return true;              // 只缓存 true：线程名是启动后才设的
     char name[16] = {0};
@@ -1030,6 +1035,19 @@ static int cgt_fallback(clockid_t id, struct timespec* ts) {
 
 static int hk_cgt(clockid_t id, struct timespec* ts) {
     g_hookcnt[HC_CGT_ALL]++;          // 不管哪个线程，先进来就算
+
+    // 锁定真主线程：高频调用 clock_gettime 且名字叫 UnityMain 的那个
+    if (!g_main_tid) {
+        static thread_local int hits = 0;
+        if (++hits > 300) {
+            char nm[16] = {0};
+            if (prctl(PR_GET_NAME, nm) == 0 && strncmp(nm, "UnityMain", 9) == 0) {
+                g_main_tid = cur_tid();
+                LOGI("real main tid locked = %d name=%s", (int)g_main_tid, nm);
+            }
+        }
+    }
+
     if (is_unity_main()) {
         g_hookcnt[HC_CGT]++;
         main_tick();
