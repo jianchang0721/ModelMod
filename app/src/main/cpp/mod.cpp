@@ -583,7 +583,10 @@ static void collect_fingerprints(Il2CppClass* SMRCls, std::vector<Fingerprint>& 
     Il2CppClass* CompCls   = find_class_any("UnityEngine", "Component");
     Il2CppClass* TransCls  = find_class_any("UnityEngine", "Transform");
     Il2CppClass* Renderer  = find_class_any("UnityEngine", "Renderer");
-    if (!ObjectCls || !CompCls || !TransCls || !Renderer) return;
+    if (!ObjectCls || !CompCls || !TransCls || !Renderer) {
+        LOGE("collect: class missing O=%p C=%p T=%p R=%p", ObjectCls, CompCls, TransCls, Renderer);
+        return;
+    }
 
     const MethodInfo* find     = find_method(ObjectCls, "FindObjectsOfType", 1);
     const MethodInfo* getGO    = find_method(CompCls, "get_gameObject", 0);
@@ -592,7 +595,12 @@ static void collect_fingerprints(Il2CppClass* SMRCls, std::vector<Fingerprint>& 
     const MethodInfo* getBones = find_method(SMRCls, "get_bones", 0);
     const MethodInfo* getMats  = find_method(Renderer, "get_sharedMaterials", 0);
     const MethodInfo* getMesh  = find_method(SMRCls, "get_sharedMesh", 0);
-    if (!find || !getGO || !getTrans || !getParent || !getBones || !getMats || !getMesh) return;
+    if (!find || !getGO || !getTrans || !getParent || !getBones || !getMats || !getMesh) {
+        LOGE("collect: method missing find=%p GO=%p TR=%p PA=%p BO=%p MA=%p ME=%p",
+             (void*)find, (void*)getGO, (void*)getTrans, (void*)getParent,
+             (void*)getBones, (void*)getMats, (void*)getMesh);
+        return;
+    }
 
     void* a[1] = { g_api.type_get_object(g_api.class_get_type(SMRCls)) };
     Il2CppArray* arr = (Il2CppArray*)invoke_static(find, a);
@@ -1289,16 +1297,16 @@ static void do_patch_tick() {
     for (auto& f : list) {
         if (done >= 1 || g_cube_done >= 1) break;
 
-        for (int r = 0; r < RULE_COUNT; r++) {
-            if (!rule_matches(g_rules[r], f)) continue;
+        // 注意：不能走 rule_matches，那个是隐藏逻辑（看 g_hide_mask，默认为 0 = 全不匹配）
+        // 换模型只认名字：找第一个 Body 挂上去
+        if (f.chain.find("Body") == std::string::npos) continue;
 
-            g_cube_done++;
-            LOGI("model: trying %s", f.chain.c_str());
-            Il2CppObject* cb = spawn_model_object(f.smr);
-            LOGI("model: result=%p", cb);
-            done++;
-            break;
-        }
+        g_cube_done++;
+        LOGI("model: trying %s", f.chain.c_str());
+        Il2CppObject* cb = spawn_model_object(f.smr);
+        LOGI("model: result=%p", cb);
+        done++;
+        break;
     }
     if (done > 0) LOGI("tick cube done=%d total=%zu", done, g_last_scan);
 }
