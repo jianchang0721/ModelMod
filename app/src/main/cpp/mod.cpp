@@ -1158,8 +1158,22 @@ static void do_patch_tick() {
     if (!g_tick_inited) {
         g_tick_inited = true;
         g_smrCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
-        LOGI("tick init: smr=%p setEnabled=%p", g_smrCls, g_setEnabled);
+        LOGI("tick init: smr=%p setEnabled=%p tid=%d", g_smrCls, g_setEnabled, (int)cur_tid());
         probe_types();
+
+        // 诊断：主线程里 il2cpp 调用到底哪一步断了
+        Il2CppClass* OC = find_class_any("UnityEngine", "Object");
+        LOGI("diag: ObjectCls=%p", OC);
+        if (OC && g_smrCls) {
+            const MethodInfo* fm = find_method(OC, "FindObjectsOfType", 1);
+            LOGI("diag: FindObjectsOfType=%p", (void*)fm);
+            if (fm) {
+                void* a[1] = { g_api.type_get_object(g_api.class_get_type(g_smrCls)) };
+                LOGI("diag: typeObj=%p", a[0]);
+                Il2CppArray* arr = (Il2CppArray*)invoke_static(fm, a);
+                LOGI("diag: arr=%p len=%zu", arr, arr ? arr->max_length : (size_t)-1);
+            }
+        }
     }
     if (!g_smrCls) return;
 
