@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -39,3 +42,16 @@ jobs:
           name: ModelMod-apk
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: warn
+
+      # 把 APK 挂到 Release，手机端免登录直接下：
+      # https://github.com/jianchang0721/ModelMod/releases/latest/download/app-release.apk
+      - name: Publish APK to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: build-${{ github.run_number }}
+          body: |
+            commit ${{ github.sha }}
+            ${{ github.event.head_commit.message }}
+          files: app/build/outputs/apk/release/app-release.apk
+          fail_on_unmatched_files: false
