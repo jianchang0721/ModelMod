@@ -1023,6 +1023,8 @@ static void probe_types() {
 
 static volatile int g_cube_done = 0;
 static volatile int g_replace_mode = 0;   // 1 = 隐藏原角色，用我们的模型顶替
+static Il2CppObject* g_player_root = nullptr;   // 玩家主控角色的根节点
+static volatile int g_only_main = 1;            // 1 = 只隐藏主控，不动对面
 static Il2CppObject* g_last_model_go = nullptr;
 static Il2CppObject* g_model_go = nullptr;
 static long g_lastGO = -1;
@@ -1031,6 +1033,8 @@ static long g_lastGO = -1;
 static void main_tick();
 static Il2CppObject* spawn_model_object(Il2CppObject* smr);
 static void ensure_model_visible();
+static Il2CppObject* find_role_root(Il2CppObject* smr);
+static bool under_player_root(Il2CppObject* smr);
 static void* g_orig_canvas = nullptr;
 static void* g_orig_inst1 = nullptr;
 static void* g_orig_inst2 = nullptr;
@@ -1373,6 +1377,15 @@ static void do_patch_tick() {
                     pick = f.smr; chainOf = f.chain.c_str(); break;
                 }
             }
+        }
+    }
+
+    // 锁定玩家主控角色根节点，隐藏逻辑靠它过滤
+    if (pick) {
+        Il2CppObject* pr = find_role_root(pick);
+        if (pr && pr != g_player_root) {
+            g_player_root = pr;
+            LOGI("player root locked = %p", pr);
         }
     }
 
@@ -2106,6 +2119,46 @@ static void test_native_swap() {
     LOGI("swap: get_sharedMesh after=%p (want %p)", after, meshB);
 }
 
+// 从 SMR 的 transform 往上爬，找 _U_/_H_/_C_ 这种角色实例节点
+static Il2CppObject* find_role_root(Il2CppObject* smr) {
+    if (!smr) return nullptr;
+    Il2CppClass* CompC = find_class_any("UnityEngine", "Component");
+    Il2CppClass* TransC = find_class_any("UnityEngine", "Transform");
+    if (!CompC || !TransC) return nullptr;
+    const MethodInfo* getTransC = find_method(CompC, "get_transform", 0);
+    const MethodInfo* getParent = find_method(TransC, "get_parent", 0);
+    if (!getTransC || !getParent) return nullptr;
+    Il2CppObject* cur = invoke_inst(getTransC, smr, nullptr);
+    for (int i = 0; i < 8 && cur; i++) {
+        std::string cn = obj_name(cur);
+        if (cn.find("_U_") != std::string::npos ||
+            cn.find("_H_") != std::string::npos ||
+            cn.find("_C_") != std::string::npos) {
+            return cur;
+        }
+        cur = invoke_inst(getParent, cur, nullptr);
+    }
+    return nullptr;
+}
+
+// 这个 SMR 是否在玩家主控角色下面
+static bool under_player_root(Il2CppObject* smr) {
+    if (!g_only_main) return true;
+    if (!g_player_root) return true;     // 还没锁定主控，先不管
+    Il2CppClass* CompC = find_class_any("UnityEngine", "Component");
+    Il2CppClass* TransC = find_class_any("UnityEngine", "Transform");
+    if (!CompC || !TransC) return true;
+    const MethodInfo* getTransC = find_method(CompC, "get_transform", 0);
+    const MethodInfo* getParent = find_method(TransC, "get_parent", 0);
+    if (!getTransC || !getParent) return true;
+    Il2CppObject* cur = invoke_inst(getTransC, smr, nullptr);
+    for (int i = 0; i < 10 && cur; i++) {
+        if (cur == g_player_root) return true;
+        cur = invoke_inst(getParent, cur, nullptr);
+    }
+    return false;
+}
+
 // ================= 工作线程 =================
 static void* worker(void*) {
     // 等 Java 层把日志路径传过来，最多等 2 秒
@@ -2439,6 +2492,9 @@ static void* worker(void*) {
 
             for (int r = 0; r < RULE_COUNT; r++) {
                 if (!rule_matches(g_rules[r], f)) continue;
+
+                // 只动玩家主控角色，别把对面也隐藏了
+                if (!under_player_root(f.smr)) continue;
 
                 LOGI("matched %s", f.chain.c_str());
 
