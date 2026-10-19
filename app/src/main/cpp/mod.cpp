@@ -3511,22 +3511,31 @@ static int replace_original_smr(Il2CppObject* SMRCls_unused, Il2CppObject* smr,
             LOGI("gpu: no set_enabled, skipping rebuild");
         }
 
-        // 诊断：把实际参与蒙皮的骨骼世界位置打出来，和 bindpose 对照
+        // 诊断：读回 bindposes 和骨骼世界矩阵，看 bind 时乘积是否接近单位阵
         {
+            Il2CppClass* MeshCls2 = find_class_any("UnityEngine", "Mesh");
             Il2CppClass* TrCls = find_class_any("UnityEngine", "Transform");
+            const MethodInfo* gbp = MeshCls2 ? find_method_any(MeshCls2, "get_bindposes") : nullptr;
             const MethodInfo* gb3 = SMRCls ? find_method_any(SMRCls, "get_bones") : nullptr;
             const MethodInfo* l2w = TrCls ? find_method_any(TrCls, "get_localToWorldMatrix") : nullptr;
+            Il2CppArray* bp = gbp ? (Il2CppArray*)invoke_inst(gbp, origMesh, nullptr) : nullptr;
             Il2CppArray* ba = gb3 ? (Il2CppArray*)invoke_inst(gb3, smr, nullptr) : nullptr;
-            int ngn = (int)gameNorm.size();
-            int shown = 0;
-            for (int bi = 0; bi < N && shown < 6 && bi < ngn; bi++) {
-                Il2CppObject* bone = ba ? *(Il2CppObject**)array_addr(ba, 8, (size_t)bi) : nullptr;
-                if (!bone || !l2w) continue;
-                Il2CppObject* mtx = invoke_inst(l2w, bone, nullptr);
-                if (!mtx) continue;
-                const float* mm = (const float*)((char*)mtx + 16);
-                LOGI("gpu: bone[%d] %s worldPos=(%.3f, %.3f, %.3f)", bi, gameNorm[bi].c_str(), mm[12], mm[13], mm[14]);
-                shown++;
+            LOGI("gpu: diag bindposes=%p len=%d, bones=%p len=%d",
+                 bp, bp ? (int)bp->max_length : -1, ba, ba ? (int)ba->max_length : -1);
+            for (int i = 0; i < 4 && bp && ba; i++) {
+                if (i >= (int)bp->max_length || i >= (int)ba->max_length) break;
+                const float* B = (const float*)array_addr(bp, 64, (size_t)i);
+                Il2CppObject* bone = *(Il2CppObject**)array_addr(ba, 8, (size_t)i);
+                LOGI("gpu: BP[%d] T=(%.3f %.3f %.3f) diag=(%.3f %.3f %.3f)",
+                     i, B[12], B[13], B[14], B[0], B[5], B[10]);
+                if (bone && l2w) {
+                    Il2CppObject* mtx = invoke_inst(l2w, bone, nullptr);
+                    if (mtx) {
+                        const float* W = (const float*)((char*)mtx + 16);
+                        LOGI("gpu: BW[%d] T=(%.3f %.3f %.3f) diag=(%.3f %.3f %.3f)",
+                             i, W[12], W[13], W[14], W[0], W[5], W[10]);
+                    }
+                }
             }
         }
 
