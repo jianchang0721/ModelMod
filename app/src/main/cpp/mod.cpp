@@ -1458,9 +1458,10 @@ static void main_tick() {
 
     // CPU 蒙皮：约 20fps 刷一次，全速跑太重
     {
-        // CPU 蒙皮：静止时内部会自动跳过，动起来才刷；30 帧一次约 2fps
-        static int skinTick = 0;
-        if ((skinTick++ % 30) == 0) { update_skin_parts(); }
+        // CPU 蒙皮在 hook 上下文里跑 il2cpp + 文件/顶点上传，fdsan 和 NPTH 都会炸，
+        // 先彻底关掉保稳定；下一步改成 worker 线程预算 + 主线程只做上传
+        // static int skinTick = 0;
+        // if ((skinTick++ % 30) == 0) { update_skin_parts(); }
     }
 
     // 开关切换：立即处理，不等 3 秒
