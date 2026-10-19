@@ -59,6 +59,7 @@ static CharRule g_rules[] = {
 static const int RULE_COUNT = (int)(sizeof(g_rules) / sizeof(g_rules[0]));
 
 struct Vec3 { float x, y, z; };
+struct Color4 { float r, g, b, a; };
 
 Il2CppApi g_api{};
 static JavaVM* g_vm = nullptr;
@@ -1795,12 +1796,34 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
     Il2CppObject* mr = invoke_inst(addComp, go, t2);
     LOGI("mmesh: MeshRenderer=%p", mr);
 
-    // 材质从原 SMR 偷一个
-    if (mr && smr) {
-        Il2CppClass* smrCls = g_api.object_get_class(smr);
-        const MethodInfo* getMat = find_method(smrCls, "get_sharedMaterial", 0);
-        Il2CppObject* mat = getMat ? invoke_inst(getMat, smr, nullptr) : nullptr;
-        LOGI("mmesh: src material=%p", mat);
+    // 材质：优先自己建一个 unlit 纯色（借来的游戏材质不会对）
+    if (mr) {
+        Il2CppObject* mat = nullptr;
+        Il2CppClass* ShaderCls = find_class_any("UnityEngine", "Shader");
+        Il2CppClass* MatCls    = find_class_any("UnityEngine", "Material");
+        const MethodInfo* shFind = ShaderCls ? find_method(ShaderCls, "Find", 1) : nullptr;
+        if (shFind && MatCls) {
+            const char* names[] = {"Unlit/Color", "Sprites/Default", "UI/Default", "Mobile/Diffuse"};
+            for (int i = 0; i < 4 && !mat; i++) {
+                void* a[1] = { g_api.string_new(names[i]) };
+                Il2CppObject* sh = invoke_static(shFind, a);
+                LOGI("mmesh: shader %s = %p", names[i], sh);
+                if (!sh) continue;
+                mat = g_api.object_new(MatCls);
+                const MethodInfo* mctor = find_method(MatCls, ".ctor", 1);
+                if (mctor) { void* b[1] = { sh }; invoke_inst(mctor, mat, b); }
+                const MethodInfo* setColor = find_method(MatCls, "set_color", 1);
+                if (setColor) { Color4 c = {0.86f, 0.66f, 0.52f, 1.0f}; void* d[1] = { &c }; invoke_inst(setColor, mat, d); }
+                LOGI("mmesh: own material %p with %s", mat, names[i]);
+            }
+        }
+        // 拿不到 shader 就只能借原角色的
+        if (!mat && smr) {
+            Il2CppClass* smrCls = g_api.object_get_class(smr);
+            const MethodInfo* getMat = find_method(smrCls, "get_sharedMaterial", 0);
+            mat = getMat ? invoke_inst(getMat, smr, nullptr) : nullptr;
+            LOGI("mmesh: fallback src material=%p", mat);
+        }
         if (mat) {
             const MethodInfo* setMat = find_method(MRCls, "set_sharedMaterial", 1);
             if (setMat) { void* a[1] = { mat }; invoke_inst(setMat, mr, a); }
@@ -1824,23 +1847,12 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
     Il2CppObject* sp = (st && getParent) ? invoke_inst(getParent, st, nullptr) : nullptr;
     LOGI("mmesh: step st=%p sp=%p setParent=%p", st, sp, (void*)setParent);
 
-    // 直接挂到主相机前面 3 米，保证能看见（先验证渲染链路）
-    Il2CppClass* CamCls = find_class_any("UnityEngine", "Camera");
-    const MethodInfo* getMain = CamCls ? find_method(CamCls, "get_main", 0) : nullptr;
-    Il2CppObject* cam = getMain ? invoke_static(getMain, nullptr) : nullptr;
-    Il2CppObject* camT = (cam && getTransC) ? invoke_inst(getTransC, cam, nullptr) : nullptr;
-    LOGI("mmesh: camera=%p camTrans=%p", cam, camT);
-
-    if (gt && camT && setParent) {
-        void* a[1] = { camT };
-        invoke_inst(setParent, gt, a);
-        if (setLScale) { Vec3 s = {20, 20, 20}; void* b[1] = { &s }; invoke_inst(setLScale, gt, b); }
-        if (setLPos)   { Vec3 p = {0, 0, 3};    void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
-        LOGI("mmesh: attached to camera front");
-    } else if (gt && sp && setParent) {
+    if (gt && sp && setParent) {
         void* a[1] = { sp };
         invoke_inst(setParent, gt, a);
-        LOGI("mmesh: parent ok (no camera)");
+        if (setLScale) { Vec3 s = {20, 20, 20}; void* b[1] = { &s }; invoke_inst(setLScale, gt, b); }
+        if (setLPos)   { Vec3 p = {0, 0, 0};    void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
+        LOGI("mmesh: parent ok");
     }
 
     LOGI("mmesh: done go=%p trans=%p parent=%p", go, gt, sp);
