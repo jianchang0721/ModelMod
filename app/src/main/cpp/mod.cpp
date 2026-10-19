@@ -1397,8 +1397,8 @@ static void do_patch_tick() {
     if (pick) {
         g_cube_done++;
         LOGI("model: trying %s", chainOf ? chainOf : "?");
-        Il2CppObject* cb = spawn_model_object(pick);
-        LOGI("model: result=%p", cb);
+        int made = spawn_parts_loop(pick);
+        LOGI("model: parts spawned=%d", made);
         done++;
     }
     if (done > 0) LOGI("tick cube done=%d total=%zu", done, g_last_scan);
@@ -2280,6 +2280,210 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
     g_last_model_go = go;
     g_model_go = go;
     return go;
+}
+
+
+// ---------------------------------------------------------------
+// 多部位加载：custom_0..custom_3 每个都是一个材质组 + 自己的贴图
+// ---------------------------------------------------------------
+static Il2CppObject* spawn_one_part(Il2CppObject* smr, Il2CppObject* roleRoot,
+                                    const char* meshPath, const char* texPath, float scaleK) {
+    FILE* f = fopen(meshPath, "rb");
+    if (!f) { LOGE("part: open fail %s", meshPath); return nullptr; }
+    char magic[4]; uint32_t nv = 0, ni = 0, flags = 0;
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MMSH", 4) != 0) { fclose(f); return nullptr; }
+    fread(&nv, 4, 1, f); fread(&ni, 4, 1, f); fread(&flags, 4, 1, f);
+    if (nv == 0 || nv > 300000 || ni == 0) { fclose(f); return nullptr; }
+
+    std::vector<float> pos(nv * 3), nrm(nv * 3), uv(nv * 2);
+    std::vector<uint32_t> idx(ni);
+    fread(pos.data(), 4, nv * 3, f);
+    fread(nrm.data(), 4, nv * 3, f);
+    fread(uv.data(),  4, nv * 2, f);
+    fread(idx.data(), 4, ni, f);
+    fclose(f);
+    LOGI("part: %s nv=%u ni=%u", meshPath, nv, ni);
+
+    Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
+    Il2CppClass* V3Cls   = find_class_any("UnityEngine", "Vector3");
+    Il2CppClass* V2Cls   = find_class_any("UnityEngine", "Vector2");
+    Il2CppClass* I32Cls  = find_class_any("System", "Int32");
+    Il2CppClass* ByteCls = find_class_any("System", "Byte");
+    Il2CppClass* GOCls   = find_class_any("UnityEngine", "GameObject");
+    Il2CppClass* MFCls   = find_class_any("UnityEngine", "MeshFilter");
+    Il2CppClass* MRCls   = find_class_any("UnityEngine", "MeshRenderer");
+    Il2CppClass* CompCls = find_class_any("UnityEngine", "Component");
+    Il2CppClass* TransCls= find_class_any("UnityEngine", "Transform");
+    Il2CppClass* MatCls  = find_class_any("UnityEngine", "Material");
+    Il2CppClass* ShaderCls = find_class_any("UnityEngine", "Shader");
+    Il2CppClass* TexCls  = find_class_any("UnityEngine", "Texture2D");
+    if (!MeshCls || !V3Cls || !V2Cls || !I32Cls || !GOCls || !MFCls || !MRCls || !CompCls || !TransCls || !MatCls) {
+        LOGE("part: class missing");
+        return nullptr;
+    }
+
+    Il2CppObject* mesh = g_api.object_new(MeshCls);
+    const MethodInfo* ctor = find_method(MeshCls, ".ctor", 0);
+    if (ctor) invoke_inst(ctor, mesh, nullptr);
+    Il2CppArray* va = g_api.array_new(V3Cls, nv); memcpy(array_addr(va, 12, 0), pos.data(), (size_t)nv * 12);
+    Il2CppArray* na = g_api.array_new(V3Cls, nv); memcpy(array_addr(na, 12, 0), nrm.data(), (size_t)nv * 12);
+    Il2CppArray* ua = g_api.array_new(V2Cls, nv); memcpy(array_addr(ua, 8, 0),  uv.data(),  (size_t)nv * 8);
+    Il2CppArray* ia = g_api.array_new(I32Cls, ni); memcpy(array_addr(ia, 4, 0), idx.data(), (size_t)ni * 4);
+    const MethodInfo* setV = find_method(MeshCls, "set_vertices", 1);
+    const MethodInfo* setN = find_method(MeshCls, "set_normals", 1);
+    const MethodInfo* setU = find_method(MeshCls, "set_uv", 1);
+    const MethodInfo* setT = find_method(MeshCls, "set_triangles", 1);
+    if (setV) { void* a[1] = { va }; invoke_inst(setV, mesh, a); }
+    if (setN) { void* a[1] = { na }; invoke_inst(setN, mesh, a); }
+    if (setU) { void* a[1] = { ua }; invoke_inst(setU, mesh, a); }
+    if (setT) { void* a[1] = { ia }; invoke_inst(setT, mesh, a); }
+
+    const MethodInfo* goCtor = find_method(GOCls, ".ctor", 1);
+    if (!goCtor) return nullptr;
+    void* an[1] = { g_api.string_new("ModelModPart") };
+    Il2CppObject* go = g_api.object_new(GOCls);
+    invoke_inst(goCtor, go, an);
+
+    // layer 跟角色一致
+    int layer = 0;
+    const MethodInfo* getGO = find_method(CompCls, "get_gameObject", 0);
+    Il2CppObject* sgo = (smr && getGO) ? invoke_inst(getGO, smr, nullptr) : nullptr;
+    if (sgo) {
+        const MethodInfo* getLayer = find_method(GOCls, "get_layer", 0);
+        if (getLayer) { Il2CppObject* lr = invoke_inst(getLayer, sgo, nullptr); if (lr) layer = *(int*)((char*)lr + 16); }
+    }
+    const MethodInfo* setLayer = find_method(GOCls, "set_layer", 1);
+    if (setLayer) { void* a[1] = { &layer }; invoke_inst(setLayer, go, a); }
+
+    const MethodInfo* addComp = find_method(GOCls, "AddComponent", 1);
+    if (!addComp) return nullptr;
+    void* t1[1] = { g_api.type_get_object(g_api.class_get_type(MFCls)) };
+    Il2CppObject* mf = invoke_inst(addComp, go, t1);
+    if (mf) {
+        const MethodInfo* setMesh = find_method(MFCls, "set_mesh", 1);
+        if (setMesh) { void* a[1] = { mesh }; invoke_inst(setMesh, mf, a); }
+    }
+    void* t2[1] = { g_api.type_get_object(g_api.class_get_type(MRCls)) };
+    Il2CppObject* mr = invoke_inst(addComp, go, t2);
+
+    // 材质：Unlit/Texture + 自己的贴图
+    if (mr) {
+        Il2CppObject* mat = nullptr;
+        const MethodInfo* shFind = ShaderCls ? find_method(ShaderCls, "Find", 1) : nullptr;
+        if (shFind) {
+            const char* sn[] = {"Unlit/Texture", "Mobile/Diffuse", "Sprites/Default"};
+            for (int i = 0; i < 3 && !mat; i++) {
+                void* a[1] = { g_api.string_new(sn[i]) };
+                Il2CppObject* sh = invoke_static(shFind, a);
+                if (!sh) continue;
+                mat = g_api.object_new(MatCls);
+                const MethodInfo* mctor = find_method(MatCls, ".ctor", 1);
+                if (mctor) { void* b[1] = { sh }; invoke_inst(mctor, mat, b); }
+                LOGI("part: shader %s", sn[i]);
+            }
+        }
+        if (mat) {
+            const MethodInfo* setMat = find_method(MRCls, "set_sharedMaterial", 1);
+            if (setMat) { void* a[1] = { mat }; invoke_inst(setMat, mr, a); }
+
+            FILE* tf = fopen(texPath, "rb");
+            if (tf) {
+                char tm[4]; uint32_t tw = 0, th = 0;
+                if (fread(tm, 1, 4, tf) == 4 && memcmp(tm, "MMTX", 4) == 0) {
+                    fread(&tw, 4, 1, tf); fread(&th, 4, 1, tf);
+                    if (tw > 0 && th > 0 && tw <= 4096 && th <= 4096) {
+                        size_t nbytes = (size_t)tw * th * 4;
+                        std::vector<unsigned char> px(nbytes);
+                        fread(px.data(), 1, nbytes, tf);
+                        if (TexCls && ByteCls) {
+                            const MethodInfo* tctor4 = find_method(TexCls, ".ctor", 4);
+                            Il2CppObject* tex = g_api.object_new(TexCls);
+                            if (tctor4) {
+                                int wi = (int)tw, hi = (int)th, fmt = 4; bool mip = false;
+                                void* ta[4] = { &wi, &hi, &fmt, &mip };
+                                invoke_inst(tctor4, tex, ta);
+                            }
+                            const MethodInfo* loadRaw = find_method(TexCls, "LoadRawTextureData", 1);
+                            const MethodInfo* apply1 = find_method(TexCls, "Apply", 1);
+                            if (tex && loadRaw) {
+                                Il2CppArray* barr = g_api.array_new(ByteCls, nbytes);
+                                memcpy(array_addr(barr, 1, 0), px.data(), nbytes);
+                                void* la[1] = { barr };
+                                invoke_inst(loadRaw, tex, la);
+                                if (apply1) { bool upd = false; void* aa[1] = { &upd }; invoke_inst(apply1, tex, aa); }
+                                const MethodInfo* setMain = find_method(MatCls, "set_mainTexture", 1);
+                                if (setMain) { void* sa[1] = { tex }; invoke_inst(setMain, mat, sa); }
+                                const MethodInfo* setCol = find_method(MatCls, "set_color", 1);
+                                if (setCol) { Color4 wc = {1,1,1,1}; void* ca[1] = { &wc }; invoke_inst(setCol, mat, ca); }
+                                LOGI("part: tex ok %ux%u", tw, th);
+                            }
+                        }
+                    }
+                }
+                fclose(tf);
+            } else {
+                LOGE("part: tex open fail %s", texPath);
+            }
+        }
+    }
+
+    // 挂到角色根节点，统一缩放和朝向
+    const MethodInfo* getTransGO = find_method(GOCls, "get_transform", 0);
+    const MethodInfo* setParent  = find_method(TransCls, "SetParent", 1);
+    const MethodInfo* setLPos    = find_method(TransCls, "set_localPosition", 1);
+    const MethodInfo* setLScale  = find_method(TransCls, "set_localScale", 1);
+    const MethodInfo* setLRot    = find_method(TransCls, "set_localRotation", 1);
+    Il2CppObject* gt = getTransGO ? invoke_inst(getTransGO, go, nullptr) : nullptr;
+    if (gt && roleRoot && setParent) {
+        void* a[1] = { roleRoot };
+        invoke_inst(setParent, gt, a);
+        if (setLScale) { Vec3 s2 = {scaleK, scaleK, scaleK}; void* b[1] = { &s2 }; invoke_inst(setLScale, gt, b); }
+        if (setLRot) { Quat q = {0.0f, 1.0f, 0.0f, 0.0f}; void* b[1] = { &q }; invoke_inst(setLRot, gt, b); }
+        if (setLPos) {
+            Vec3 p = g_replace_mode ? Vec3{0, 0, 0} : Vec3{0, 2.4f, 0};
+            void* b[1] = { &p };
+            invoke_inst(setLPos, gt, b);
+        }
+    }
+    LOGI("part: done %s go=%p", meshPath, go);
+    return go;
+}
+
+// 一次加载 custom_0..custom_3
+static int spawn_parts_loop(Il2CppObject* smr) {
+    Il2CppObject* roleRoot = find_role_root(smr);
+    if (!roleRoot) { LOGE("parts: no roleRoot"); return 0; }
+
+    // 用 1.7 米 / 20.214 单位（南宫羽 bbox 高度）
+    float scaleK = 1.7f / (20.214f * 1.0f);
+
+    static Il2CppObject* parts[8] = {nullptr};
+    int made = 0;
+    const char* bases[] = {
+        "/data/user/0/com.hermes.h1game/files/custom_%d.mmesh",
+        "/data/data/com.hermes.h1game/files/custom_%d.mmesh",
+    };
+    const char* texbases[] = {
+        "/data/user/0/com.hermes.h1game/files/custom_%d.mmtex",
+        "/data/data/com.hermes.h1game/files/custom_%d.mmtex",
+    };
+    for (int i = 0; i < 4; i++) {
+        char mp[256], tp[256];
+        bool ok = false;
+        for (int b = 0; b < 2 && !ok; b++) {
+            snprintf(mp, sizeof(mp), bases[b], i);
+            FILE* tf = fopen(mp, "rb");
+            if (!tf) continue;
+            fclose(tf);
+            snprintf(tp, sizeof(tp), texbases[b], i);
+            ok = true;
+        }
+        if (!ok) { LOGI("parts: custom_%d.mmesh missing", i); continue; }
+        Il2CppObject* g = spawn_one_part(smr, roleRoot, mp, tp, scaleK);
+        if (g) { parts[made++] = g; }
+    }
+    LOGI("parts: spawned %d", made);
+    return made;
 }
 
 // 实测 0x1d8 就是 native SkinnedMeshRenderer 里的 mesh 指针，直接改它换模型
