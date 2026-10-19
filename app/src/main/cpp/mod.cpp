@@ -1284,9 +1284,9 @@ static void do_patch_tick() {
             if (!rule_matches(g_rules[r], f)) continue;
 
             g_cube_done++;
-            LOGI("cube: trying %s", f.chain.c_str());
-            Il2CppObject* cb = spawn_cube_for(f.smr);
-            LOGI("cube: result=%p", cb);
+            LOGI("model: trying %s", f.chain.c_str());
+            Il2CppObject* cb = spawn_model_object(f.smr);
+            LOGI("model: result=%p", cb);
             done++;
             break;
         }
@@ -1659,6 +1659,118 @@ static void probe_native_mesh() {
         }
         LOGI("  scan done hits=%d", hits);
     }
+}
+
+// ---------------------------------------------------------------
+// 加载我们自己转好的 .mmesh，主线程里建 Mesh + GameObject 挂到角色身上
+// 文件放在游戏私有目录，因为 app 读不了 /sdcard 上任意路径
+// ---------------------------------------------------------------
+#define MMESH_PATH "/data/user/0/com.hermes.h1game/files/human.mmesh"
+
+static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
+    FILE* f = fopen(MMESH_PATH, "rb");
+    if (!f) { LOGE("mmesh: open fail %s", MMESH_PATH); return nullptr; }
+    char magic[4]; uint32_t nv = 0, ni = 0, flags = 0;
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MMSH", 4) != 0) { fclose(f); LOGE("mmesh: bad magic"); return nullptr; }
+    fread(&nv, 4, 1, f); fread(&ni, 4, 1, f); fread(&flags, 4, 1, f);
+    LOGI("mmesh: nv=%u ni=%u flags=%u", nv, ni, flags);
+    if (nv == 0 || nv > 300000 || ni == 0) { fclose(f); return nullptr; }
+
+    std::vector<float> pos(nv * 3), nrm(nv * 3), uv(nv * 2);
+    std::vector<uint32_t> idx(ni);
+    fread(pos.data(), 4, nv * 3, f);
+    fread(nrm.data(), 4, nv * 3, f);
+    fread(uv.data(),  4, nv * 2, f);
+    fread(idx.data(), 4, ni, f);
+    fclose(f);
+
+    Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
+    Il2CppClass* V3Cls   = find_class_any("UnityEngine", "Vector3");
+    Il2CppClass* V2Cls   = find_class_any("UnityEngine", "Vector2");
+    Il2CppClass* I32Cls  = find_class_any("System", "Int32");
+    Il2CppClass* GOCls   = find_class_any("UnityEngine", "GameObject");
+    Il2CppClass* MFCls   = find_class_any("UnityEngine", "MeshFilter");
+    Il2CppClass* MRCls   = find_class_any("UnityEngine", "MeshRenderer");
+    Il2CppClass* CompCls = find_class_any("UnityEngine", "Component");
+    Il2CppClass* TransCls= find_class_any("UnityEngine", "Transform");
+    if (!MeshCls || !V3Cls || !V2Cls || !I32Cls || !GOCls || !MFCls || !MRCls || !CompCls || !TransCls) {
+        LOGE("mmesh: class missing M=%p V3=%p V2=%p I32=%p GO=%p MF=%p MR=%p", MeshCls, V3Cls, V2Cls, I32Cls, GOCls, MFCls, MRCls);
+        return nullptr;
+    }
+
+    Il2CppObject* mesh = g_api.object_new(MeshCls);
+    const MethodInfo* ctor = find_method(MeshCls, ".ctor", 0);
+    if (ctor) invoke_inst(ctor, mesh, nullptr);
+
+    Il2CppArray* va = g_api.array_new(V3Cls, nv);
+    memcpy(array_addr(va, 12, 0), pos.data(), (size_t)nv * 12);
+    Il2CppArray* na = g_api.array_new(V3Cls, nv);
+    memcpy(array_addr(na, 12, 0), nrm.data(), (size_t)nv * 12);
+    Il2CppArray* ua = g_api.array_new(V2Cls, nv);
+    memcpy(array_addr(ua, 8, 0), uv.data(), (size_t)nv * 8);
+    Il2CppArray* ia = g_api.array_new(I32Cls, ni);
+    memcpy(array_addr(ia, 4, 0), idx.data(), (size_t)ni * 4);
+
+    const MethodInfo* setV = find_method(MeshCls, "set_vertices", 1);
+    const MethodInfo* setN = find_method(MeshCls, "set_normals", 1);
+    const MethodInfo* setU = find_method(MeshCls, "set_uv", 1);
+    const MethodInfo* setT = find_method(MeshCls, "set_triangles", 1);
+    if (!setV || !setT) { LOGE("mmesh: setter missing V=%p T=%p", (void*)setV, (void*)setT); return nullptr; }
+    { void* a[1] = { va }; invoke_inst(setV, mesh, a); }
+    if (setN) { void* a[1] = { na }; invoke_inst(setN, mesh, a); }
+    if (setU) { void* a[1] = { ua }; invoke_inst(setU, mesh, a); }
+    { void* a[1] = { ia }; invoke_inst(setT, mesh, a); }
+    LOGI("mmesh: mesh built %p", mesh);
+
+    // GameObject + MeshFilter + MeshRenderer
+    const MethodInfo* goCtor = find_method(GOCls, ".ctor", 1);
+    if (!goCtor) { LOGE("mmesh: no GameObject ctor"); return nullptr; }
+    void* an[1] = { g_api.string_new("ModelModBody") };
+    Il2CppObject* go = g_api.object_new(GOCls);
+    invoke_inst(goCtor, go, an);
+
+    const MethodInfo* addComp = find_method(GOCls, "AddComponent", 1);
+    if (!addComp) { LOGE("mmesh: no AddComponent"); return nullptr; }
+
+    void* t1[1] = { g_api.type_get_object(g_api.class_get_type(MFCls)) };
+    Il2CppObject* mf = invoke_inst(addComp, go, t1);
+    LOGI("mmesh: MeshFilter=%p", mf);
+    if (mf) {
+        const MethodInfo* setMesh = find_method(MFCls, "set_mesh", 1);
+        if (setMesh) { void* a[1] = { mesh }; invoke_inst(setMesh, mf, a); }
+        else LOGE("mmesh: no set_mesh");
+    }
+
+    void* t2[1] = { g_api.type_get_object(g_api.class_get_type(MRCls)) };
+    Il2CppObject* mr = invoke_inst(addComp, go, t2);
+    LOGI("mmesh: MeshRenderer=%p", mr);
+
+    // 材质从原 SMR 偷一个
+    if (mr && smr) {
+        Il2CppClass* smrCls = g_api.object_get_class(smr);
+        const MethodInfo* getMat = find_method(smrCls, "get_sharedMaterial", 0);
+        Il2CppObject* mat = getMat ? invoke_inst(getMat, smr, nullptr) : nullptr;
+        LOGI("mmesh: src material=%p", mat);
+        if (mat) {
+            const MethodInfo* setMat = find_method(MRCls, "set_sharedMaterial", 1);
+            if (setMat) { void* a[1] = { mat }; invoke_inst(setMat, mr, a); }
+        }
+    }
+
+    // 挂到角色父节点，缩放 20 倍（模型高 0.08 -> 1.6m）
+    const MethodInfo* getTransGO = find_method(GOCls, "get_transform", 0);
+    const MethodInfo* getParent  = find_method(TransCls, "get_parent", 0);
+    const MethodInfo* setParent  = find_method(TransCls, "SetParent", 1);
+    const MethodInfo* setLPos    = find_method(TransCls, "set_localPosition", 1);
+    const MethodInfo* setLScale  = find_method(TransCls, "set_localScale", 1);
+    Il2CppObject* gt = getTransGO ? invoke_inst(getTransGO, go, nullptr) : nullptr;
+    Il2CppObject* st = smr ? invoke_inst(getTransGO, smr, nullptr) : nullptr;
+    Il2CppObject* sp = (st && getParent) ? invoke_inst(getParent, st, nullptr) : nullptr;
+    if (gt && sp && setParent) { void* a[1] = { sp }; invoke_inst(setParent, gt, a); }
+    if (gt && setLPos) { Vec3 p = {0, 0, 0}; void* a[1] = { &p }; invoke_inst(setLPos, gt, a); }
+    if (gt && setLScale) { Vec3 s = {20, 20, 20}; void* a[1] = { &s }; invoke_inst(setLScale, gt, a); }
+    LOGI("mmesh: done go=%p trans=%p parent=%p", go, gt, sp);
+    return go;
 }
 
 // 实测 0x1d8 就是 native SkinnedMeshRenderer 里的 mesh 指针，直接改它换模型
