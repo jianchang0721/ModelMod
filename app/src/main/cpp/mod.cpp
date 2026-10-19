@@ -20,6 +20,9 @@
 #include <set>
 #include <android/log.h>
 #include <time.h>
+#include <sys/mman.h>
+#include <errno.h>
+#include <sys/syscall.h>
 
 #include "il2cpp_api.h"
 
@@ -991,6 +994,32 @@ static void hk_tween_update(void* self, void* m) {
     ((void(*)(void*, void*))g_orig_tween)(self, m);
 }
 
+// ---------------------------------------------------------------
+// 自己的 ARM64 inline hook：shadowhook 实测根本改不动代码（日志里 hook 后字节还是原指令）
+// 这条路径不需要调原函数，直接写 16 字节绝对跳转就行
+// ldr x16, #8 ; br x16 ; <addr>
+// ---------------------------------------------------------------
+static bool self_hook_code(void* target, void* replace) {
+    uintptr_t page = (uintptr_t)target & ~(uintptr_t)0xFFFULL;
+    size_t len = 0x2000;
+    if (mprotect((void*)page, len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        LOGE("mprotect RWX fail at %p errno=%d", (void*)page, errno);
+        return false;
+    }
+    unsigned char* p = (unsigned char*)target;
+    uint32_t insn[4];
+    insn[0] = 0x58000050;   // ldr x16, #8
+    insn[1] = 0xD61F0200;   // br x16
+    uint64_t addr = (uint64_t)replace;
+    memcpy(&insn[2], &addr, 8);
+    memcpy(p, insn, 16);
+    __builtin___clear_cache((char*)p, (char*)p + 16);
+    mprotect((void*)page, len, PROT_READ | PROT_EXEC);
+    LOGI("self_hook %p -> %p bytes=%02x%02x%02x%02x%02x%02x%02x%02x",
+         target, replace, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+    return true;
+}
+
 // libc 的 clock_gettime：UnityMain 每秒调几千次，这才是真正的高频主线程入口
 static int (*g_orig_cgt)(clockid_t, struct timespec*) = nullptr;
 
@@ -1001,12 +1030,12 @@ static int cgt_fallback(clockid_t id, struct timespec* ts) {
 
 static int hk_cgt(clockid_t id, struct timespec* ts) {
     g_hookcnt[HC_CGT_ALL]++;          // 不管哪个线程，先进来就算
-    if (!g_orig_cgt) return cgt_fallback(id, ts);
     if (is_unity_main()) {
         g_hookcnt[HC_CGT]++;
         main_tick();
     }
-    return g_orig_cgt(id, ts);
+    if (g_orig_cgt) return g_orig_cgt(id, ts);
+    return cgt_fallback(id, ts);
 }
 
 // dotween 之外每帧必调的 MonoBehaviour 候选
@@ -1654,14 +1683,13 @@ static void* worker(void*) {
     }
 
     // libc clock_gettime：实测 UnityMain 每秒 5000+ 次，这是真正的主线程 tick
+    // 不走 shadowhook（它没写入代码），用自己的 patch
     {
-        void* shc = load_so_by_name("libshadowhook.so");
         void* cgt = dlsym(RTLD_DEFAULT, "clock_gettime");
         LOGI("clock_gettime addr=%p", cgt);
-        if (shc && cgt) {
-            g_orig_cgt = cgt_fallback;   // 先给兜底，再改代码
-            void* o = try_hook(shc, cgt, (void*)hk_cgt, "clock_gettime");
-            if (o) { g_orig_cgt = (int(*)(clockid_t, struct timespec*))o; LOGI("cgt hook ok"); }
+        if (cgt) {
+            if (self_hook_code(cgt, (void*)hk_cgt)) LOGI("cgt self-hook ok");
+            else LOGE("cgt self-hook FAILED");
         }
     }
 
