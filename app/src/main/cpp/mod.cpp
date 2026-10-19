@@ -3517,24 +3517,15 @@ static int replace_original_smr(Il2CppObject* SMRCls_unused, Il2CppObject* smr,
             const MethodInfo* gb3 = SMRCls ? find_method_any(SMRCls, "get_bones") : nullptr;
             const MethodInfo* l2w = TrCls ? find_method_any(TrCls, "get_localToWorldMatrix") : nullptr;
             Il2CppArray* ba = gb3 ? (Il2CppArray*)invoke_inst(gb3, smr, nullptr) : nullptr;
+            int ngn = (int)gameNorm.size();
             int shown = 0;
-            for (int bi = 0; bi < N && shown < 6; bi++) {
-                if (bi >= nb) break;
-                int tgt = -1;
-                std::vector<int> gidx2;
-                (void)gidx2;
-                // 找这个槽位对应哪根目标骨骼：用 map_bones 反查
-                for (int k = 0; k < nb; k++) {
-                    if (k == bi) { tgt = bi; break; }
-                }
-                (void)tgt;
+            for (int bi = 0; bi < N && shown < 6 && bi < ngn; bi++) {
                 Il2CppObject* bone = ba ? *(Il2CppObject**)array_addr(ba, 8, (size_t)bi) : nullptr;
                 if (!bone || !l2w) continue;
                 Il2CppObject* mtx = invoke_inst(l2w, bone, nullptr);
                 if (!mtx) continue;
                 const float* mm = (const float*)((char*)mtx + 16);
-                LOGI("gpu: bone[%d] %s worldPos=(%.3f, %.3f, %.3f)",
-                     bi, gameNorm[bi].c_str(), mm[12], mm[13], mm[14]);
+                LOGI("gpu: bone[%d] %s worldPos=(%.3f, %.3f, %.3f)", bi, gameNorm[bi].c_str(), mm[12], mm[13], mm[14]);
                 shown++;
             }
         }
