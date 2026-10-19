@@ -1458,10 +1458,9 @@ static void main_tick() {
 
     // CPU 蒙皮：约 20fps 刷一次，全速跑太重
     {
-        static int skinTick = 0;
-        if ((skinTick++ % 10) == 0) {
-            update_skin_parts();
-        }
+        // 暂时停掉 CPU 蒙皮：上线后游戏反复 SIGSEGV，先保稳定
+        // static int skinTick = 0;
+        // if ((skinTick++ % 10) == 0) { update_skin_parts(); }
     }
 
     // 开关切换：立即处理，不等 3 秒
