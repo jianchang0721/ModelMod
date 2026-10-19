@@ -886,16 +886,10 @@ static void hk_canvasupdate(void* m) {
 
 static void* g_orig_setactive = nullptr;
 static void* g_orig_getname = nullptr;
-static void* g_orig_gettrans = nullptr;
 
 static Il2CppString* hk_getname(void* self, void* m) {
     main_tick();
     return ((Il2CppString*(*)(void*, void*))g_orig_getname)(self, m);
-}
-
-static Il2CppObject* hk_gettrans(void* self, void* m) {
-    main_tick();
-    return ((Il2CppObject*(*)(void*, void*))g_orig_gettrans)(self, m);
 }
 
 static void hk_setactive(void* self, void* m, uint8_t v) {
