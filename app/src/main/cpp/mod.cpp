@@ -1300,7 +1300,12 @@ static void* try_hook(void* sh, void* code, void* handler, const char* label) {
     if (!h) { LOGE("hook sym missing"); return nullptr; }
     void* orig = nullptr;
     void* stub = h(code, handler, &orig);
-    LOGI("hook %s: code=%p stub=%p orig=%p", label, code, stub, orig);
+    {
+        unsigned char b[16];
+        memcpy(b, code, 16);
+        LOGI("hook %s: code=%p stub=%p orig=%p bytes=%02x%02x%02x%02x%02x%02x%02x%02x",
+             label, code, stub, orig, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+    }
     if (!stub || !orig) return nullptr;
 
     HookRec r;
@@ -1353,6 +1358,13 @@ static void* hook_watchdog(void*) {
             for (auto& r : g_hookrecs) if (r.reinstalls > 0) total += r.reinstalls;
             pthread_mutex_unlock(&g_hrec_mtx);
             LOGI("watchdog: total rehooks=%d points=%zu", total, g_hookrecs.size());
+            if (!g_hookrecs.empty()) {
+                const unsigned char* c = (const unsigned char*)g_hookrecs[g_hookrecs.size() - 1].code;
+                LOGI("watchdog: last hook %s bytes now=%02x%02x%02x%02x snap=%02x%02x%02x%02x",
+                     g_hookrecs.back().tag, c[0], c[1], c[2], c[3],
+                     g_hookrecs.back().snap[0], g_hookrecs.back().snap[1],
+                     g_hookrecs.back().snap[2], g_hookrecs.back().snap[3]);
+            }
         }
     }
     return nullptr;
@@ -1863,10 +1875,11 @@ static void* worker(void*) {
             static int probed = 0;
             if (!probed && list.size() >= 10) { probed = 1; probe_native_mesh(); }
         }
-        {
-            static int swapped = 0;
-            if (!swapped && round >= 12 && list.size() >= 10) { swapped = 1; test_native_swap(); }
-        }
+        // swap 实测会让游戏崩（0x1d8 不是安全的 mesh 入口），先关掉
+        // {
+        //     static int swapped = 0;
+        //     if (!swapped && round >= 12 && list.size() >= 10) { swapped = 1; test_native_swap(); }
+        // }
 
         int done = 0;
         for (auto& f : list) {
