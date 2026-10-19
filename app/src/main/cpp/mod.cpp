@@ -1956,8 +1956,8 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
         }
         float k = 20.0f / psc;
         if (setLScale) { Vec3 s = {k, k, k}; void* b[1] = { &s }; invoke_inst(setLScale, gt, b); }
-        // 停在角色正常会跟角色完全重叠（被角色模型包在里面看不见），先往旁边偏 1 米
-        if (setLPos)   { Vec3 p = {1.0f, 0, 0}; void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
+        // 站在旁边半米，不再被原模型包住
+        if (setLPos)   { Vec3 p = {0.5f, 0, 0}; void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
         LOGI("mmesh: parent set to role root %p localScale=%f", roleRoot, k);
     }
 
