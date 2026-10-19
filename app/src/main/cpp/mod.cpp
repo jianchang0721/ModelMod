@@ -651,9 +651,19 @@ static bool path_has_id(const std::string& chain, const char* id) {
     return false;
 }
 
+// 只看路径最后一段：避免 Face 误命中字样，也避免 Body_PX 归错类
 static int part_bit(const std::string& chain) {
-    if (chain.find("Weapon") != std::string::npos) return 3;
+    size_t p = chain.rfind('/');
+    std::string leaf = (p == std::string::npos) ? chain : chain.substr(p + 1);
+
+    if (leaf.find("PX") != std::string::npos) return 4;
+    if (leaf.find("Weapon") != std::string::npos) return 3;
+    if (leaf.find("Hair") != std::string::npos) return 2;
+    if (leaf.find("Face") != std::string::npos) return 1;
+    if (leaf.find("Body") != std::string::npos) return 0;
+
     if (chain.find("_PX") != std::string::npos) return 4;
+    if (chain.find("Weapon") != std::string::npos) return 3;
     if (chain.find("Hair") != std::string::npos) return 2;
     if (chain.find("Face") != std::string::npos) return 1;
     if (chain.find("Body") != std::string::npos) return 0;

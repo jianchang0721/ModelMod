@@ -5,6 +5,7 @@ import android.app.Application;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
 import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -39,7 +40,6 @@ public class HookEntry implements IXposedHookLoadPackage {
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
         if (!TARGET.equals(lp.packageName)) return;
-
         XposedBridge.log(TAG + "enter process: " + lp.processName);
 
         XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class,
@@ -62,8 +62,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                 new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
                     @Override
                     public void run() {
-                        if (overlayShown) return;
-                        if (act.isFinishing()) return;
+                        if (overlayShown || act.isFinishing()) return;
                         overlayShown = true;
                         try {
                             showOverlay(act);
@@ -95,17 +94,38 @@ public class HookEntry implements IXposedHookLoadPackage {
     private void showOverlay(Activity act) {
         XposedBridge.log(TAG + "showOverlay on " + act.getClass().getName());
 
-        LinearLayout root = new LinearLayout(act);
+        final LinearLayout root = new LinearLayout(act);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(0xDD101018);
-        root.setPadding(24, 16, 24, 16);
+        root.setPadding(18, 10, 18, 10);
 
-        TextView title = new TextView(act);
-        title.setText("ModelMod");
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(14);
-        title.setPadding(0, 0, 0, 8);
-        root.addView(title);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xE6121219);
+        bg.setCornerRadius(24f);
+        bg.setStroke(2, 0x66FFD54F);
+        root.setBackground(bg);
+
+        // 标题行（拖动 + 折叠）
+        LinearLayout header = new LinearLayout(act);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setPadding(0, 4, 0, 4);
+
+        final TextView title = new TextView(act);
+        title.setText("ModelMod  ▾");
+        title.setTextColor(0xFFFFD54F);
+        title.setTextSize(13);
+        title.setPadding(0, 6, 0, 6);
+        header.addView(title);
+
+        // 开关容器
+        final LinearLayout body = new LinearLayout(act);
+        body.setOrientation(LinearLayout.VERTICAL);
+
+        TextView hint = new TextView(act);
+        hint.setText("勾选 = 隐藏");
+        hint.setTextColor(0xFF888888);
+        hint.setTextSize(10);
+        hint.setPadding(0, 0, 0, 6);
+        body.addView(hint);
 
         final String[] labels = {"身体 Body", "脸 Face", "头发 Hair", "武器 Weapon", "描边 PX", "NPC"};
         for (int i = 0; i < labels.length; i++) {
@@ -114,6 +134,7 @@ public class HookEntry implements IXposedHookLoadPackage {
             sw.setText(labels[i]);
             sw.setTextColor(Color.WHITE);
             sw.setTextSize(12);
+            sw.setPadding(0, 0, 0, 0);
             sw.setChecked((hideMask & (1 << bit)) != 0);
             sw.setOnCheckedChangeListener((btn, checked) -> {
                 if (checked) hideMask |= (1 << bit);
@@ -123,17 +144,22 @@ public class HookEntry implements IXposedHookLoadPackage {
                 } catch (Throwable ignored) {
                 }
             });
-            root.addView(sw);
+            body.addView(sw);
         }
+
+        root.addView(header);
+        root.addView(body);
 
         FrameLayout.LayoutParams flp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
-        flp.leftMargin = 40;
+        flp.leftMargin = 36;
         flp.topMargin = 260;
 
-        title.setOnTouchListener(new View.OnTouchListener() {
+        header.setOnTouchListener(new View.OnTouchListener() {
             private float dx, dy;
+            private long downAt;
+            private boolean moved;
 
             @Override
             public boolean onTouch(View v, MotionEvent e) {
@@ -141,10 +167,22 @@ public class HookEntry implements IXposedHookLoadPackage {
                     case MotionEvent.ACTION_DOWN:
                         dx = e.getRawX() - root.getX();
                         dy = e.getRawY() - root.getY();
+                        downAt = System.currentTimeMillis();
+                        moved = false;
                         return true;
                     case MotionEvent.ACTION_MOVE:
-                        root.setX(e.getRawX() - dx);
-                        root.setY(e.getRawY() - dy);
+                        float nx = e.getRawX() - dx;
+                        float ny = e.getRawY() - dy;
+                        if (Math.abs(nx - root.getX()) > 8 || Math.abs(ny - root.getY()) > 8) moved = true;
+                        root.setX(nx);
+                        root.setY(ny);
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                        if (!moved && System.currentTimeMillis() - downAt < 300) {
+                            boolean visible = body.getVisibility() == View.VISIBLE;
+                            body.setVisibility(visible ? View.GONE : View.VISIBLE);
+                            title.setText(visible ? "ModelMod  ▸" : "ModelMod  ▾");
+                        }
                         return true;
                 }
                 return false;
@@ -152,6 +190,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         });
 
         act.addContentView(root, flp);
-        XposedBridge.log(TAG + "overlay added via addContentView");
+        XposedBridge.log(TAG + "overlay added");
     }
 }
