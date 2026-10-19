@@ -1910,6 +1910,16 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
     std::vector<float> pos(nv * 3), nrm(nv * 3), uv(nv * 2);
     std::vector<uint32_t> idx(ni);
     fread(pos.data(), 4, nv * 3, f);
+    // 模型自带的包围盒高度：不同来源的模型单位差异巨大（MMD 约 20 单位，Quaternius 0.08）
+    float minY = 1e9f, maxY = -1e9f;
+    for (uint32_t i = 0; i < nv; i++) {
+        float y = pos[i * 3 + 1];
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+    }
+    float modelH = maxY - minY;
+    if (modelH < 0.0001f) modelH = 1.0f;
+    LOGI("mmesh: bboxY %.3f .. %.3f (h=%.3f)", minY, maxY, modelH);
     fread(nrm.data(), 4, nv * 3, f);
     fread(uv.data(),  4, nv * 2, f);
     fread(idx.data(), 4, ni, f);
@@ -2126,7 +2136,8 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
                 if (v.x > 0.00001f) psc = v.x;
             }
         }
-        float k = 20.0f / psc;
+        // 自动缩放：不管模型是 0.08 单位还是 20 单位，都拉到 1.7 米高
+        float k = 1.7f / (modelH * psc);
         if (setLScale) { Vec3 s = {k, k, k}; void* b[1] = { &s }; invoke_inst(setLScale, gt, b); }
 
         if (g_replace_mode) {
