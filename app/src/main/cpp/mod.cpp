@@ -12,6 +12,7 @@
 #include <time.h>
 #include <cstring>
 #include <cstdio>
+#include <cmath>
 #include <cstdint>
 #include <cstdarg>
 #include <string>
@@ -1049,6 +1050,7 @@ static Il2CppObject* find_role_root(Il2CppObject* smr);
 static bool under_player_root(Il2CppObject* smr);
 static int spawn_parts_loop(Il2CppObject* smr);
 static void build_target_list(Il2CppObject* playerRoot);
+static int spawn_rigid_parts(Il2CppObject* origSmr);
 static void update_skin_parts();
 static void* g_orig_canvas = nullptr;
 static void* g_orig_inst1 = nullptr;
@@ -3639,6 +3641,270 @@ static int replace_original_smr(Il2CppObject* SMRCls_unused, Il2CppObject* smr,
 }
 
 // ---------------------------------------------------------------
+
+// =====================================================================
+// v123 刚性分段：不蒙皮，每块模型挂到对应骨骼的 Transform 下面
+//
+// 之前所有方案都死在 Unity 的 bindposes 语义上：官方定义是「骨骼 bind 姿态
+// 世界矩阵的逆」，我实际用的是「把顶点移到骨骼原点的平移」。单骨骼看不出差别，
+// 多骨骼权重的顶点在不同骨骼下算出不同位置，接缝必然裂。
+//
+// 这个方案完全不碰蒙皮：
+//   Python 已经把模型切成 27 块（每块是一个骨骼的顶点，坐标已减去该骨骼的 bind 位置）
+//   C++ 每块建一个 GameObject，parent 到那根骨骼的 Transform，localPosition=0
+//   骨骼怎么动，块就怎么动 —— 引擎的父子变换，没有我能算错的地方
+// =====================================================================
+
+static Il2CppObject* g_rigidRoot = nullptr;
+
+static int spawn_rigid_parts(Il2CppObject* origSmr) {
+    LOGI("rigid: begin");
+    Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+    if (!SMRCls) { LOGE("rigid: no SMR class"); return 0; }
+    const MethodInfo* gb = find_method_any(SMRCls, "get_bones");
+    if (!gb) { LOGE("rigid: no get_bones"); return 0; }
+    Il2CppArray* ba = (Il2CppArray*)invoke_inst(gb, origSmr, nullptr);
+    if (!ba || ba->max_length == 0) { LOGE("rigid: no bones"); return 0; }
+    int N = (int)ba->max_length;
+
+    std::vector<Il2CppObject*> bones((size_t)N, nullptr);
+    std::vector<std::string> gnorm((size_t)N);
+    for (int i = 0; i < N; i++) {
+        Il2CppObject* b = *(Il2CppObject**)array_addr(ba, 8, (size_t)i);
+        bones[i] = b;
+        gnorm[i] = b ? norm_bone(obj_name(b), false) : std::string();
+    }
+
+    // 找那个目录（两个候选）
+    const char* cand[2] = {
+        "/data/user/0/com.hermes.h1game/files/",
+        "/data/data/com.hermes.h1game/files/",
+    };
+    char dir[256] = {0};
+    for (int i = 0; i < 2 && !dir[0]; i++) {
+        char probe[320];
+        snprintf(probe, sizeof(probe), "%srg_0_05.mmesh", cand[i]);
+        FILE* f = fopen(probe, "rb");
+        if (f) { fclose(f); snprintf(dir, sizeof(dir), "%s", cand[i]); }
+    }
+    if (!dir[0]) { LOGE("rigid: rg_*.mmesh not found"); return 0; }
+
+    // 我们的 22 个骨骼名
+    char p0[320];
+    snprintf(p0, sizeof(p0), "%scustom_0.mmesh", dir);
+    std::vector<std::string> ourNames;
+    if (!read_mm2_names(p0, ourNames)) { LOGE("rigid: cannot read custom_0 names"); return 0; }
+    std::vector<int> gidx;
+    int found = map_bones(ourNames, gnorm, &gidx);
+    LOGI("rigid: mapped %d/%d bones, target rig has %d", found, (int)ourNames.size(), N);
+    if (found < 5) { LOGE("rigid: too few bones mapped -> abort"); return 0; }
+
+    Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
+    Il2CppClass* V3Cls   = find_class_any("UnityEngine", "Vector3");
+    Il2CppClass* V2Cls   = find_class_any("UnityEngine", "Vector2");
+    Il2CppClass* I32Cls  = find_class_any("System", "Int32");
+    Il2CppClass* ByteCls = find_class_any("System", "Byte");
+    Il2CppClass* GOCls   = find_class_any("UnityEngine", "GameObject");
+    Il2CppClass* MFCls   = find_class_any("UnityEngine", "MeshFilter");
+    Il2CppClass* MRCls   = find_class_any("UnityEngine", "MeshRenderer");
+    Il2CppClass* CompCls = find_class_any("UnityEngine", "Component");
+    Il2CppClass* TransCls= find_class_any("UnityEngine", "Transform");
+    Il2CppClass* MatCls  = find_class_any("UnityEngine", "Material");
+    Il2CppClass* ShCls   = find_class_any("UnityEngine", "Shader");
+    Il2CppClass* TexCls  = find_class_any("UnityEngine", "Texture2D");
+    Il2CppClass* RCls    = find_class_any("UnityEngine", "Renderer");
+    if (!MeshCls || !V3Cls || !V2Cls || !I32Cls || !ByteCls || !GOCls || !MFCls ||
+        !MRCls || !CompCls || !TransCls || !MatCls || !RCls) {
+        LOGE("rigid: class missing"); return 0;
+    }
+
+    // 原 SMR 的 shader（自带蒙皮变体，MeshRenderer 也能用）
+    Il2CppObject* srcShader = nullptr;
+    {
+        const MethodInfo* gm = find_method_any(RCls, "get_sharedMaterial");
+        const MethodInfo* gs = find_method_any(MatCls, "get_shader");
+        if (gm && gs) {
+            Il2CppObject* mt = invoke_inst(gm, origSmr, nullptr);
+            if (mt) srcShader = invoke_inst(gs, mt, nullptr);
+        }
+    }
+
+    const MethodInfo* l2w = TransCls ? find_method_any(TransCls, "get_localToWorldMatrix") : nullptr;
+    const MethodInfo* setParent = find_method_any(TransCls, "SetParent");
+    const MethodInfo* setLPos = find_method_any(TransCls, "set_localPosition");
+    const MethodInfo* setLRot = find_method_any(TransCls, "set_localRotation");
+    const MethodInfo* setLScl = find_method_any(TransCls, "set_localScale");
+    const MethodInfo* goCtor = find_method_any(GOCls, ".ctor");
+    const MethodInfo* getGOTr = find_method_any(GOCls, "get_transform");
+    const MethodInfo* addComp = find_method_any(GOCls, "AddComponent");
+    const MethodInfo* setMesh = find_method_any(MFCls, "set_mesh");
+    const MethodInfo* setMat  = find_method_any(RCls, "set_sharedMaterial");
+    const MethodInfo* getLayer = find_method_any(GOCls, "get_layer");
+    const MethodInfo* setLayer = find_method_any(GOCls, "set_layer");
+    if (!setParent || !goCtor || !getGOTr || !addComp || !setMesh || !setMat) {
+        LOGE("rigid: method missing"); return 0;
+    }
+
+    // 原 SMR 所在 GameObject 的 layer，照抄
+    int layer = 0;
+    {
+        const MethodInfo* getGO = find_method_any(CompCls, "get_gameObject");
+        if (getGO) {
+            Il2CppObject* sgo = invoke_inst(getGO, origSmr, nullptr);
+            if (sgo && getLayer) {
+                Il2CppObject* lr = invoke_inst(getLayer, sgo, nullptr);
+                if (lr) layer = *(int*)((char*)lr + 16);
+            }
+        }
+    }
+    if (layer == 0) layer = 10;
+    LOGI("rigid: layer=%d", layer);
+
+    const float kBase = 1.7f / 20.214f;
+    int made = 0, skipped = 0;
+
+    for (int part = 0; part < 4; part++) {
+        for (int j = 0; j < (int)ourNames.size(); j++) {
+            int tgt = gidx[j];
+            if (tgt < 0 || tgt >= N || !bones[tgt]) { skipped++; continue; }
+
+            char path[400];
+            snprintf(path, sizeof(path), "%srg_%d_%02d.mmesh", dir, part, j);
+            FILE* f = fopen(path, "rb");
+            if (!f) continue;
+
+            char magic[4];
+            uint32_t nv = 0, ni = 0, flags = 0;
+            if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MMSH", 4) != 0) { fclose(f); continue; }
+            fread(&nv, 4, 1, f); fread(&ni, 4, 1, f); fread(&flags, 4, 1, f);
+            if (nv == 0 || ni == 0 || nv > 200000) { fclose(f); continue; }
+            std::vector<float> pos((size_t)nv*3), nrm((size_t)nv*3), uv((size_t)nv*2);
+            std::vector<uint32_t> idx(ni);
+            if (fread(pos.data(),4,(size_t)nv*3,f) != (size_t)nv*3 ||
+                fread(nrm.data(),4,(size_t)nv*3,f) != (size_t)nv*3 ||
+                fread(uv.data(), 4,(size_t)nv*2,f) != (size_t)nv*2 ||
+                fread(idx.data(),4,ni,f) != ni) { fclose(f); continue; }
+            fclose(f);
+
+            // 建 Mesh
+            Il2CppObject* mesh = g_api.object_new(MeshCls);
+            const MethodInfo* mc = find_method_any(MeshCls, ".ctor");
+            if (mc) invoke_inst(mc, mesh, nullptr);
+
+            Il2CppArray* va = g_api.array_new(V3Cls, nv); memcpy(array_addr(va,12,0), pos.data(), (size_t)nv*12);
+            Il2CppArray* na = g_api.array_new(V3Cls, nv); memcpy(array_addr(na,12,0), nrm.data(), (size_t)nv*12);
+            Il2CppArray* ua = g_api.array_new(V2Cls, nv); memcpy(array_addr(ua, 8,0), uv.data(),  (size_t)nv*8);
+            Il2CppArray* ia = g_api.array_new(I32Cls, ni); memcpy(array_addr(ia, 4,0), idx.data(), (size_t)ni*4);
+            const MethodInfo* sv = find_method_any(MeshCls, "set_vertices");
+            const MethodInfo* sn = find_method_any(MeshCls, "set_normals");
+            const MethodInfo* su = find_method_any(MeshCls, "set_uv");
+            const MethodInfo* st = find_method_any(MeshCls, "set_triangles");
+            if (sv) { void* a[1]={va}; invoke_inst(sv, mesh, a); }
+            if (sn) { void* a[1]={na}; invoke_inst(sn, mesh, a); }
+            if (su) { void* a[1]={ua}; invoke_inst(su, mesh, a); }
+            if (st) { void* a[1]={ia}; invoke_inst(st, mesh, a); }
+
+            // GameObject + 组件
+            void* an[1] = { g_api.string_new("mm_rigid") };
+            Il2CppObject* go = g_api.object_new(GOCls);
+            invoke_inst(goCtor, go, an);
+            if (setLayer && go) { void* a[1]={&layer}; invoke_inst(setLayer, go, a); }
+
+            void* t1[1] = { g_api.type_get_object(g_api.class_get_type(MFCls)) };
+            Il2CppObject* mf = invoke_inst(addComp, go, t1);
+            if (mf) { void* a[1]={mesh}; invoke_inst(setMesh, mf, a); }
+            void* t2[1] = { g_api.type_get_object(g_api.class_get_type(MRCls)) };
+            Il2CppObject* mr = invoke_inst(addComp, go, t2);
+
+            // 材质
+            if (mr) {
+                Il2CppObject* mat = nullptr;
+                if (srcShader) {
+                    mat = g_api.object_new(MatCls);
+                    const MethodInfo* c1 = find_method(MatCls, ".ctor", 1);
+                    if (c1) { void* b[1]={srcShader}; invoke_inst(c1, mat, b); }
+                }
+                if (!mat && ShCls) {
+                    const MethodInfo* sf = find_method(ShCls, "Find", 1);
+                    if (sf) {
+                        const char* sn[] = {"Unlit/Texture", "Sprites/Default"};
+                        for (int q = 0; q < 2 && !mat; q++) {
+                            void* a[1] = { g_api.string_new(sn[q]) };
+                            Il2CppObject* sh = invoke_static(sf, a);
+                            if (!sh) continue;
+                            mat = g_api.object_new(MatCls);
+                            const MethodInfo* c1 = find_method(MatCls, ".ctor", 1);
+                            if (c1) { void* b[1]={sh}; invoke_inst(c1, mat, b); }
+                        }
+                    }
+                }
+                if (mat) {
+                    void* a[1]={mat}; invoke_inst(setMat, mr, a);
+                    const MethodInfo* sc = find_method(MatCls, "set_color", 1);
+                    if (sc) { Color4 w={1,1,1,1}; void* b[1]={&w}; invoke_inst(sc, mat, b); }
+                    // 贴图
+                    char tp[400];
+                    snprintf(tp, sizeof(tp), "%scustom_%d.mmtex", dir, part);
+                    FILE* tf = fopen(tp, "rb");
+                    if (tf) {
+                        char tm[4]; uint32_t tw=0, th=0;
+                        if (fread(tm,1,4,tf)==4 && memcmp(tm,"MMTX",4)==0 &&
+                            fread(&tw,4,1,tf)==1 && fread(&th,4,1,tf)==1 &&
+                            tw>0 && th>0 && tw<=4096 && th<=4096) {
+                            size_t nbytes=(size_t)tw*th*4;
+                            std::vector<unsigned char> px(nbytes);
+                            if (fread(px.data(),1,nbytes,tf)==nbytes && TexCls && ByteCls) {
+                                const MethodInfo* tc = find_method(TexCls, ".ctor", 4);
+                                Il2CppObject* tex = g_api.object_new(TexCls);
+                                if (tc) { int wi=(int)tw, hi=(int)th, fmt=4; bool mip=false;
+                                          void* ta[4]={&wi,&hi,&fmt,&mip}; invoke_inst(tc, tex, ta); }
+                                const MethodInfo* lr = find_method(TexCls, "LoadRawTextureData", 1);
+                                const MethodInfo* ap = find_method(TexCls, "Apply", 1);
+                                if (tex && lr) {
+                                    Il2CppArray* bar = g_api.array_new(ByteCls, nbytes);
+                                    memcpy(array_addr(bar,1,0), px.data(), nbytes);
+                                    void* la[1]={bar}; invoke_inst(lr, tex, la);
+                                    if (ap) { bool u=false; void* aa[1]={&u}; invoke_inst(ap, tex, aa); }
+                                    const MethodInfo* sm2 = find_method(MatCls, "set_mainTexture", 1);
+                                    if (sm2) { void* sa[1]={tex}; invoke_inst(sm2, mat, sa); }
+                                }
+                            }
+                        }
+                        fclose(tf);
+                    }
+                }
+            }
+
+            // 挂到骨骼下
+            Il2CppObject* gt = getGOTr ? invoke_inst(getGOTr, go, nullptr) : nullptr;
+            if (!gt) continue;
+            void* pa[1] = { bones[tgt] };
+            invoke_inst(setParent, gt, pa);
+
+            // localScale = k / 骨骼世界缩放
+            float ws = 1.0f;
+            if (l2w) {
+                Il2CppObject* m2 = invoke_inst(l2w, bones[tgt], nullptr);
+                if (m2) {
+                    const float* mm = (const float*)((char*)m2 + 16);
+                    float sx = sqrtf(mm[0]*mm[0] + mm[1]*mm[1] + mm[2]*mm[2]);
+                    if (sx > 0.0001f) ws = sx;
+                }
+            }
+            float ls = kBase / ws;
+            if (setLScl) { Vec3 v = {ls, ls, ls}; void* a[1]={&v}; invoke_inst(setLScl, gt, a); }
+            if (setLRot) { Quat q = {0,0,0,1}; void* a[1]={&q}; invoke_inst(setLRot, gt, a); }
+            if (setLPos) { Vec3 v = {0,0,0}; void* a[1]={&v}; invoke_inst(setLPos, gt, a); }
+
+            g_ourSmrs.insert(go);
+            made++;
+        }
+    }
+    LOGI("rigid: spawned %d pieces (skipped %d unmapped bones)", made, skipped);
+    if (made > 0) g_gpu_skin = 1;
+    return made;
+}
+
 static int spawn_gpu_parts(Il2CppObject* origSmr) {
     if (g_gpu_tried) return g_gpu_skin ? 1 : 0;
     g_gpu_tried = 1;
@@ -3714,14 +3980,13 @@ static int spawn_parts_loop(Il2CppObject* smr) {
     Il2CppObject* roleRoot = find_role_root(smr);
     if (!roleRoot) { LOGE("parts: no roleRoot"); return 0; }
 
-    // v114: 先试 GPU 蒙皮（克隆原 SMR，引擎每帧自己驱骨骼），成了就不走静态版
-    if (!g_probed) { g_probed = 1; probe_unity_api(); }
+    // v123: 先试刚性分段（每块挂到骨骼 Transform 下，不碰蒙皮）
     if (!g_gpu_skin) {
-        int g = spawn_gpu_parts(smr);
-        LOGI("parts: gpu=%d spawned=%d", (int)g_gpu_skin, g);
-        if (g_gpu_skin) return g;
+        int r = spawn_rigid_parts(smr);
+        LOGI("parts: rigid=%d -> %s", r, r > 0 ? "RIGID MODE" : "fallback static");
+        if (r > 0) return r;
     } else {
-        LOGI("parts: already gpu mode, skip static");
+        LOGI("parts: already in rigid/gpu mode, skip");
         return 1;
     }
 
