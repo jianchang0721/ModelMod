@@ -2125,6 +2125,18 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
                                     const MethodInfo* setMain = find_method(MatCls, "set_mainTexture", 1);
                                     if (setMain) { void* sa[1] = { tex }; invoke_inst(setMain, mat, sa); LOGI("tex: mainTexture set %p", tex); }
                                     else LOGE("tex: no set_mainTexture");
+
+                                    // 关键：材质原来的 tint 是肉色，会和贴图相乘，刷成白色贴图才准
+                                    const MethodInfo* setCol = find_method(MatCls, "set_color", 1);
+                                    if (setCol) { Color4 wcol = {1.0f, 1.0f, 1.0f, 1.0f}; void* ca[1] = { &wcol }; invoke_inst(setCol, mat, ca); LOGI("tex: tint white"); }
+
+                                    // 读回宽高确认纹理真的建出来了
+                                    const MethodInfo* getW = find_method(TexCls, "get_width", 0);
+                                    const MethodInfo* getH = find_method(TexCls, "get_height", 0);
+                                    int rw = -1, rh = -1;
+                                    if (getW) { Il2CppObject* o = invoke_inst(getW, tex, nullptr); if (o) rw = *(int*)((char*)o + 16); }
+                                    if (getH) { Il2CppObject* o = invoke_inst(getH, tex, nullptr); if (o) rh = *(int*)((char*)o + 16); }
+                                    LOGI("tex: readback %dx%d (ctor2=%p)", rw, rh, (void*)tctor);
                                 } else {
                                     LOGE("tex: tex=%p loadRaw=%p", tex, (void*)loadRaw);
                                 }
