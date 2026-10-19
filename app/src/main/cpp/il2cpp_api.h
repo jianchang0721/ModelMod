@@ -12,6 +12,7 @@ typedef struct Il2CppString         Il2CppString;
 typedef struct Il2CppType           Il2CppType;
 typedef struct Il2CppReflectionType Il2CppReflectionType;
 typedef struct MethodInfo           MethodInfo;
+typedef struct FieldInfo            FieldInfo;
 
 struct Il2CppObject {
     void* klass;
@@ -54,6 +55,11 @@ typedef Il2CppObject*         (*fn_object_new)(Il2CppClass*);
 typedef Il2CppClass*          (*fn_object_get_class)(Il2CppObject*);
 typedef Il2CppArray*          (*fn_array_new)(Il2CppClass*, size_t);
 typedef Il2CppReflectionType* (*fn_type_get_object)(const Il2CppType*);
+typedef FieldInfo*            (*fn_class_get_fields)(Il2CppClass*, void**);
+typedef const char*           (*fn_field_get_name)(FieldInfo*);
+typedef size_t                (*fn_field_get_offset)(FieldInfo*);
+typedef const Il2CppType*     (*fn_field_get_type)(FieldInfo*);
+typedef char*                 (*fn_type_get_name)(const Il2CppType*);
 
 struct Il2CppApi {
     fn_domain_get                domain_get;
@@ -80,6 +86,11 @@ struct Il2CppApi {
     fn_object_get_class          object_get_class;
     fn_array_new                 array_new;
     fn_type_get_object           type_get_object;
+    fn_class_get_fields          class_get_fields;
+    fn_field_get_name            field_get_name;
+    fn_field_get_offset          field_get_offset;
+    fn_field_get_type            field_get_type;
+    fn_type_get_name             type_get_name;
 };
 
 extern Il2CppApi g_api;

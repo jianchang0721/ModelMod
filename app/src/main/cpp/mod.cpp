@@ -421,6 +421,15 @@ static bool bind_api(uintptr_t base) {
     B(array_new,                 "il2cpp_array_new")
     B(type_get_object,           "il2cpp_type_get_object")
 #undef B
+
+    // 字段相关（可选，缺了不影响主流程）
+    g_api.class_get_fields = (fn_class_get_fields)dlsym(h, "il2cpp_class_get_fields");
+    g_api.field_get_name   = (fn_field_get_name)  dlsym(h, "il2cpp_field_get_name");
+    g_api.field_get_offset = (fn_field_get_offset)dlsym(h, "il2cpp_field_get_offset");
+    g_api.field_get_type   = (fn_field_get_type)  dlsym(h, "il2cpp_field_get_type");
+    g_api.type_get_name    = (fn_type_get_name)   dlsym(h, "il2cpp_type_get_name");
+    LOGI("field api: %p %p %p %p %p", (void*)g_api.class_get_fields, (void*)g_api.field_get_name,
+         (void*)g_api.field_get_offset, (void*)g_api.field_get_type, (void*)g_api.type_get_name);
     return true;
 }
 
@@ -1413,6 +1422,34 @@ static bool install_hooks() {
     return ok;
 }
 
+// dump 一个类的字段偏移和方法名：判断能不能直接改字段，或有没有漏掉的 setter
+static void dump_class_members(const char* ns, const char* name) {
+    Il2CppClass* k = find_class_any(ns, name);
+    if (!k) { LOGE("dump: no class %s.%s", ns, name); return; }
+    LOGI("==== dump %s ====", name);
+    void* it = nullptr;
+    FieldInfo* f;
+    int n = 0;
+    if (g_api.class_get_fields) {
+        while ((f = g_api.class_get_fields(k, &it)) && n < 120) {
+            const Il2CppType* t = g_api.field_get_type ? g_api.field_get_type(f) : nullptr;
+            const char* tn = (t && g_api.type_get_name) ? g_api.type_get_name(t) : "?";
+            LOGI("F %-30s off=%4d type=%s", g_api.field_get_name(f),
+                 (int)g_api.field_get_offset(f), tn ? tn : "?");
+            n++;
+        }
+    }
+    LOGI("-- %s fields=%d --", name, n);
+    it = nullptr;
+    const MethodInfo* m;
+    n = 0;
+    while ((m = g_api.class_get_methods(k, &it)) && n < 250) {
+        LOGI("M %s/%u", g_api.method_get_name(m), g_api.method_get_param_count(m));
+        n++;
+    }
+    LOGI("-- %s methods=%d --", name, n);
+}
+
 // ================= 工作线程 =================
 static void* worker(void*) {
     // 等 Java 层把日志路径传过来，最多等 2 秒
@@ -1698,6 +1735,11 @@ static void* worker(void*) {
     }
 
     LOGI("worker loop start (hide + instantiate-hook)");
+
+    // 一次性 dump：字段偏移 + 方法名
+    dump_class_members("UnityEngine", "SkinnedMeshRenderer");
+    dump_class_members("UnityEngine", "Renderer");
+    dump_class_members("UnityEngine", "Mesh");
 
     int round = 0;
     while (true) {
