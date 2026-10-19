@@ -68,12 +68,12 @@ static pid_t cur_tid() {
 // UnityMain 线程的 tid 不等于 pid！只能靠线程名认
 // 缓存：clock_gettime 每秒几千次，不能每次都 prctl
 static bool is_unity_main() {
-    static thread_local int8_t cached = -1;
-    if (cached >= 0) return cached == 1;
+    static thread_local int8_t cached = 0;
+    if (cached == 1) return true;              // 只缓存 true：线程名是启动后才设的
     char name[16] = {0};
-    if (prctl(PR_GET_NAME, name) != 0) { cached = 0; return false; }
-    cached = (strncmp(name, "UnityMain", 9) == 0) ? 1 : 0;
-    return cached == 1;
+    if (prctl(PR_GET_NAME, name) != 0) return false;
+    if (strncmp(name, "UnityMain", 9) == 0) { cached = 1; return true; }
+    return false;
 }
 static std::string g_log_path;
 static FILE* g_log_fp = nullptr;
@@ -94,6 +94,7 @@ static volatile int g_hookcnt[12] = {0};
 #define HC_ASPECT   8
 #define HC_VOLUME   9
 #define HC_CGT      10
+#define HC_CGT_ALL  11
 static const MethodInfo* g_setEnabled = nullptr;
 static std::map<void*, int> g_patched_meshes;
 
@@ -999,6 +1000,7 @@ static int cgt_fallback(clockid_t id, struct timespec* ts) {
 }
 
 static int hk_cgt(clockid_t id, struct timespec* ts) {
+    g_hookcnt[HC_CGT_ALL]++;          // 不管哪个线程，先进来就算
     if (!g_orig_cgt) return cgt_fallback(id, ts);
     if (is_unity_main()) {
         g_hookcnt[HC_CGT]++;
@@ -1166,13 +1168,13 @@ static void main_tick() {
     static int tmain = 0;
     if (isMain) {
         tmain++;
-        if (tmain <= 5 || (tmain % 200) == 0) {
+        if (tmain <= 5 || (tmain % 100) == 0) {
             LOGI("tick MAIN #%d tid=%d", tmain, (int)tid);
             LOGI("hookcnt tween=%d canvas=%d setact=%d getname=%d gettrans=%d getpos=%d event=%d cscaler=%d aspect=%d volume=%d",
                  g_hookcnt[HC_TWEEN], g_hookcnt[HC_CANVAS], g_hookcnt[HC_SETACT],
                  g_hookcnt[HC_GETNAME], g_hookcnt[HC_GETTRANS], g_hookcnt[HC_GETPOS],
                  g_hookcnt[HC_EVENT], g_hookcnt[HC_CSCALER], g_hookcnt[HC_ASPECT], g_hookcnt[HC_VOLUME]);
-            LOGI("hookcnt2 cgt=%d", g_hookcnt[HC_CGT]);
+            LOGI("hookcnt2 cgt_main=%d cgt_all=%d", g_hookcnt[HC_CGT], g_hookcnt[HC_CGT_ALL]);
         }
     }
 
