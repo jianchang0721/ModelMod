@@ -3662,6 +3662,95 @@ static int replace_original_smr(Il2CppObject* SMRCls_unused, Il2CppObject* smr,
 //   骨骼怎么动，块就怎么动 —— 引擎的父子变换，没有我能算错的地方
 // =====================================================================
 
+
+// ---------------------------------------------------------------
+// 按骨骼相对位置匹配（名字对不上时用）
+//   PMX 骨骼位置和游戏骨骼世界位置各自归一化（减去均值、除以最大半径），
+//   找最近的一根；带左右约束避免 L/R 互换。
+// ---------------------------------------------------------------
+static int match_bones_by_position(const char* dir,
+                                   const std::vector<std::string>& gnorm,
+                                   const std::vector<Il2CppObject*>& bones, int N,
+                                   std::vector<int>& gidx) {
+    char path[400];
+    snprintf(path, sizeof(path), "%sbonepos.txt", dir);
+    FILE* f = fopen(path, "r");
+    if (!f) { LOGE("rigid: bonepos.txt not found, skip position matching"); return 0; }
+    std::vector<float> ppos;
+    std::vector<std::string> pnames;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        int idx; char nm[128]; float x, y, z;
+        if (sscanf(line, "%d %127s %f %f %f", &idx, nm, &x, &y, &z) == 5) {
+            pnames.push_back(std::string(nm));
+            ppos.push_back(x); ppos.push_back(y); ppos.push_back(z);
+        }
+    }
+    fclose(f);
+    int nb = (int)pnames.size();
+    if (nb == 0) return 0;
+
+    Il2CppClass* TrCls = find_class_any("UnityEngine", "Transform");
+    const MethodInfo* l2w = TrCls ? find_method_any(TrCls, "get_localToWorldMatrix") : nullptr;
+    if (!l2w) return 0;
+
+    std::vector<float> gpos((size_t)N*3, 0.0f);
+    std::vector<char> gok((size_t)N, 0);
+    for (int j = 0; j < N; j++) {
+        if (!bones[j]) continue;
+        Il2CppObject* m = invoke_inst(l2w, bones[j], nullptr);
+        if (!m) continue;
+        const float* mm = (const float*)((char*)m + 16);
+        gpos[j*3] = mm[12]; gpos[j*3+1] = mm[13]; gpos[j*3+2] = mm[14];
+        gok[j] = 1;
+    }
+
+    float pc[3] = {0,0,0}, gc[3] = {0,0,0};
+    int pn = nb, gc2 = 0;
+    for (int i = 0; i < nb; i++) { pc[0]+=ppos[i*3]; pc[1]+=ppos[i*3+1]; pc[2]+=ppos[i*3+2]; }
+    for (int j = 0; j < N; j++) if (gok[j]) { gc[0]+=gpos[j*3]; gc[1]+=gpos[j*3+1]; gc[2]+=gpos[j*3+2]; gc2++; }
+    if (!pn || !gc2) return 0;
+    for (int k = 0; k < 3; k++) { pc[k] /= pn; gc[k] /= gc2; }
+
+    float pr = 0.0f, gr = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        float dx=ppos[i*3]-pc[0], dy=ppos[i*3+1]-pc[1], dz=ppos[i*3+2]-pc[2];
+        float d = sqrtf(dx*dx+dy*dy+dz*dz); if (d > pr) pr = d;
+    }
+    for (int j = 0; j < N; j++) if (gok[j]) {
+        float dx=gpos[j*3]-gc[0], dy=gpos[j*3+1]-gc[1], dz=gpos[j*3+2]-gc[2];
+        float d = sqrtf(dx*dx+dy*dy+dz*dz); if (d > gr) gr = d;
+    }
+    if (pr < 0.001f || gr < 0.001f) return 0;
+
+    int matched = 0;
+    for (int i = 0; i < nb; i++) {
+        if (gidx[i] >= 0) { matched++; continue; }     // 名字已匹配的保留
+        float px=(ppos[i*3]-pc[0])/pr, py=(ppos[i*3+1]-pc[1])/pr, pz=(ppos[i*3+2]-pc[2])/pr;
+        int best = -1; float bd = 1e18f;
+        for (int j = 0; j < N; j++) {
+            if (!gok[j]) continue;
+            float qx=(gpos[j*3]-gc[0])/gr, qy=(gpos[j*3+1]-gc[1])/gr, qz=(gpos[j*3+2]-gc[2])/gr;
+            // 左右约束：x 明显分居两侧的不许配对
+            if (px > 0.15f && qx < -0.15f) continue;
+            if (px < -0.15f && qx > 0.15f) continue;
+            float dx=px-qx, dy=py-qy, dz=pz-qz;
+            float d = dx*dx+dy*dy+dz*dz;
+            if (d < bd) { bd = d; best = j; }
+        }
+        if (best >= 0 && bd < 0.09f) {
+            gidx[i] = best;
+            matched++;
+            LOGI("rigid: posmap[%2d] %-18s -> bone[%2d](%s) d2=%.4f",
+                 i, pnames[i].c_str(), best, gnorm[best].c_str(), bd);
+        } else {
+            LOGI("rigid: posmap[%2d] %-18s -> none (best d2=%.4f)", i, pnames[i].c_str(), bd);
+        }
+    }
+    LOGI("rigid: position matching done, %d/%d mapped", matched, nb);
+    return matched;
+}
+
 static Il2CppObject* g_rigidRoot = nullptr;
 
 static int spawn_rigid_parts(Il2CppObject* origSmr) {
@@ -3704,7 +3793,12 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
     if (!read_mm2_names(p0, ourNames)) { LOGE("rigid: cannot read custom_0 names"); return 0; }
     std::vector<int> gidx;
     int found = map_bones(ourNames, gnorm, &gidx);
-    LOGI("rigid: mapped %d/%d bones, target rig has %d", found, (int)ourNames.size(), N);
+    LOGI("rigid: name-mapped %d/%d bones, target rig has %d", found, (int)ourNames.size(), N);
+    if (found < (int)ourNames.size() * 3 / 4) {
+        int m2 = match_bones_by_position(dir, gnorm, bones, N, gidx);
+        if (m2 > found) found = m2;
+        LOGI("rigid: after position matching -> %d/%d", found, (int)ourNames.size());
+    }
     if (found < 5) { LOGE("rigid: too few bones mapped -> abort"); return 0; }
 
     Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
