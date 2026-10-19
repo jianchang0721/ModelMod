@@ -1450,6 +1450,42 @@ static void dump_class_members(const char* ns, const char* name) {
     LOGI("-- %s methods=%d --", name, n);
 }
 
+// ---------------------------------------------------------------
+// 没有 set_sharedMesh：直接从 native 对象里找 mesh 指针的偏移
+// IL2CPP 的 UnityEngine.Object 布局：klass(0) monitor(8) m_CachedPtr(16)
+// ---------------------------------------------------------------
+static void probe_native_mesh() {
+    Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+    if (!SMRCls) { LOGE("probe_native: no SMR"); return; }
+    const MethodInfo* getMesh = find_method(SMRCls, "get_sharedMesh", 0);
+    if (!getMesh) { LOGE("probe_native: no get_sharedMesh"); return; }
+
+    std::vector<Fingerprint> list;
+    collect_fingerprints(SMRCls, list);
+    LOGI("probe_native: smrs=%zu", list.size());
+
+    int shown = 0;
+    for (size_t i = 0; i < list.size() && shown < 3; i++) {
+        Il2CppObject* smr = list[i].smr;
+        Il2CppObject* mesh = invoke_inst(getMesh, smr, nullptr);
+        if (!mesh) continue;
+
+        void* np_smr  = *(void**)((char*)smr + 16);
+        void* np_mesh = *(void**)((char*)mesh + 16);
+        LOGI("native[%d] %s", shown, list[i].chain.c_str());
+        LOGI("  smrMg=%p smrNat=%p meshMg=%p meshNat=%p", smr, np_smr, mesh, np_mesh);
+        shown++;
+        if (!np_smr || !np_mesh) { LOGE("  null native ptr, skip"); continue; }
+
+        int hits = 0;
+        for (int off = 0; off < 0x300; off += 8) {
+            void* v = *(void**)((char*)np_smr + off);
+            if (v == np_mesh) { LOGI("  HIT mesh@0x%x", off); hits++; }
+        }
+        LOGI("  scan done hits=%d", hits);
+    }
+}
+
 // ================= 工作线程 =================
 static void* worker(void*) {
     // 等 Java 层把日志路径传过来，最多等 2 秒
@@ -1747,6 +1783,7 @@ static void* worker(void*) {
         std::vector<Fingerprint> list;
         collect_fingerprints(SMRCls, list);
         LOGI("scan #%d: %zu smrs", round, list.size());
+        if (round == 8) probe_native_mesh();
 
         int done = 0;
         for (auto& f : list) {
