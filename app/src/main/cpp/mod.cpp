@@ -1785,6 +1785,7 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
 
     // 挂到角色父节点，缩放 20 倍（模型高 0.08 -> 1.6m）
     const MethodInfo* getTransGO = find_method(GOCls, "get_transform", 0);
+    const MethodInfo* getTransC  = find_method(CompCls, "get_transform", 0);   // SMR 是 Component，不能走 GameObject.get_transform
     const MethodInfo* getParent  = find_method(TransCls, "get_parent", 0);
     const MethodInfo* setParent  = find_method(TransCls, "SetParent", 1);
     const MethodInfo* setLPos    = find_method(TransCls, "set_localPosition", 1);
@@ -1795,7 +1796,7 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
     if (gt && setLScale) { Vec3 s = {20, 20, 20}; void* a[1] = { &s }; invoke_inst(setLScale, gt, a); LOGI("mmesh: scale ok"); }
     if (gt && setLPos)   { Vec3 p = {0, 0, 0};    void* a[1] = { &p }; invoke_inst(setLPos, gt, a);   LOGI("mmesh: pos ok"); }
 
-    Il2CppObject* st = smr ? invoke_inst(getTransGO, smr, nullptr) : nullptr;
+    Il2CppObject* st = (smr && getTransC) ? invoke_inst(getTransC, smr, nullptr) : nullptr;
     Il2CppObject* sp = (st && getParent) ? invoke_inst(getParent, st, nullptr) : nullptr;
     LOGI("mmesh: step st=%p sp=%p setParent=%p", st, sp, (void*)setParent);
     if (gt && sp && setParent) { void* a[1] = { sp }; invoke_inst(setParent, gt, a); LOGI("mmesh: parent ok"); }
