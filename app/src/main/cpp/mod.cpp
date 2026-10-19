@@ -885,14 +885,6 @@ static void hk_canvasupdate(void* m) {
 }
 
 static void* g_orig_setactive = nullptr;
-static void* g_orig_getpos = nullptr;
-
-struct Vec3 { float x, y, z; };
-
-static Vec3 hk_getpos(void* self, void* m) {
-    main_tick();
-    return ((Vec3(*)(void*, void*))g_orig_getpos)(self, m);
-}
 
 static void hk_setactive(void* self, void* m, uint8_t v) {
     static int cnt = 0;
