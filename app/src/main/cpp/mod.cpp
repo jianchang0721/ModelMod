@@ -1458,9 +1458,9 @@ static void main_tick() {
 
     // CPU 蒙皮：约 20fps 刷一次，全速跑太重
     {
-        // 暂时停掉 CPU 蒙皮：上线后游戏反复 SIGSEGV，先保稳定
-        // static int skinTick = 0;
-        // if ((skinTick++ % 10) == 0) { update_skin_parts(); }
+        // CPU 蒙皮：静止时内部会自动跳过，动起来才刷；30 帧一次约 2fps
+        static int skinTick = 0;
+        if ((skinTick++ % 30) == 0) { update_skin_parts(); }
     }
 
     // 开关切换：立即处理，不等 3 秒
@@ -2434,6 +2434,13 @@ static void update_skin_parts() {
             const float* mm = (const float*)((char*)m + 16);
             for (int k = 0; k < 16; k++) mats[b*16+k] = mm[k];
         }
+
+        // 骨骼没动就别刷顶点：NPTH 反调试对高频顶点上传很敏感，静止时不写就没风险
+        if (sp.lastMats.size() == mats.size() &&
+            memcmp(sp.lastMats.data(), mats.data(), mats.size() * sizeof(float)) == 0) {
+            continue;
+        }
+        sp.lastMats = mats;
 
         std::vector<float> out((size_t)sp.nv * 3);
         for (int v = 0; v < sp.nv; v++) {
