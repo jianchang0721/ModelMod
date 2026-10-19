@@ -73,6 +73,22 @@ static pid_t cur_tid() {
 // 游戏会建好几个叫 UnityMain 的线程，只有一个是真的：clock_gettime 频率最高的那个
 static volatile pid_t g_main_tid = 0;
 
+// 每个线程的 clock_gettime 命中数，用来看谁才是真主线程
+struct TidStat { volatile pid_t tid; volatile int hits; };
+static TidStat g_tidstat[48];
+static void stat_touch_tid(pid_t tid, int add) {
+    for (int i = 0; i < 48; i++) {
+        if (g_tidstat[i].tid == tid) { g_tidstat[i].hits += add; return; }
+        if (g_tidstat[i].tid == 0) { g_tidstat[i].tid = tid; g_tidstat[i].hits = add; return; }
+    }
+}
+static void stat_dump() {
+    for (int i = 0; i < 48; i++) {
+        if (!g_tidstat[i].tid) break;
+        LOGI("tidstat tid=%d hits=%d", (int)g_tidstat[i].tid, g_tidstat[i].hits);
+    }
+}
+
 static bool is_unity_main() {
     pid_t tid = cur_tid();
     if (g_main_tid) return tid == g_main_tid;
@@ -1036,14 +1052,20 @@ static int cgt_fallback(clockid_t id, struct timespec* ts) {
 static int hk_cgt(clockid_t id, struct timespec* ts) {
     g_hookcnt[HC_CGT_ALL]++;          // 不管哪个线程，先进来就算
 
-    // 锁定真主线程：高频调用 clock_gettime 且名字叫 UnityMain 的那个
-    if (!g_main_tid) {
+    // 锁定真主线程：clock_gettime 调用次数最多的那个 UnityMain
+    // （游戏有好几个同名线程，第一个跑到阈值的未必是主线程）
+    {
         static thread_local int hits = 0;
-        if (++hits > 300) {
+        hits++;
+        if ((hits % 503) == 0) {          // 每 503 次更新一次全局表，不拖性能
+            stat_touch_tid(cur_tid(), 503);
+        }
+        if (!g_main_tid && hits > 5000) {
             char nm[16] = {0};
             if (prctl(PR_GET_NAME, nm) == 0 && strncmp(nm, "UnityMain", 9) == 0) {
                 g_main_tid = cur_tid();
-                LOGI("real main tid locked = %d name=%s", (int)g_main_tid, nm);
+                LOGI("real main tid locked = %d name=%s (hits=%d)", (int)g_main_tid, nm, hits);
+                stat_dump();
             }
         }
     }
