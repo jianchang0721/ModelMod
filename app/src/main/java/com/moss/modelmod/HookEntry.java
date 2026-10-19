@@ -43,6 +43,7 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static native void setLogPath(String path);
     private static native void setHideMask(int mask);
     private static native void reloadModel();
+    private static native String getLayerInfo();
 
     private static final int REQ_PICK = 0x4D44;   // 自定义模型选择器
 
@@ -212,6 +213,26 @@ public class HookEntry implements IXposedHookLoadPackage {
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         btnRow.addView(btnPick, blp2);
         body.addView(btnRow);
+
+        // layer 指示器：每秒刷新 camMask / 模型 layer / 原角色 layer
+        final TextView info = new TextView(act);
+        info.setTextColor(0xFF7FD4FF);
+        info.setTextSize(9);
+        info.setPadding(0, 10, 0, 0);
+        info.setText("layer: loading...");
+        body.addView(info);
+
+        final Handler lh = new Handler(Looper.getMainLooper());
+        lh.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    info.setText(getLayerInfo());
+                } catch (Throwable ignored) {
+                }
+                lh.postDelayed(this, 1000);
+            }
+        });
 
         root.addView(header);
         root.addView(body);

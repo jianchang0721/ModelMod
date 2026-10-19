@@ -1716,6 +1716,31 @@ static void probe_native_mesh() {
 // 加载我们自己转好的 .mmesh，主线程里建 Mesh + GameObject 挂到角色身上
 // 文件放在游戏私有目录，因为 app 读不了 /sdcard 上任意路径
 // ---------------------------------------------------------------
+// 悬浮窗上显示的诊断信息：主相机能看见哪些 layer、我们的模型在哪层、原角色在哪层
+static char g_layer_info[192] = "model not spawned yet";
+static int g_model_layer = -1;
+static int g_role_layer = -1;
+
+static void update_layer_info() {
+    int camMask = -1;
+    Il2CppClass* CamCls = find_class_any("UnityEngine", "Camera");
+    if (CamCls) {
+        const MethodInfo* getMain = find_method(CamCls, "get_main", 0);
+        Il2CppObject* cam = getMain ? invoke_static(getMain, nullptr) : nullptr;
+        if (cam) {
+            const MethodInfo* getMask = find_method(CamCls, "get_cullingMask", 0);
+            if (getMask) {
+                Il2CppObject* r = invoke_inst(getMask, cam, nullptr);
+                if (r) camMask = *(int*)((char*)r + 16);
+            }
+        }
+    }
+    snprintf(g_layer_info, sizeof(g_layer_info),
+             "camMask=0x%08X\nmodelL=%d roleL=%d",
+             camMask, g_model_layer, g_role_layer);
+    LOGI("layerinfo: %s", g_layer_info);
+}
+
 static const char* kMmeshPaths[] = {
     "/data/user/0/com.hermes.h1game/files/custom.mmesh",   // 用户从悬浮窗选的
     "/data/data/com.hermes.h1game/files/custom.mmesh",
@@ -1814,8 +1839,10 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
             }
         }
         LOGI("mmesh: source layer=%d", layer);
+        g_role_layer = layer;
         const MethodInfo* setLayer = find_method(GOCls, "set_layer", 1);
         if (setLayer) { void* a[1] = { &layer }; invoke_inst(setLayer, go, a); LOGI("mmesh: layer set to %d", layer); }
+        g_model_layer = layer;
     }
 
     const MethodInfo* addComp = find_method(GOCls, "AddComponent", 1);
@@ -2338,6 +2365,12 @@ static void* worker(void*) {
 
 // ================= 入口 =================
 // Java 层把游戏的 files 目录传进来，保证日志一定写得出去
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_moss_modelmod_HookEntry_getLayerInfo(JNIEnv* env, jclass) {
+    update_layer_info();
+    return env->NewStringUTF(g_layer_info);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_moss_modelmod_HookEntry_reloadModel(JNIEnv*, jclass) {
     g_cube_done = 0;
