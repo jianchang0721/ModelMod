@@ -2046,6 +2046,17 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
         }
     }
 
+    // 一次性 dump 纹理 API
+    {
+        static int dumpedTex = 0;
+        if (!dumpedTex) {
+            dumpedTex = 1;
+            dump_class_members("UnityEngine", "Texture2D");
+            dump_class_members("UnityEngine", "Texture");
+            dump_class_members("UnityEngine", "Material");
+        }
+    }
+
     // 材质：优先自己建一个 unlit 纯色（借来的游戏材质不会对）
     if (mr) {
         Il2CppObject* mat = nullptr;
