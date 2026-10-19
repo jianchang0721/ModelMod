@@ -3723,29 +3723,37 @@ static int match_bones_by_position(const char* dir,
     }
     if (pr < 0.001f || gr < 0.001f) return 0;
 
+    // 名字已经占掉的骨骼先标成已用（同名的多对一是合理的，比如 Spine/Spine1/Spine2）
+    std::vector<char> used((size_t)N, 0);
     int matched = 0;
-    for (int i = 0; i < nb; i++) {
-        if (gidx[i] >= 0) { matched++; continue; }     // 名字已匹配的保留
-        float px=(ppos[i*3]-pc[0])/pr, py=(ppos[i*3+1]-pc[1])/pr, pz=(ppos[i*3+2]-pc[2])/pr;
-        int best = -1; float bd = 1e18f;
-        for (int j = 0; j < N; j++) {
-            if (!gok[j]) continue;
-            float qx=(gpos[j*3]-gc[0])/gr, qy=(gpos[j*3+1]-gc[1])/gr, qz=(gpos[j*3+2]-gc[2])/gr;
-            // 左右约束：x 明显分居两侧的不许配对
-            if (px > 0.15f && qx < -0.15f) continue;
-            if (px < -0.15f && qx > 0.15f) continue;
-            float dx=px-qx, dy=py-qy, dz=pz-qz;
-            float d = dx*dx+dy*dy+dz*dz;
-            if (d < bd) { bd = d; best = j; }
+    for (int i = 0; i < nb; i++) if (gidx[i] >= 0) { used[gidx[i]] = 1; matched++; }
+
+    // 两轮：先严格一对一（阈值 0.03），不够再放宽（0.09，允许重复）
+    const float thr[2] = {0.03f, 0.09f};
+    for (int round = 0; round < 2; round++) {
+        for (int i = 0; i < nb; i++) {
+            if (gidx[i] >= 0) continue;
+            float px=(ppos[i*3]-pc[0])/pr, py=(ppos[i*3+1]-pc[1])/pr, pz=(ppos[i*3+2]-pc[2])/pr;
+            int best = -1; float bd = 1e18f;
+            for (int j = 0; j < N; j++) {
+                if (!gok[j]) continue;
+                if (round == 0 && used[j]) continue;        // 严格轮：不许抢已占的骨骼
+                float qx=(gpos[j*3]-gc[0])/gr, qy=(gpos[j*3+1]-gc[1])/gr, qz=(gpos[j*3+2]-gc[2])/gr;
+                if (px > 0.15f && qx < -0.15f) continue;    // 左右不许互换
+                if (px < -0.15f && qx > 0.15f) continue;
+                float dx=px-qx, dy=py-qy, dz=pz-qz;
+                float d = dx*dx+dy*dy+dz*dz;
+                if (d < bd) { bd = d; best = j; }
+            }
+            if (best >= 0 && bd < thr[round]) {
+                gidx[i] = best; used[best] = 1; matched++;
+                LOGI("rigid: posmap[%2d] %-18s -> bone[%2d](%s) d2=%.4f r%d",
+                     i, pnames[i].c_str(), best, gnorm[best].c_str(), bd, round);
+            } else if (round == 1) {
+                LOGI("rigid: posmap[%2d] %-18s -> none (best d2=%.4f)", i, pnames[i].c_str(), bd);
+            }
         }
-        if (best >= 0 && bd < 0.09f) {
-            gidx[i] = best;
-            matched++;
-            LOGI("rigid: posmap[%2d] %-18s -> bone[%2d](%s) d2=%.4f",
-                 i, pnames[i].c_str(), best, gnorm[best].c_str(), bd);
-        } else {
-            LOGI("rigid: posmap[%2d] %-18s -> none (best d2=%.4f)", i, pnames[i].c_str(), bd);
-        }
+        if (matched >= nb * 3 / 4) break;
     }
     LOGI("rigid: position matching done, %d/%d mapped", matched, nb);
     return matched;
