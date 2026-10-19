@@ -2904,19 +2904,26 @@ static void build_target_list(Il2CppObject* playerRoot) {
     const MethodInfo* gb = find_method_any(SMRCls, "get_bones");
     std::string out;
     std::vector<Il2CppObject*> smrs;
+    std::map<std::string,int> bestOfRoot;
     int idx = 0;
     for (size_t i = 0; i < list.size(); i++) {
         Il2CppObject* s = list[i].smr;
         if (!s || !*(void**)((char*)s + 16)) continue;
         Il2CppArray* a = gb ? (Il2CppArray*)invoke_inst(gb, s, nullptr) : nullptr;
         int nb = a ? (int)a->max_length : 0;
-        if (nb < 12) continue;                 // 跳过脸骨、手指这种小骨架
+        if (nb < 20) continue;                 // 跳过脸骨、手指这种小骨架
         std::string ch = list[i].chain;
         std::string leaf = ch;
         size_t p = ch.find_last_of('/');
         if (p != std::string::npos) leaf = ch.substr(p + 1);
         Il2CppObject* root = find_role_root(s);
         std::string rootName = root ? obj_name(root) : std::string();
+        // 同一个角色下只保留骨骼最多的那个部件，避免列表里一堆同一角色的条目
+        if (!rootName.empty()) {
+            std::map<std::string,int>::iterator hit = bestOfRoot.find(rootName);
+            if (hit != bestOfRoot.end() && hit->second >= nb) continue;
+            bestOfRoot[rootName] = nb;
+        }
         bool isPlayer = (playerRoot != nullptr) && under_root_chain(s, playerRoot);
         char line[360];
         snprintf(line, sizeof(line), "%d|%d|%s|%s|%d\n",
@@ -3659,6 +3666,7 @@ static Il2CppObject* g_rigidRoot = nullptr;
 
 static int spawn_rigid_parts(Il2CppObject* origSmr) {
     LOGI("rigid: begin");
+    destroy_our_smrs();          // 先清掉上一轮建的块，否则每选一次就叠一层
     Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
     if (!SMRCls) { LOGE("rigid: no SMR class"); return 0; }
     const MethodInfo* gb = find_method_any(SMRCls, "get_bones");
@@ -4500,6 +4508,7 @@ Java_com_moss_modelmod_HookEntry_getTargets(JNIEnv* env, jclass) {
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_moss_modelmod_HookEntry_selectTarget(JNIEnv*, jclass, jint idx) {
+    destroy_our_smrs();          // 换目标前把旧的清干净
     g_tgt_sel = (int)idx;
     g_gpu_tried = 0;
     g_cube_done = 0;
