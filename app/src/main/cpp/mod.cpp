@@ -1783,7 +1783,10 @@ static void* worker(void*) {
         std::vector<Fingerprint> list;
         collect_fingerprints(SMRCls, list);
         LOGI("scan #%d: %zu smrs", round, list.size());
-        if (round == 8) probe_native_mesh();
+        {
+            static int probed = 0;
+            if (!probed && list.size() >= 10) { probed = 1; probe_native_mesh(); }
+        }
 
         int done = 0;
         for (auto& f : list) {
