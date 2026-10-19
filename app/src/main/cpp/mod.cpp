@@ -2306,6 +2306,7 @@ struct SkinPart {
     std::vector<Il2CppObject*> bones;// 游戏骨骼 Transform
     Il2CppArray* varray = nullptr;   // 复用顶点数组，避免每帧 array_new 撑爆 GC
     std::vector<float> outBuf;
+    std::vector<float> lastMats;     // 上一帧骨骼矩阵，没变就跳过 set_vertices
 };
 static std::vector<SkinPart> g_skinParts;
 static std::vector<std::string> g_lastBoneNames;
