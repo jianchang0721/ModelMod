@@ -1285,6 +1285,17 @@ static void do_patch_tick() {
         }
     }
 
+    // 场景切了引擎会把挂上去的对象销毁掉，托管对象还在但 m_CachedPtr 归 0，
+    // 这时候得自己把标记重置，不然就一直不再重建
+    if (g_last_model_go) {
+        void* np = *(void**)((char*)g_last_model_go + 16);
+        if (!np) {
+            LOGI("model: engine destroyed previous one, rebuild");
+            g_last_model_go = nullptr;
+            g_cube_done = 0;
+        }
+    }
+
     // 已经干完活就不再全量扫描，别再拖主线程
     if (g_cube_done >= 1) return;
 
