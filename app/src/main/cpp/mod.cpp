@@ -1040,6 +1040,7 @@ static void ensure_model_visible();
 static Il2CppObject* find_role_root(Il2CppObject* smr);
 static bool under_player_root(Il2CppObject* smr);
 static int spawn_parts_loop(Il2CppObject* smr);
+static void update_skin_parts();
 static void* g_orig_canvas = nullptr;
 static void* g_orig_inst1 = nullptr;
 static void* g_orig_inst2 = nullptr;
@@ -1454,6 +1455,14 @@ static void main_tick() {
     syscall(__NR_clock_gettime, CLOCK_MONOTONIC, &now);   // 绕开自己的 hook
     long ms = (long)(now.tv_sec - last.tv_sec) * 1000L + (now.tv_nsec - last.tv_nsec) / 1000000L;
     ensure_model_visible();
+
+    // CPU 蒙皮：约 20fps 刷一次，全速跑太重
+    {
+        static int skinTick = 0;
+        if ((skinTick++ % 3) == 0) {
+            update_skin_parts();
+        }
+    }
 
     // 开关切换：立即处理，不等 3 秒
     if (g_hide_main_pending) {
@@ -2284,6 +2293,159 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
 }
 
 
+
+// ---------------------------------------------------------------
+// CPU 蒙皮：读 MMS2 的骨骼权重，每 N 帧算一次顶点
+// ---------------------------------------------------------------
+struct SkinPart {
+    Il2CppObject* mesh = nullptr;
+    int nv = 0;
+    std::vector<float> basePos;      // 原始顶点（模型空间）
+    std::vector<uint8_t> joints;     // nv*4
+    std::vector<float> weights;      // nv*4
+    std::vector<float> bindT;        // nb*3 每骨骼 bind 平移
+    std::vector<Il2CppObject*> bones;// 游戏骨骼 Transform
+};
+static std::vector<SkinPart> g_skinParts;
+static std::vector<std::string> g_lastBoneNames;
+
+// 递归找子 Transform（按名字）
+static Il2CppObject* find_child_by_name(Il2CppObject* root, const char* name, int depth = 0) {
+    if (!root || depth > 8) return nullptr;
+    Il2CppClass* TransCls = find_class_any("UnityEngine", "Transform");
+    if (!TransCls) return nullptr;
+    std::string rn = obj_name(root);
+    if (rn == name) return root;
+    const MethodInfo* getCount = find_method(TransCls, "get_childCount", 0);
+    const MethodInfo* getChild = find_method(TransCls, "GetChild", 1);
+    if (!getCount || !getChild) return nullptr;
+    Il2CppObject* cobj = invoke_inst(getCount, root, nullptr);
+    int cnt = cobj ? *(int*)((char*)cobj + 16) : 0;
+    for (int i = 0; i < cnt && i < 200; i++) {
+        void* a[1] = { &i };
+        Il2CppObject* ch = invoke_inst(getChild, root, a);
+        if (!ch) continue;
+        Il2CppObject* r = find_child_by_name(ch, name, depth + 1);
+        if (r) return r;
+    }
+    return nullptr;
+}
+
+// 读 MMS2 的骨骼部分（在 spawn_one_part 读完顶点/索引之后调用）
+static bool load_skin_part(FILE* f, Il2CppObject* mesh, int nv, int ni,
+                           Il2CppObject* roleRoot) {
+    uint32_t nb = 0;
+    if (fread(&nb, 4, 1, f) != 1 || nb == 0 || nb > 128) return false;
+
+    std::vector<std::string> names;
+    for (uint32_t i = 0; i < nb; i++) {
+        uint32_t len = 0;
+        if (fread(&len, 4, 1, f) != 1 || len > 128) return false;
+        std::vector<char> buf(len + 1, 0);
+        if (fread(buf.data(), 1, len, f) != len) return false;
+        names.push_back(std::string(buf.data(), len));
+    }
+    uint32_t jc = 0;
+    if (fread(&jc, 4, 1, f) != 1) return false;
+    if (jc != nb) return false;
+
+    std::vector<uint8_t> joints((size_t)nv * 4);
+    std::vector<float> weights((size_t)nv * 4);
+    for (int i = 0; i < nv; i++) {
+        uint8_t j4[4]; float w4[4];
+        if (fread(j4, 1, 4, f) != 4) return false;
+        if (fread(w4, 4, 4, f) != 4) return false;
+        for (int k = 0; k < 4; k++) { joints[i*4+k] = j4[k]; weights[i*4+k] = w4[k]; }
+    }
+    std::vector<float> ibm((size_t)nb * 16);
+    if (fread(ibm.data(), 4, (size_t)nb * 16, f) != (size_t)nb * 16) return false;
+
+    SkinPart sp;
+    sp.mesh = mesh;
+    sp.nv = nv;
+    sp.joints = joints;
+    sp.weights = weights;
+    sp.bindT.resize((size_t)nb * 3);
+    for (uint32_t i = 0; i < nb; i++) {
+        sp.bindT[i*3+0] = -ibm[i*16+12];
+        sp.bindT[i*3+1] = -ibm[i*16+13];
+        sp.bindT[i*3+2] = -ibm[i*16+14];
+    }
+    // 找游戏骨骼
+    int found = 0;
+    for (uint32_t i = 0; i < nb; i++) {
+        Il2CppObject* b = find_child_by_name(roleRoot, names[i].c_str());
+        sp.bones.push_back(b);
+        if (b) found++;
+    }
+    LOGI("skin: %d bones, found %d/%u", nv, found, nb);
+    g_skinParts.push_back(sp);
+    g_lastBoneNames = names;
+    return found > 0;
+}
+
+// 每帧把蒙皮后的顶点写回 mesh
+static void update_skin_parts() {
+    if (g_skinParts.empty()) return;
+    Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
+    Il2CppClass* V3Cls   = find_class_any("UnityEngine", "Vector3");
+    Il2CppClass* TransCls= find_class_any("UnityEngine", "Transform");
+    if (!MeshCls || !V3Cls || !TransCls) return;
+
+    const MethodInfo* getL2W   = find_method(TransCls, "get_localToWorldMatrix", 0);
+    const MethodInfo* setVerts = find_method(MeshCls, "set_vertices", 1);
+    if (!getL2W || !setVerts) return;
+
+    for (auto& sp : g_skinParts) {
+        if (!sp.mesh) continue;
+        if (sp.basePos.empty()) {
+            // 第一次：读回原始顶点
+            const MethodInfo* getV = find_method(MeshCls, "get_vertices", 0);
+            if (!getV) continue;
+            Il2CppArray* arr = (Il2CppArray*)invoke_inst(getV, sp.mesh, nullptr);
+            if (!arr || arr->max_length != (size_t)sp.nv) continue;
+            sp.basePos.resize((size_t)sp.nv * 3);
+            memcpy(sp.basePos.data(), array_addr(arr, 12, 0), (size_t)sp.nv * 12);
+        }
+
+        // 骨骼矩阵
+        size_t nb = sp.bones.size();
+        std::vector<float> mats(nb * 16, 0.0f);
+        for (size_t b = 0; b < nb; b++) {
+            if (!sp.bones[b]) { mats[b*16+0] = 1; mats[b*16+5] = 1; mats[b*16+10] = 1; mats[b*16+15] = 1; continue; }
+            Il2CppObject* m = invoke_inst(getL2W, sp.bones[b], nullptr);
+            if (!m) continue;
+            const float* mm = (const float*)((char*)m + 16);
+            for (int k = 0; k < 16; k++) mats[b*16+k] = mm[k];
+        }
+
+        std::vector<float> out((size_t)sp.nv * 3);
+        for (int v = 0; v < sp.nv; v++) {
+            float x = sp.basePos[v*3+0], y = sp.basePos[v*3+1], z = sp.basePos[v*3+2];
+            float ox = 0, oy = 0, oz = 0;
+            for (int k = 0; k < 4; k++) {
+                float w = sp.weights[v*4+k];
+                if (w <= 0.0001f) continue;
+                int b = sp.joints[v*4+k];
+                if (b < 0 || (size_t)b >= nb) continue;
+                float px = x - sp.bindT[b*3+0];
+                float py = y - sp.bindT[b*3+1];
+                float pz = z - sp.bindT[b*3+2];
+                const float* m = &mats[b*16];
+                ox += w * (m[0]*px + m[4]*py + m[8]*pz + m[12]);
+                oy += w * (m[1]*px + m[5]*py + m[9]*pz + m[13]);
+                oz += w * (m[2]*px + m[6]*py + m[10]*pz + m[14]);
+            }
+            out[v*3+0] = ox; out[v*3+1] = oy; out[v*3+2] = oz;
+        }
+
+        Il2CppArray* va = g_api.array_new(V3Cls, sp.nv);
+        memcpy(array_addr(va, 12, 0), out.data(), (size_t)sp.nv * 12);
+        void* a[1] = { va };
+        invoke_inst(setVerts, sp.mesh, a);
+    }
+}
+
 // ---------------------------------------------------------------
 // 多部位加载：custom_0..custom_3 每个都是一个材质组 + 自己的贴图
 // ---------------------------------------------------------------
@@ -2292,7 +2454,9 @@ static Il2CppObject* spawn_one_part(Il2CppObject* smr, Il2CppObject* roleRoot,
     FILE* f = fopen(meshPath, "rb");
     if (!f) { LOGE("part: open fail %s", meshPath); return nullptr; }
     char magic[4]; uint32_t nv = 0, ni = 0, flags = 0;
-    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MMSH", 4) != 0) { fclose(f); return nullptr; }
+    if (fread(magic, 1, 4, f) != 4) { fclose(f); return nullptr; }
+    bool isSkinPart = (memcmp(magic, "MMS2", 4) == 0);
+    if (!isSkinPart && memcmp(magic, "MMSH", 4) != 0) { fclose(f); return nullptr; }
     fread(&nv, 4, 1, f); fread(&ni, 4, 1, f); fread(&flags, 4, 1, f);
     if (nv == 0 || nv > 300000 || ni == 0) { fclose(f); return nullptr; }
 
@@ -2302,8 +2466,7 @@ static Il2CppObject* spawn_one_part(Il2CppObject* smr, Il2CppObject* roleRoot,
     fread(nrm.data(), 4, nv * 3, f);
     fread(uv.data(),  4, nv * 2, f);
     fread(idx.data(), 4, ni, f);
-    fclose(f);
-    LOGI("part: %s nv=%u ni=%u", meshPath, nv, ni);
+    LOGI("part: %s nv=%u ni=%u skin=%d", meshPath, nv, ni, (int)isSkinPart);
 
     Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
     Il2CppClass* V3Cls   = find_class_any("UnityEngine", "Vector3");
@@ -2338,6 +2501,11 @@ static Il2CppObject* spawn_one_part(Il2CppObject* smr, Il2CppObject* roleRoot,
     if (setN) { void* a[1] = { na }; invoke_inst(setN, mesh, a); }
     if (setU) { void* a[1] = { ua }; invoke_inst(setU, mesh, a); }
     if (setT) { void* a[1] = { ia }; invoke_inst(setT, mesh, a); }
+
+    if (isSkinPart && mesh) {
+        load_skin_part(f, mesh, (int)nv, (int)ni, roleRoot);
+    }
+    fclose(f);
 
     const MethodInfo* goCtor = find_method(GOCls, ".ctor", 1);
     if (!goCtor) return nullptr;
