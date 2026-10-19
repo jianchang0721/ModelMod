@@ -60,6 +60,7 @@ static const int RULE_COUNT = (int)(sizeof(g_rules) / sizeof(g_rules[0]));
 
 struct Vec3 { float x, y, z; };
 struct Color4 { float r, g, b, a; };
+struct Quat { float x, y, z, w; };
 
 Il2CppApi g_api{};
 static JavaVM* g_vm = nullptr;
@@ -2139,6 +2140,15 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
         // 自动缩放：不管模型是 0.08 单位还是 20 单位，都拉到 1.7 米高
         float k = 1.7f / (modelH * psc);
         if (setLScale) { Vec3 s = {k, k, k}; void* b[1] = { &s }; invoke_inst(setLScale, gt, b); }
+
+        // MMD/glTF 模型多数面朝 -Z，Unity 是 +Z，转 180
+        const MethodInfo* setLRot = find_method(TransCls, "set_localRotation", 1);
+        if (setLRot) {
+            Quat q = {0.0f, 1.0f, 0.0f, 0.0f};
+            void* b[1] = { &q };
+            invoke_inst(setLRot, gt, b);
+            LOGI("mmesh: rotated 180 on Y");
+        }
 
         if (g_replace_mode) {
             // 替换模式：模型站在角色原点，再把原模型的 SMR 关掉
