@@ -1721,6 +1721,7 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
     }
     if (!f) { LOGE("mmesh: no usable file"); return nullptr; }
     char magic[4]; uint32_t nv = 0, ni = 0, flags = 0;
+    if (fread(magic, 1, 4, f) != 4) { fclose(f); LOGE("mmesh: header short"); return nullptr; }
     fread(&nv, 4, 1, f); fread(&ni, 4, 1, f); fread(&flags, 4, 1, f);
     LOGI("mmesh: nv=%u ni=%u flags=%u", nv, ni, flags);
     if (nv == 0 || nv > 300000 || ni == 0) { fclose(f); return nullptr; }
