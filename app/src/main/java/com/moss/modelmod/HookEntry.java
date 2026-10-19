@@ -18,6 +18,7 @@ import android.widget.Switch;
 import android.widget.TextView;
 
 import java.io.File;
+import java.io.FileWriter;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -36,6 +37,19 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static boolean overlayShown = false;
     private static int hideMask = 0x3F;
+    private static String hookLogPath = null;
+
+    private static void log(String msg) {
+        XposedBridge.log(TAG + msg);
+        if (hookLogPath != null) {
+            try {
+                FileWriter fw = new FileWriter(hookLogPath, true);
+                fw.write(msg + "\n");
+                fw.close();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
@@ -48,7 +62,13 @@ public class HookEntry implements IXposedHookLoadPackage {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         Context ctx = (Context) param.args[0];
-                        if (ctx != null) loadNative(ctx);
+                        if (ctx == null) return;
+                        try {
+                            hookLogPath = new File(ctx.getFilesDir(), "hook.log").getAbsolutePath();
+                        } catch (Throwable ignored) {
+                        }
+                        log("attach, logPath=" + hookLogPath);
+                        loadNative(ctx);
                     }
                 });
 
@@ -58,6 +78,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                     protected void afterHookedMethod(MethodHookParam param) {
                         final Activity act = (Activity) param.thisObject;
                         if (act == null) return;
+                        log("activity onCreate: " + act.getClass().getName());
                         new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
                             @Override
                             public void run() {
@@ -66,7 +87,12 @@ public class HookEntry implements IXposedHookLoadPackage {
                                 try {
                                     showOverlay(act);
                                 } catch (Throwable t) {
-                                    XposedBridge.log(TAG + "overlay fail: " + t);
+                                    log("overlay fail: " + t);
+                                    StringBuilder sb = new StringBuilder();
+                                    for (StackTraceElement e : t.getStackTrace()) {
+                                        sb.append("\n  at ").append(e.toString());
+                                    }
+                                    log(sb.toString());
                                 }
                             }
                         }, 6000);
@@ -79,19 +105,24 @@ public class HookEntry implements IXposedHookLoadPackage {
             ApplicationInfo ai = ctx.getPackageManager().getApplicationInfo(SELF, 0);
             String so = ai.nativeLibraryDir + "/libmodelmod.so";
             System.load(so);
-            XposedBridge.log(TAG + "native loaded: " + so);
+            log("native loaded: " + so);
 
             String logPath = new File(ctx.getFilesDir(), "modelmod.log").getAbsolutePath();
             setLogPath(logPath);
             setHideMask(hideMask);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "native load failed: " + t);
+            log("native load failed: " + t);
         }
     }
 
     private void showOverlay(Activity act) {
+        log("showOverlay start, act=" + act.getClass().getName());
+
         WindowManager wm = (WindowManager) act.getSystemService(Context.WINDOW_SERVICE);
-        if (wm == null) return;
+        if (wm == null) {
+            log("showOverlay: no WindowManager");
+            return;
+        }
 
         LinearLayout root = new LinearLayout(act);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -118,7 +149,9 @@ public class HookEntry implements IXposedHookLoadPackage {
                 else hideMask &= ~(1 << bit);
                 try {
                     setHideMask(hideMask);
-                } catch (Throwable ignored) {
+                    log("mask -> 0x" + Integer.toHexString(hideMask));
+                } catch (Throwable t) {
+                    log("setHideMask fail: " + t);
                 }
             });
             root.addView(sw);
@@ -130,10 +163,15 @@ public class HookEntry implements IXposedHookLoadPackage {
                 WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT);
-        lp.token = act.getWindow().getDecorView().getWindowToken();
         lp.gravity = Gravity.TOP | Gravity.START;
         lp.x = 40;
         lp.y = 240;
+
+        View decor = act.getWindow().getDecorView();
+        if (decor != null) {
+            lp.token = decor.getWindowToken();
+            log("token=" + lp.token);
+        }
 
         title.setOnTouchListener(new View.OnTouchListener() {
             private int sx, sy;
@@ -151,7 +189,10 @@ public class HookEntry implements IXposedHookLoadPackage {
                     case MotionEvent.ACTION_MOVE:
                         lp.x = sx + (int) (e.getRawX() - dx);
                         lp.y = sy + (int) (e.getRawY() - dy);
-                        wm.updateViewLayout(root, lp);
+                        try {
+                            wm.updateViewLayout(root, lp);
+                        } catch (Throwable ignored) {
+                        }
                         return true;
                 }
                 return false;
@@ -159,6 +200,6 @@ public class HookEntry implements IXposedHookLoadPackage {
         });
 
         wm.addView(root, lp);
-        XposedBridge.log(TAG + "overlay shown");
+        log("overlay shown OK");
     }
 }
