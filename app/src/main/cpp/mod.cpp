@@ -2064,8 +2064,9 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
         Il2CppClass* MatCls    = find_class_any("UnityEngine", "Material");
         const MethodInfo* shFind = ShaderCls ? find_method(ShaderCls, "Find", 1) : nullptr;
         if (shFind && MatCls) {
-            const char* names[] = {"Unlit/Color", "Sprites/Default", "UI/Default", "Mobile/Diffuse"};
-            for (int i = 0; i < 4 && !mat; i++) {
+            const char* names[] = {"Unlit/Texture", "Mobile/Diffuse", "Legacy Shaders/Diffuse",
+                                   "Sprites/Default", "UI/Default", "Unlit/Color"};
+            for (int i = 0; i < 6 && !mat; i++) {
                 void* a[1] = { g_api.string_new(names[i]) };
                 Il2CppObject* sh = invoke_static(shFind, a);
                 LOGI("mmesh: shader %s = %p", names[i], sh);
@@ -2107,6 +2108,9 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
                             size_t nbytes = (size_t)tw * th * 4;
                             std::vector<unsigned char> px(nbytes);
                             fread(px.data(), 1, nbytes, tf);
+                            LOGI("tex: px[0..3] = %u,%u,%u,%u | %u,%u,%u,%u",
+                                 px[0], px[1], px[2], px[3], px[nbytes/2], px[nbytes/2+1],
+                                 px[nbytes/2+2], px[nbytes/2+3]);
 
                             Il2CppClass* TexCls = find_class_any("UnityEngine", "Texture2D");
                             Il2CppClass* ByteCls = find_class_any("System", "Byte");
@@ -2122,6 +2126,20 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
                                     void* la[1] = { barr };
                                     invoke_inst(loadRaw, tex, la);
                                     if (apply) invoke_inst(apply, tex, nullptr);
+                                    // 诊断：UV 样本
+                                    {
+                                        const MethodInfo* gm = find_method(MeshCls, "get_uv", 0);
+                                        LOGI("tex: uv sample %s", gm ? "has get_uv" : "no get_uv");
+                                    }
+                                    // 显式按名字设一遍（有的 shader 的属性不是 _MainTex 也能兜住）
+                                    {
+                                        const MethodInfo* setTexStr = find_method(MatCls, "SetTexture", 2);
+                                        if (setTexStr) {
+                                            void* st[2] = { g_api.string_new("_MainTex"), tex };
+                                            invoke_inst(setTexStr, mat, st);
+                                            LOGI("tex: SetTexture(_MainTex) done");
+                                        }
+                                    }
                                     const MethodInfo* setMain = find_method(MatCls, "set_mainTexture", 1);
                                     if (setMain) { void* sa[1] = { tex }; invoke_inst(setMain, mat, sa); LOGI("tex: mainTexture set %p", tex); }
                                     else LOGE("tex: no set_mainTexture");
