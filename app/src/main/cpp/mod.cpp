@@ -1322,19 +1322,25 @@ static void do_patch_tick() {
 
     // 不管 worker 是否已隐藏，前 3 个匹配的 SMR 直接造 cube（当前主线，安全）
     // 选靶子：优先真玩家角色（PlayerRoot），其次角色池，最后随便一个 Body
+    // 只认你自己的角色：PlayerRoot 下的 Body；预览/池子（VisualPool）全跳过
+    // （挂到池子上等于挂到屏幕外，永远看不见）
     Il2CppObject* pick = nullptr;
     const char* chainOf = nullptr;
     for (auto& f : list) {
-        if (f.chain.find("Body") == std::string::npos) continue;
-        if (f.chain.find("PlayerRoot") != std::string::npos) { pick = f.smr; chainOf = f.chain.c_str(); break; }
+        if (f.chain.find("PlayerRoot") != std::string::npos &&
+            f.chain.find("Body") != std::string::npos) {
+            pick = f.smr; chainOf = f.chain.c_str(); break;
+        }
     }
-    if (!pick) for (auto& f : list) {
-        if (f.chain.find("Body") == std::string::npos) continue;
-        if (f.chain.find("AvatarPoolRoot") != std::string::npos) { pick = f.smr; chainOf = f.chain.c_str(); break; }
-    }
-    if (!pick) for (auto& f : list) {
-        if (f.chain.find("Body") == std::string::npos) continue;
-        pick = f.smr; chainOf = f.chain.c_str(); break;
+    if (!pick) {
+        for (auto& f : list) {
+            if (f.chain.find("NPCRoot") == std::string::npos &&
+                f.chain.find("VisualPool") == std::string::npos &&
+                f.chain.find("AvatarPoolRoot") == std::string::npos &&
+                f.chain.find("Body") != std::string::npos) {
+                pick = f.smr; chainOf = f.chain.c_str(); break;
+            }
+        }
     }
 
     int done = 0;
