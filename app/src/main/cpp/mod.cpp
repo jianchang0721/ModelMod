@@ -885,6 +885,18 @@ static void hk_canvasupdate(void* m) {
 }
 
 static void* g_orig_setactive = nullptr;
+static void* g_orig_getname = nullptr;
+static void* g_orig_gettrans = nullptr;
+
+static Il2CppString* hk_getname(void* self, void* m) {
+    main_tick();
+    return ((Il2CppString*(*)(void*, void*))g_orig_getname)(self, m);
+}
+
+static Il2CppObject* hk_gettrans(void* self, void* m) {
+    main_tick();
+    return ((Il2CppObject*(*)(void*, void*))g_orig_gettrans)(self, m);
+}
 
 static void hk_setactive(void* self, void* m, uint8_t v) {
     static int cnt = 0;
@@ -1313,6 +1325,32 @@ static void* worker(void*) {
                 if (sh) {
                     void* o = try_hook(sh, *(void**)sa, (void*)hk_setactive, "GameObject.SetActive");
                     if (o) { g_orig_setactive = o; LOGI("setactive hook ok"); }
+                }
+            }
+        }
+    }
+
+    // Object.get_name / Component.get_transform：返回指针，ABI 简单，调用量大
+    {
+        Il2CppClass* OB = find_class_any("UnityEngine", "Object");
+        if (OB) {
+            const MethodInfo* nm = find_method(OB, "get_name", 0);
+            if (nm) {
+                void* sh = load_so_by_name("libshadowhook.so");
+                if (sh) {
+                    void* o = try_hook(sh, *(void**)nm, (void*)hk_getname, "Object.get_name");
+                    if (o) { g_orig_getname = o; LOGI("getname hook ok"); }
+                }
+            }
+        }
+        Il2CppClass* CO = find_class_any("UnityEngine", "Component");
+        if (CO) {
+            const MethodInfo* gt = find_method(CO, "get_transform", 0);
+            if (gt) {
+                void* sh = load_so_by_name("libshadowhook.so");
+                if (sh) {
+                    void* o = try_hook(sh, *(void**)gt, (void*)hk_gettrans, "Component.get_transform");
+                    if (o) { g_orig_gettrans = o; LOGI("gettrans hook ok"); }
                 }
             }
         }
