@@ -1996,12 +1996,29 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
     Il2CppObject* mr = invoke_inst(addComp, go, t2);
     LOGI("mmesh: MeshRenderer=%p", mr);
 
-    // 一次性地 dump 游戏骨骼名字，为后面把模型绑到游戏骨骼做准备
+    // 一次性地 dump 游戏骨骼名字（要主 Body，不要 _PX 描边层，那层挂的是脸部表情骨）
     {
         static int dumped = 0;
-        if (!dumped && smr) {
+        Il2CppObject* dumpTarget = smr;
+        if (!dumped) {
+            std::string ch = smr ? obj_name(smr) : "";
+            if (ch.find("_PX") != std::string::npos) {
+                Il2CppClass* SMRc = g_smrCls ? g_smrCls : find_class_any("UnityEngine", "SkinnedMeshRenderer");
+                std::vector<Fingerprint> all;
+                if (SMRc) collect_fingerprints(SMRc, all);
+                for (auto& ff : all) {
+                    if (ff.chain.find("Body") != std::string::npos &&
+                        ff.chain.find("_PX") == std::string::npos) {
+                        dumpTarget = ff.smr;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!dumped && dumpTarget) {
             dumped = 1;
-            Il2CppClass* smrCls2 = g_api.object_get_class(smr);
+            Il2CppClass* smrCls2 = g_api.object_get_class(dumpTarget);
+            smr = dumpTarget;
             const MethodInfo* getBones2 = find_method(smrCls2, "get_bones", 0);
             Il2CppArray* bones = getBones2 ? (Il2CppArray*)invoke_inst(getBones2, smr, nullptr) : nullptr;
             if (bones) {
