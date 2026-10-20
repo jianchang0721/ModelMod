@@ -4180,6 +4180,44 @@ static void dump_everything() {
     // 标记到 log，方便确认执行了
 }
 
+
+// ---------------------------------------------------------------
+// 基于 bonedb.txt 人工分析得出的硬映射（只对这名角色有效，名字对不上时兜底）
+// 依据：11001_U_1/Body 的骨骼树
+//   L Calf → Bone19 → Bone18 → Bone17       (脚 / 脚趾 / 末端)
+//   R Calf → Bone16 → Bone15 → Bone14
+//   Bone57 是独立根，wpos 在左手末端
+//   Bone38 是独立根，wpos 在右手末端
+// ---------------------------------------------------------------
+static const struct { const char* target; int slot; } kHardMap[] = {
+    {"bone19",  8},   // L Foot
+    {"bone18",  9},   // L Toe0
+    {"bone16", 12},   // R Foot
+    {"bone15", 13},   // R Toe0
+    {"bone57", 17},   // L Hand
+    {"bone38", 21},   // R Hand
+};
+
+static int apply_hard_map(const std::vector<std::string>& gnorm, int N, std::vector<int>& gidx) {
+    int added = 0;
+    int cnt = (int)(sizeof(kHardMap) / sizeof(kHardMap[0]));
+    for (int h = 0; h < cnt; h++) {
+        int slot = kHardMap[h].slot;
+        if (slot < 0 || slot >= 22) continue;
+        if (gidx[slot] >= 0) continue;                 // 名字已经匹配上了就别覆盖
+        for (int j = 0; j < N; j++) {
+            if (gnorm[j] == kHardMap[h].target) {
+                gidx[slot] = j;
+                added++;
+                LOGI("rigid: hardmap[%2d] <- bone[%d](%s)", slot, j, gnorm[j].c_str());
+                break;
+            }
+        }
+    }
+    LOGI("rigid: hard map added %d", added);
+    return added;
+}
+
 static Il2CppObject* g_rigidRoot = nullptr;
 
 static int spawn_rigid_parts(Il2CppObject* origSmr) {
@@ -4265,7 +4303,10 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
     found = map_bones(ourNames, gnorm, &gidx);
     LOGI("rigid: name-mapped %d/%d bones, target rig has %d", found, (int)ourNames.size(), N);
 
-    // 名字对不上的，从已匹配的父骨骼沿子节点往下捞
+    // 先按 bonedb 分析出的硬映射补
+    apply_hard_map(gnorm, N, gidx);
+
+    // 剩下的再从已匹配的父骨骼沿子节点往下捞
     {
         Il2CppClass* TrCls = find_class_any("UnityEngine", "Transform");
         int h = match_by_hierarchy(TrCls, bones, N, gidx);
@@ -4537,7 +4578,28 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
             }
             float ls = kBase / ws;
             if (setLScl) { Vec3 v = {ls, ls, ls}; void* a[1]={&v}; invoke_inst(setLScl, gt, a); }
-            if (setLRot) { Quat q = {0,0,0,1}; void* a[1]={&q}; invoke_inst(setLRot, gt, a); }
+
+            // ---- 关键：抵消骨骼自身的 bind 旋转 ----
+            // 块的顶点是"模型空间"的偏移 (v-p)，如果 localRotation 是单位矩阵，
+            // 世界朝向就跟着骨骼的旋转走（Bip001 Pelvis 的 lrot 是 (-0.518,0.491,0.493,0.497)，
+            // 根本不是单位）——表现为位置对、方向全歪。
+            // 设成 inverse(bone.worldRotation) 之后：R * R^-1 = I，偏移就保持模型空间朝向。
+            {
+                const MethodInfo* getRot = find_method_any(TransCls, "get_rotation");
+                Quat inv = {0, 0, 0, 1};
+                if (getRot) {
+                    Il2CppObject* rq = invoke_inst(getRot, bones[tgt], nullptr);
+                    if (rq) {
+                        float qx = *(float*)((char*)rq + 16);
+                        float qy = *(float*)((char*)rq + 20);
+                        float qz = *(float*)((char*)rq + 24);
+                        float qw = *(float*)((char*)((char*)rq) + 28);
+                        // 单位四元数的逆 = 共轭
+                        inv.x = -qx; inv.y = -qy; inv.z = -qz; inv.w = qw;
+                    }
+                }
+                if (setLRot) { void* a[1] = { &inv }; invoke_inst(setLRot, gt, a); }
+            }
             if (setLPos) { Vec3 v = {0,0,0}; void* a[1]={&v}; invoke_inst(setLPos, gt, a); }
 
             g_ourSmrs.insert(go);
