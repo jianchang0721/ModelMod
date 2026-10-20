@@ -438,9 +438,13 @@ public class HookEntry implements IXposedHookLoadPackage {
                         float ny = e.getRawY() - dy;
                         int sw2 = act.getResources().getDisplayMetrics().widthPixels;
                         int sh2 = act.getResources().getDisplayMetrics().heightPixels;
-                        // 至少留 80px 在屏幕里，别拖出去就找不回来了
-                        nx = Math.max(-600f, Math.min(nx, sw2 - 80f));
-                        ny = Math.max(0f, Math.min(ny, sh2 - 80f));
+                        int vw = root.getWidth()  > 0 ? root.getWidth()  : 360;
+                        int vh = root.getHeight() > 0 ? root.getHeight() : 420;
+                        // 全程可见：左上角不进负区，右下角不出屏
+                        float maxX = Math.max(0f, sw2 - vw);
+                        float maxY = Math.max(0f, sh2 - vh);
+                        nx = Math.max(0f, Math.min(nx, maxX));
+                        ny = Math.max(0f, Math.min(ny, maxY));
                         root.setX(nx);
                         root.setY(ny);
                         moved = true;
@@ -474,13 +478,25 @@ public class HookEntry implements IXposedHookLoadPackage {
             }
         });
 
-        act.addContentView(root, flp);
+        // v146: 挂到 DecorView（不是 content view）。
+        // 挂在 content view 里，往上每一层都可能 clipChildren=true，
+        // 拖到边界外就被裁掉 —— 表现就是"看不见但还能点"，点一下展开又重新布局才回来。
+        ViewGroup decor = null;
+        try {
+            decor = (ViewGroup) act.getWindow().getDecorView();
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "decorview fail: " + t);
+        }
+        if (decor != null) decor.addView(root, flp);
+        else act.addContentView(root, flp);
 
-        // 允许拖出容器边界
+        // 沿父链一路关掉裁剪，别只关一层
         ViewParent par = root.getParent();
-        if (par instanceof ViewGroup) {
+        int pdepth = 0;
+        while (par instanceof ViewGroup && pdepth++ < 10) {
             ((ViewGroup) par).setClipChildren(false);
             ((ViewGroup) par).setClipToPadding(false);
+            par = par.getParent();
         }
 
         XposedBridge.log(TAG + "overlay added");
