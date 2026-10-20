@@ -3730,7 +3730,7 @@ static int match_bones_by_position(const char* dir,
     for (int i = 0; i < nb; i++) if (gidx[i] >= 0) { used[gidx[i]] = 1; matched++; }
 
     // 两轮：先严格一对一（阈值 0.03），不够再放宽（0.09，允许重复）
-    const float thr[2] = {0.03f, 0.09f};
+    const float thr[2] = {0.03f, 0.14f};
     for (int round = 0; round < 2; round++) {
         for (int i = 0; i < nb; i++) {
             if (gidx[i] >= 0) continue;
@@ -3740,8 +3740,8 @@ static int match_bones_by_position(const char* dir,
                 if (!gok[j]) continue;
                 if (round == 0 && used[j]) continue;        // 严格轮：不许抢已占的骨骼
                 float qx=(gpos[j*3]-gc[0])/gr, qy=(gpos[j*3+1]-gc[1])/gr, qz=(gpos[j*3+2]-gc[2])/gr;
-                if (px > 0.15f && qx < -0.15f) continue;    // 左右不许互换
-                if (px < -0.15f && qx > 0.15f) continue;
+                if (px > 0.05f && qx < -0.05f) continue;    // 左右不许互换（收紧）
+                if (px < -0.05f && qx > 0.05f) continue;
                 float dx=px-qx, dy=py-qy, dz=pz-qz;
                 float d = dx*dx+dy*dy+dz*dz;
                 if (d < bd) { bd = d; best = j; }
@@ -3936,7 +3936,7 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
                 if (ShCls) {
                     const MethodInfo* sf = find_method(ShCls, "Find", 1);
                     if (sf) {
-                        const char* sn[] = {"Unlit/Texture", "Mobile/Diffuse", "Sprites/Default"};
+                        const char* sn[] = {"Mobile/Diffuse", "Unlit/Texture", "Sprites/Default"};
                         for (int q = 0; q < 3 && !mat; q++) {
                             void* a[1] = { g_api.string_new(sn[q]) };
                             Il2CppObject* sh = invoke_static(sf, a);
