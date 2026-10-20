@@ -4306,15 +4306,15 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
     // 先按 bonedb 分析出的硬映射补
     apply_hard_map(gnorm, N, gidx);
 
-    // 剩下的再从已匹配的父骨骼沿子节点往下捞
+    // 层级猜测已禁用。
+    // 上一版 hier[20] 把 R Forearm 配到了 Bone095，而 Bone095 的 wpos=(0.09,1.15,-7.08)
+    // 和 Bip001 R UpperArm 几乎完全重合 —— 那是肩膀上的装饰骨，不是前臂。
+    // 猜错一块，那块就整体飞到错误位置，表现为"碎一地"。
+    // 宁可少一块，不要错一块。
     {
-        Il2CppClass* TrCls = find_class_any("UnityEngine", "Transform");
-        int h = match_by_hierarchy(TrCls, bones, N, gidx);
-        if (h > 0) {
-            found = 0;
-            for (int i = 0; i < 22; i++) if (gidx[i] >= 0) found++;
-            LOGI("rigid: after hierarchy -> %d/22", found);
-        }
+        found = 0;
+        for (int i = 0; i < 22; i++) if (gidx[i] >= 0) found++;
+        LOGI("rigid: final mapped %d/22 (hierarchy guessing disabled)", found);
     }
     LOGI("rigid: STEP4 done");
     mapped_done:;
