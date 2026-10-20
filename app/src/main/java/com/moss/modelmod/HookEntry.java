@@ -282,7 +282,12 @@ public class HookEntry implements IXposedHookLoadPackage {
         btnRow4.setOrientation(LinearLayout.HORIZONTAL);
         TextView btnT4 = mkBtn(act, "验4 探测 readability/setter");
         btnT4.setOnClickListener(v -> { try { testMesh(4); toast(act, "探测中，看日志"); } catch (Throwable t) { } });
-        btnRow4.addView(btnT4, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        TextView btnT5 = mkBtn(act, "验5 原生蒙皮实验");
+        btnT5.setOnClickListener(v -> { try { testMesh(5); toast(act, "建测试网格，看日志"); } catch (Throwable t) { } });
+        LinearLayout.LayoutParams t4lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        t4lp.rightMargin = 6;
+        btnRow4.addView(btnT4, t4lp);
+        btnRow4.addView(btnT5, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         panel.addView(btnRow4);
 
         // v144: 渲染模式三选

@@ -1072,6 +1072,7 @@ static std::vector<unsigned char> g_bak_bw;
 static int g_bak_nv = 0;
 static Il2CppObject* g_bak_mesh = nullptr;
 static void run_mesh_test(int cmd);
+static void probe_native_skinning();
 
 static void* g_orig_canvas = nullptr;
 static void* g_orig_inst1 = nullptr;
@@ -4757,6 +4758,8 @@ static void run_mesh_test(int cmd) {
     if (!MeshCls || !V3Cls) { LOGE("test: class missing M=%p V3=%p", (void*)MeshCls, (void*)V3Cls); return; }
     int v3stride = array_elem_size(V3Cls, 12);
 
+    if (cmd == 5) { probe_native_skinning(); return; }
+
     if (cmd == 3) {
         if (!g_bak_mesh || g_bak_nv <= 0 || g_bak_verts.empty()) {
             LOGE("test3: nothing backed up");
@@ -4918,6 +4921,293 @@ static void run_mesh_test(int cmd) {
     const MethodInfo* rb = find_method_any(meshCls, "RecalculateBounds");
     if (rb) invoke_inst(rb, mesh, nullptr);
     LOGI("===== MESHTEST cmd=%d END =====", cmd);
+}
+
+// ===============================================================
+// v151: 原生蒙皮最小实验（GPT 大纲 任务 2-4）
+//
+// 目的只有一个：把 set_sharedMesh / set_bones 这两个闸门钉死。
+// 不碰游戏的任何对象，全部自己 new：
+//   GameObject + SkinnedMeshRenderer + 两根父子骨骼 + 12 顶点柱子
+//   底层 4 顶点绑 A，中间 4 顶点 A/B 各 50%，顶层 4 顶点绑 B
+// 每一步都打日志 + 读回验证，卡在哪一步就停在哪一步，
+// 不再用"方法查找失败"这种二手结论下判断。
+// ===============================================================
+static Il2CppObject* g_skinTestGo = nullptr;
+
+static void probe_native_skinning() {
+    LOGI("========== [SKIN] NATIVE SKIN PROBE BEGIN ==========");
+
+    Il2CppClass* SMRCls  = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+    Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
+    Il2CppClass* GOCls   = find_class_any("UnityEngine", "GameObject");
+    Il2CppClass* TrCls   = find_class_any("UnityEngine", "Transform");
+    Il2CppClass* V3Cls   = find_class_any("UnityEngine", "Vector3");
+    Il2CppClass* V2Cls   = find_class_any("UnityEngine", "Vector2");
+    Il2CppClass* I32Cls  = find_class_any("System", "Int32");
+    Il2CppClass* M4Cls   = find_class_any("UnityEngine", "Matrix4x4");
+    Il2CppClass* BWCls   = find_class_any("UnityEngine", "BoneWeight");
+    Il2CppClass* MRCls   = find_class_any("UnityEngine", "MeshRenderer");
+    Il2CppClass* MatCls  = find_class_any("UnityEngine", "Material");
+    Il2CppClass* ShCls   = find_class_any("UnityEngine", "Shader");
+    Il2CppClass* ObjCls  = find_class_any("UnityEngine", "Object");
+    if (!SMRCls || !MeshCls || !GOCls || !TrCls || !V3Cls || !I32Cls || !M4Cls || !BWCls) {
+        LOGE("[IL2CPP] skintest: class missing SMR=%p Mesh=%p GO=%p Tr=%p V3=%p I32=%p M4=%p BW=%p",
+             (void*)SMRCls, (void*)MeshCls, (void*)GOCls, (void*)TrCls,
+             (void*)V3Cls, (void*)I32Cls, (void*)M4Cls, (void*)BWCls);
+        return;
+    }
+
+    // ---- 步骤 0：SMR 类的方法全量清单（这一步回答"到底在不在"）----
+    LOGI("[IL2CPP] ---- SkinnedMeshRenderer + parents, ALL methods ----");
+    dump_class_methods(SMRCls);
+    const char* keys[] = {"set_sharedMesh","get_sharedMesh","set_bones","get_bones",
+                          "set_rootBone","get_rootBone","set_bounds","get_bounds",
+                          "set_localBounds","BakeMesh","set_updateWhenOffscreen",
+                          "set_sharedMaterials","get_sharedMaterials"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        const MethodInfo* m = find_method_any(SMRCls, keys[i]);
+        LOGI("[IL2CPP] resolve %-24s -> %p argc=%u", keys[i], (void*)m,
+             m ? g_api.method_get_param_count(m) : 0);
+    }
+
+    // ---- 步骤 1：干净的独立 GameObject ----
+    if (g_skinTestGo) {
+        const MethodInfo* destroy = ObjCls ? find_method_any(ObjCls, "Destroy") : nullptr;
+        if (destroy) { void* a[1] = { g_skinTestGo }; invoke_static(destroy, a); }
+        g_skinTestGo = nullptr;
+        LOGI("[UNITY] step1 previous test object destroyed");
+    }
+    const MethodInfo* goCtor = find_method_any(GOCls, ".ctor");
+    const MethodInfo* getGOTr = find_method_any(GOCls, "get_transform");
+    const MethodInfo* addComp = find_method_any(GOCls, "AddComponent");
+    if (!goCtor || !getGOTr || !addComp) { LOGE("[UNITY] step1 GO api missing"); return; }
+    void* an[1] = { g_api.string_new("mm_skintest") };
+    Il2CppObject* go = g_api.object_new(GOCls);
+    invoke_inst(goCtor, go, an);
+    if (!go) { LOGE("[UNITY] step1 GameObject new failed"); return; }
+    g_skinTestGo = go;
+    Il2CppObject* goTr = invoke_inst(getGOTr, go, nullptr);
+    LOGI("[UNITY] step1 GameObject=%p transform=%p", (void*)go, (void*)goTr);
+
+    // ---- 步骤 2：两根父子骨骼 A(0,0,0) B(0,1,0) ----
+    Il2CppObject* boneA = nullptr;
+    Il2CppObject* boneB = nullptr;
+    {
+        void* n1[1] = { g_api.string_new("mm_boneA") };
+        Il2CppObject* g1 = g_api.object_new(GOCls);
+        invoke_inst(goCtor, g1, n1);
+        boneA = g1 ? invoke_inst(getGOTr, g1, nullptr) : nullptr;
+        void* n2[1] = { g_api.string_new("mm_boneB") };
+        Il2CppObject* g2 = g_api.object_new(GOCls);
+        invoke_inst(goCtor, g2, n2);
+        boneB = g2 ? invoke_inst(getGOTr, g2, nullptr) : nullptr;
+        const MethodInfo* setParent = find_method_any(TrCls, "SetParent");
+        const MethodInfo* setLPos   = find_method_any(TrCls, "set_localPosition");
+        if (boneA && boneB && setParent) { void* a[1] = { boneA }; invoke_inst(setParent, boneB, a); }
+        if (setLPos) {
+            Vec3 p0 = {0.0f, 0.0f, 0.0f};
+            if (boneA) { void* a[1] = { &p0 }; invoke_inst(setLPos, boneA, a); }
+            Vec3 p1 = {0.0f, 1.0f, 0.0f};
+            if (boneB) { void* a[1] = { &p1 }; invoke_inst(setLPos, boneB, a); }
+        }
+        LOGI("[UNITY] step2 bones A=%p B=%p", (void*)boneA, (void*)boneB);
+    }
+    if (!boneA || !boneB) { LOGE("[UNITY] step2 bone creation failed"); return; }
+
+    // ---- 步骤 3：12 顶点柱子（3 层 × 4 角），模型空间原点在骨骼 A ----
+    const int NV = 12, NI = 48;
+    Il2CppObject* mesh = g_api.object_new(MeshCls);
+    const MethodInfo* meshCtor = find_method_any(MeshCls, ".ctor");
+    if (meshCtor) invoke_inst(meshCtor, mesh, nullptr);
+    if (!mesh) { LOGE("[UNITY] step3 Mesh new failed"); return; }
+    {
+        float v[NV * 3];
+        for (int layer = 0; layer < 3; layer++) {
+            float y = (float)layer;
+            float* d = &v[layer * 12];
+            d[0] = -0.2f; d[1] = y; d[2] = -0.2f;
+            d[3] =  0.2f; d[4] = y; d[5] = -0.2f;
+            d[6] =  0.2f; d[7] = y; d[8] =  0.2f;
+            d[9] = -0.2f; d[10]= y; d[11]=  0.2f;
+        }
+        int id[NI] = {
+            0,1,5, 0,5,4,   1,2,6, 1,6,5,   2,3,7, 2,7,6,   3,0,4, 3,4,7,
+            4,5,9, 4,9,8,   5,6,10, 5,10,9, 6,7,11, 6,11,10, 7,4,8, 7,8,11
+        };
+        Il2CppArray* va = g_api.array_new(V3Cls, NV);
+        memcpy(array_addr(va, 12, 0), v, sizeof(v));
+        Il2CppArray* na = g_api.array_new(V3Cls, NV);
+        {
+            float* np = (float*)array_addr(na, 12, 0);
+            for (int i = 0; i < NV; i++) { np[i*3+0]=0; np[i*3+1]=0; np[i*3+2]=-1.0f; }
+        }
+        Il2CppArray* ua = g_api.array_new(V2Cls, NV);
+        {
+            float* up = (float*)array_addr(ua, 8, 0);
+            for (int i = 0; i < NV; i++) { up[i*2+0]=0.5f; up[i*2+1]=0.5f; }
+        }
+        Il2CppArray* ia = g_api.array_new(I32Cls, NI);
+        memcpy(array_addr(ia, 4, 0), id, sizeof(id));
+        const MethodInfo* sv = find_method_any(MeshCls, "set_vertices");
+        const MethodInfo* sn = find_method_any(MeshCls, "set_normals");
+        const MethodInfo* su = find_method_any(MeshCls, "set_uv");
+        const MethodInfo* st = find_method_any(MeshCls, "set_triangles");
+        if (sv) { void* a[1]={va}; invoke_inst(sv, mesh, a); }
+        if (sn) { void* a[1]={na}; invoke_inst(sn, mesh, a); }
+        if (su) { void* a[1]={ua}; invoke_inst(su, mesh, a); }
+        if (st) { void* a[1]={ia}; invoke_inst(st, mesh, a); }
+        LOGI("[UNITY] step3 mesh verts=%d idx=%d setV=%p setN=%p setU=%p setT=%p",
+             NV, NI, (void*)sv, (void*)sn, (void*)su, (void*)st);
+    }
+
+    // ---- 步骤 4：bindposes（A=identity，B=平移 -1）----
+    {
+        Il2CppArray* bps = g_api.array_new(M4Cls, 2);
+        int ms = array_elem_size(M4Cls, 64);
+        float* m0 = (float*)array_addr(bps, (size_t)ms, 0);
+        float* m1 = (float*)array_addr(bps, (size_t)ms, 1);
+        for (int i = 0; i < 16; i++) { m0[i] = 0.0f; m1[i] = 0.0f; }
+        m0[0] = m0[5] = m0[10] = m0[15] = 1.0f;      // A 在原点，bind 逆 = 单位阵
+        m1[0] = m1[5] = m1[10] = m1[15] = 1.0f;
+        m1[13] = -1.0f;                               // B 在 y=1，bind 逆 = T(0,-1,0)
+        const MethodInfo* sbp = find_method_any(MeshCls, "set_bindposes");
+        if (sbp) { void* a[1] = { bps }; invoke_inst(sbp, mesh, a); }
+        LOGI("[UNITY] step4 bindposes set=%p (stride=%d)", (void*)sbp, ms);
+    }
+
+    // ---- 步骤 5：BoneWeight（底4绑A / 中4各50% / 顶4绑B）----
+    {
+        BwLayout L = bw_layout(BWCls);
+        int bs = array_elem_size(BWCls, 32);
+        Il2CppArray* bwa = g_api.array_new(BWCls, NV);
+        unsigned char* base = (unsigned char*)array_addr(bwa, (size_t)bs, 0);
+        for (int i = 0; i < NV; i++) {
+            unsigned char* e = base + (size_t)i * (size_t)bs;
+            int bi[4]; float bw[4];
+            if (i < 4)       { bi[0]=0; bw[0]=1.0f; bi[1]=0; bw[1]=0.0f; }
+            else if (i < 8)  { bi[0]=0; bw[0]=0.5f; bi[1]=1; bw[1]=0.5f; }
+            else             { bi[0]=1; bw[0]=1.0f; bi[1]=1; bw[1]=0.0f; }
+            bi[2]=bi[0]; bi[3]=bi[0]; bw[2]=0.0f; bw[3]=0.0f;
+            for (int q = 0; q < 4; q++) {
+                *(int*)(e + L.idx[q]) = bi[q];
+                *(float*)(e + L.wgt[q]) = bw[q];
+            }
+        }
+        const MethodInfo* sbw = find_method_any(MeshCls, "set_boneWeights");
+        if (sbw) { void* a[1] = { bwa }; invoke_inst(sbw, mesh, a); }
+        LOGI("[UNITY] step5 boneWeights set=%p (stride=%d)", (void*)sbw, bs);
+    }
+
+    // ---- 步骤 6：AddComponent<SkinnedMeshRenderer> ----
+    Il2CppObject* smr = nullptr;
+    {
+        void* t[1] = { g_api.type_get_object(g_api.class_get_type(SMRCls)) };
+        smr = invoke_inst(addComp, go, t);
+        LOGI("[UNITY] step6 AddComponent(SMR) -> %p", (void*)smr);
+    }
+    if (!smr) { LOGE("[UNITY] step6 SMR creation FAILED - native path dead here"); return; }
+    Il2CppClass* smrReal = g_api.object_get_class(smr);
+    LOGI("[UNITY] step6 smrReal class=%s", smrReal ? g_api.class_get_name(smrReal) : "?");
+
+    // ---- 步骤 7：set_sharedMesh（闸门 1）----
+    {
+        const MethodInfo* sm = find_method_any(smrReal ? smrReal : SMRCls, "set_sharedMesh");
+        const MethodInfo* gm = find_method_any(smrReal ? smrReal : SMRCls, "get_sharedMesh");
+        LOGI("[IL2CPP] step7 set_sharedMesh=%p get_sharedMesh=%p", (void*)sm, (void*)gm);
+        if (sm) {
+            void* a[1] = { mesh };
+            invoke_inst(sm, smr, a);
+            Il2CppObject* back = gm ? invoke_inst(gm, smr, nullptr) : nullptr;
+            LOGI("[UNITY] step7 readback sharedMesh want=%p got=%p -> %s",
+                 (void*)mesh, (void*)back, back == mesh ? "OK" : "MISMATCH");
+        } else {
+            LOGE("[IL2CPP] step7 GATE FAILED: set_sharedMesh not in metadata");
+        }
+    }
+
+    // ---- 步骤 8：set_bones（闸门 2）----
+    {
+        Il2CppArray* bones = g_api.array_new(TrCls, 2);
+        if (bones) {
+            *(Il2CppObject**)array_addr(bones, sizeof(void*), 0) = boneA;
+            *(Il2CppObject**)array_addr(bones, sizeof(void*), 1) = boneB;
+        }
+        const MethodInfo* sb = find_method_any(smrReal ? smrReal : SMRCls, "set_bones");
+        const MethodInfo* gb = find_method_any(smrReal ? smrReal : SMRCls, "get_bones");
+        LOGI("[IL2CPP] step8 set_bones=%p get_bones=%p arr=%p", (void*)sb, (void*)gb, (void*)bones);
+        if (sb && bones) {
+            void* a[1] = { bones };
+            invoke_inst(sb, smr, a);
+            Il2CppArray* back = gb ? (Il2CppArray*)invoke_inst(gb, smr, nullptr) : nullptr;
+            LOGI("[UNITY] step8 readback bones len=%ld (want 2) -> %s",
+                 back ? (long)back->max_length : -1L,
+                 (back && back->max_length == 2) ? "OK" : "MISMATCH");
+        } else {
+            LOGE("[IL2CPP] step8 GATE FAILED: set_bones not in metadata");
+        }
+    }
+
+    // ---- 步骤 9：set_rootBone ----
+    {
+        const MethodInfo* srb = find_method_any(smrReal ? smrReal : SMRCls, "set_rootBone");
+        LOGI("[IL2CPP] step9 set_rootBone=%p", (void*)srb);
+        if (srb) { void* a[1] = { boneA }; invoke_inst(srb, smr, a); }
+    }
+
+    // ---- 步骤 10：材质 ----
+    {
+        const MethodInfo* find = ShCls ? find_method(ShCls, "Find", 1) : nullptr;
+        const MethodInfo* setMat = find_method_any(MRCls, "set_sharedMaterial");
+        if (find && setMat && MatCls) {
+            const char* names[] = {"Unlit/Texture", "Mobile/Diffuse", "Sprites/Default"};
+            for (int q = 0; q < 3; q++) {
+                void* a[1] = { g_api.string_new(names[q]) };
+                Il2CppObject* sh = invoke_static(find, a);
+                if (!sh) continue;
+                Il2CppObject* mat = g_api.object_new(MatCls);
+                const MethodInfo* c1 = find_method(MatCls, ".ctor", 1);
+                if (c1) { void* b[1] = { sh }; invoke_inst(c1, mat, b); }
+                if (mat) {
+                    void* b[1] = { mat };
+                    invoke_inst(setMat, smr, b);
+                    const MethodInfo* sc = find_method(MatCls, "set_color", 1);
+                    if (sc) { Color4 w = {1.0f, 0.6f, 0.2f, 1.0f}; void* c[1] = { &w }; invoke_inst(sc, mat, c); }
+                    LOGI("[UNITY] step10 material from shader %s", names[q]);
+                    break;
+                }
+            }
+        }
+    }
+
+    // ---- 步骤 11：放到玩家角色旁边，免得看不见 ----
+    if (g_player_root && goTr) {
+        const MethodInfo* getPos = find_method_any(TrCls, "get_position");
+        const MethodInfo* setPos = find_method_any(TrCls, "set_position");
+        if (getPos && setPos) {
+            Il2CppObject* v = invoke_inst(getPos, g_player_root, nullptr);
+            if (v) {
+                const float* f = (const float*)((char*)v + 16);
+                Vec3 np = { f[0] + 0.9f, f[1] + 1.0f, f[2] };
+                void* a[1] = { &np };
+                invoke_inst(setPos, goTr, a);
+                LOGI("[UNITY] step11 placed at (%.2f,%.2f,%.2f)", np.x, np.y, np.z);
+            }
+        }
+    }
+
+    // ---- 步骤 12：转骨骼 B，看网格弯不弯 ----
+    {
+        const MethodInfo* setLR = find_method_any(TrCls, "set_localRotation");
+        if (setLR) {
+            Quat q = {0.0f, 0.0f, 0.3826834f, 0.9238795f};   // 绕 Z 轴 45°
+            void* a[1] = { &q };
+            invoke_inst(setLR, boneB, a);
+            LOGI("[SKIN] step12 boneB rotated 45deg around Z - watch the pole bend");
+        }
+    }
+
+    LOGI("========== [SKIN] NATIVE SKIN PROBE END ==========");
 }
 
 static Il2CppObject* g_rigidRoot = nullptr;
