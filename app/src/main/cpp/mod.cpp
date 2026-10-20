@@ -3976,9 +3976,10 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
     LOGI("rigid: begin");
     {
         static Il2CppObject* dumpedFor = nullptr;
-        if (dumpedFor != origSmr) { dumpedFor = origSmr; dump_bone_tree(origSmr); }
+        if (dumpedFor != origSmr) { dumpedFor = origSmr; LOGI("rigid: STEP1 dump tree"); dump_bone_tree(origSmr); LOGI("rigid: STEP1 done"); }
     }
-    destroy_our_smrs();          // 先清掉上一轮建的块，否则每选一次就叠一层
+    destroy_our_smrs();
+    LOGI("rigid: STEP2 cleared old");          // 先清掉上一轮建的块，否则每选一次就叠一层
     Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
     if (!SMRCls) { LOGE("rigid: no SMR class"); return 0; }
     const MethodInfo* gb = find_method_any(SMRCls, "get_bones");
@@ -3987,9 +3988,11 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
     if (!ba || ba->max_length == 0) { LOGE("rigid: no bones"); return 0; }
     int N = (int)ba->max_length;
 
+    LOGI("rigid: STEP3 collect union bones");
     std::vector<Il2CppObject*> bones;
     std::vector<std::string> gnorm;
     collect_role_bones(origSmr, bones, gnorm);
+    LOGI("rigid: STEP3 done, union=%d", (int)bones.size());
     if ((int)bones.size() < 22) {
         // 并集都没凑够，退回当前 SMR
         bones.assign((size_t)N, nullptr);
@@ -4027,8 +4030,10 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
     std::vector<int> gidx;
     int found = 0;
 
-    // ---- 优先走 Humanoid 语义骨骼 ----
-    {
+    // ---- Humanoid 路径已禁用 ----
+    // Animator.GetBoneTransform 在非 Humanoid rig 上会崩（SIGSEGV addr 0x78，
+    // 现场寄存器里是 "Avatar" 字符串），native 崩溃没法 try/catch，只能不走。
+    if (false) {
         std::vector<Il2CppObject*> hb;
         int hbGot = try_humanoid_bones(origSmr, hb);
         if (hbGot >= 15) {
@@ -4046,8 +4051,10 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
         if (hbGot > 0) LOGI("rigid: humanoid only %d/22, fallback to name matching", hbGot);
     }
 
+    LOGI("rigid: STEP4 name match");
     found = map_bones(ourNames, gnorm, &gidx);
     LOGI("rigid: name-mapped %d/%d bones, target rig has %d", found, (int)ourNames.size(), N);
+    LOGI("rigid: STEP4 done");
     mapped_done:;
     for (int i = 0; i < (int)ourNames.size(); i++) {
         LOGI("rigid: namemap[%2d] %-20s -> %s", i, ourNames[i].c_str(),
@@ -4127,6 +4134,7 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
     if (layer == 0) layer = 10;
     LOGI("rigid: layer=%d", layer);
 
+    LOGI("rigid: STEP5 spawning pieces");
     const float kBase = 1.7f / 20.214f;
     int made = 0, skipped = 0;
 
