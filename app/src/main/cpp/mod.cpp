@@ -3729,9 +3729,9 @@ static int match_bones_by_position(const char* dir,
     int matched = 0;
     for (int i = 0; i < nb; i++) if (gidx[i] >= 0) { used[gidx[i]] = 1; matched++; }
 
-    // 两轮：先严格一对一（阈值 0.03），不够再放宽（0.09，允许重复）
-    const float thr[2] = {0.03f, 0.14f};
-    for (int round = 0; round < 2; round++) {
+    // 只保留严格一对一（0.03）。放宽阈值会猜错，猜错就会让整块跑到错误位置。
+    const float thr[2] = {0.03f, 0.03f};
+    for (int round = 0; round < 1; round++) {
         for (int i = 0; i < nb; i++) {
             if (gidx[i] >= 0) continue;
             float px=(ppos[i*3]-pc[0])/pr, py=(ppos[i*3+1]-pc[1])/pr, pz=(ppos[i*3+2]-pc[2])/pr;
@@ -3803,10 +3803,20 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
     std::vector<int> gidx;
     int found = map_bones(ourNames, gnorm, &gidx);
     LOGI("rigid: name-mapped %d/%d bones, target rig has %d", found, (int)ourNames.size(), N);
-    if (found < (int)ourNames.size() * 3 / 4) {
+    for (int i = 0; i < (int)ourNames.size(); i++) {
+        LOGI("rigid: namemap[%2d] %-20s -> %s", i, ourNames[i].c_str(),
+             gidx[i] >= 0 ? gnorm[gidx[i]].c_str() : "NONE");
+    }
+    // 位置匹配只在名字匹配几乎没命中时才用。
+    // 它是"猜"——目标骨骼布局和 PMX 差得远时，猜出来的配对会让整块跑到错误位置，
+    // 表现为模型碎成一地。名字匹配虽然少，但每一根都是确定的。
+    if (found < 8) {
+        LOGI("rigid: name match only %d, trying position fallback (strict)", found);
         int m2 = match_bones_by_position(dir, gnorm, bones, N, gidx);
         if (m2 > found) found = m2;
-        LOGI("rigid: after position matching -> %d/%d", found, (int)ourNames.size());
+        LOGI("rigid: after position fallback -> %d/%d", found, (int)ourNames.size());
+    } else {
+        LOGI("rigid: skipping position matching (name match %d is reliable enough)", found);
     }
     if (found < 5) { LOGE("rigid: too few bones mapped -> abort"); return 0; }
 
