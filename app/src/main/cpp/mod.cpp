@@ -3817,28 +3817,6 @@ static int try_humanoid_bones(Il2CppObject* origSmr, std::vector<Il2CppObject*>&
     if (!anim) { LOGE("rigid: no Animator on/near SMR"); return 0; }
     LOGI("rigid: animator=%p", anim);
 
-    // Avatar 检查：Animator 存在不代表是 Humanoid
-    {
-        Il2CppClass* AvCls = find_class_any("UnityEngine", "Avatar");
-        const MethodInfo* gav = find_method_any(AnimCls, "get_avatar");
-        Il2CppObject* av = gav ? invoke_inst(gav, anim, nullptr) : nullptr;
-        LOGI("rigid: avatar=%p", av);
-        if (av && AvCls) {
-            const MethodInfo* gih = find_method_any(AvCls, "get_isHuman");
-            const MethodInfo* giv = find_method_any(AvCls, "get_isValid");
-            const MethodInfo* gnm = find_method_any(AvCls, "get_name");
-            Il2CppObject* r = gih ? invoke_inst(gih, av, nullptr) : nullptr;
-            int isHuman = r ? *(uint8_t*)((char*)r + 16) : -1;
-            r = giv ? invoke_inst(giv, av, nullptr) : nullptr;
-            int isValid = r ? *(uint8_t*)((char*)r + 16) : -1;
-            std::string an = "?";
-            if (gnm) { Il2CppObject* o = invoke_inst(gnm, av, nullptr); if (o) an = to_utf8((Il2CppString*)o); }
-            LOGI("rigid: AVATAR name='%s' isHuman=%d isValid=%d", an.c_str(), isHuman, isValid);
-        } else {
-            LOGE("rigid: no avatar -> 不是 Humanoid rig，GetBoneTransform 会失败");
-        }
-    }
-
     int got = 0;
     for (int i = 0; i < 22; i++) {
         int id = kHbbMap[i];
@@ -3940,6 +3918,58 @@ static void dump_bone_tree(Il2CppObject* origSmr) {
     LOGI("=== BONE TREE END (%d printed) ===", printed);
 }
 
+
+// ---------------------------------------------------------------
+// 角色的骨骼分散在多个 SkinnedMeshRenderer 里：
+// 躯干那个 SMR 的 bones 只有 Pelvis/Spine/Neck/Head/Clavicle 这几根，
+// 四肢的主骨骼在别的 SMR 里。只取一个 SMR 的 bones 永远凑不齐 22 根。
+// 这里把同一角色根节点下所有 SMR 的 bones 并起来。
+// ---------------------------------------------------------------
+static int collect_role_bones(Il2CppObject* anySmr,
+                              std::vector<Il2CppObject*>& outBones,
+                              std::vector<std::string>& outNorm) {
+    outBones.clear();
+    outNorm.clear();
+    Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+    if (!SMRCls) return 0;
+    const MethodInfo* gb = find_method_any(SMRCls, "get_bones");
+    if (!gb) return 0;
+
+    Il2CppObject* roleRoot = find_role_root(anySmr);
+    LOGI("rigid: collect_role_bones root=%p", roleRoot);
+
+    std::vector<Fingerprint> list;
+    collect_fingerprints(SMRCls, list);
+    LOGI("rigid: role has %d SMRs", (int)list.size());
+
+    std::set<Il2CppObject*> seen;
+    for (size_t i = 0; i < list.size(); i++) {
+        Il2CppObject* sm = list[i].smr;
+        if (!sm || !*(void**)((char*)sm + 16)) continue;
+        // 同角色才算（角色根节点相同）
+        if (roleRoot) {
+            Il2CppObject* r2 = find_role_root(sm);
+            if (r2 != roleRoot) continue;
+        }
+        Il2CppArray* a = (Il2CppArray*)invoke_inst(gb, sm, nullptr);
+        if (!a) continue;
+        int n = (int)a->max_length;
+        int added = 0;
+        for (int j = 0; j < n; j++) {
+            Il2CppObject* b = *(Il2CppObject**)array_addr(a, 8, (size_t)j);
+            if (!b) continue;
+            if (seen.count(b)) continue;
+            seen.insert(b);
+            outBones.push_back(b);
+            outNorm.push_back(norm_bone(obj_name(b), false));
+            added++;
+        }
+        LOGI("rigid:   smr[%d] %s bones=%d new=%d", (int)i, list[i].chain.c_str(), n, added);
+    }
+    LOGI("rigid: union bones = %d", (int)outBones.size());
+    return (int)outBones.size();
+}
+
 static Il2CppObject* g_rigidRoot = nullptr;
 
 static int spawn_rigid_parts(Il2CppObject* origSmr) {
@@ -3957,12 +3987,22 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
     if (!ba || ba->max_length == 0) { LOGE("rigid: no bones"); return 0; }
     int N = (int)ba->max_length;
 
-    std::vector<Il2CppObject*> bones((size_t)N, nullptr);
-    std::vector<std::string> gnorm((size_t)N);
-    for (int i = 0; i < N; i++) {
-        Il2CppObject* b = *(Il2CppObject**)array_addr(ba, 8, (size_t)i);
-        bones[i] = b;
-        gnorm[i] = b ? norm_bone(obj_name(b), false) : std::string();
+    std::vector<Il2CppObject*> bones;
+    std::vector<std::string> gnorm;
+    collect_role_bones(origSmr, bones, gnorm);
+    if ((int)bones.size() < 22) {
+        // 并集都没凑够，退回当前 SMR
+        bones.assign((size_t)N, nullptr);
+        gnorm.assign((size_t)N, std::string());
+        for (int i = 0; i < N; i++) {
+            Il2CppObject* b = *(Il2CppObject**)array_addr(ba, 8, (size_t)i);
+            bones[i] = b;
+            gnorm[i] = b ? norm_bone(obj_name(b), false) : std::string();
+        }
+        LOGI("rigid: union too small, using single SMR bones=%d", N);
+    } else {
+        N = (int)bones.size();
+        LOGI("rigid: using UNION bones N=%d", N);
     }
 
     // 找那个目录（两个候选）
