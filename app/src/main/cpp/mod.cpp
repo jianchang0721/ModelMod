@@ -3970,6 +3970,97 @@ static int collect_role_bones(Il2CppObject* anySmr,
     return (int)outBones.size();
 }
 
+
+// ---------------------------------------------------------------
+// 按父子层级补匹配。
+// 目标角色把前臂/手/脚改名叫 Bone12/Bone16/Bone41 之类，名字匹配永远对不上，
+// 但这些骨骼的父级（UpperArm / Calf / Spine1）都已经被名字匹配到了。
+// 所以：从已匹配的父骨骼出发，沿子节点往下走，就能把剩下的补齐。
+// ---------------------------------------------------------------
+static const int kParentIdx[22] = {
+    -1,  // 0  Pelvis
+     0,  // 1  Spine      <- Pelvis
+     1,  // 2  Spine1     <- Spine
+     2,  // 3  Spine2     <- Spine1
+     3,  // 4  Neck       <- Spine2
+     4,  // 5  Head       <- Neck
+     0,  // 6  L Thigh    <- Pelvis
+     6,  // 7  L Calf     <- L Thigh
+     7,  // 8  L Foot     <- L Calf
+     8,  // 9  L Toe0     <- L Foot
+     0,  // 10 R Thigh    <- Pelvis
+    10,  // 11 R Calf     <- R Thigh
+    11,  // 12 R Foot     <- R Calf
+    12,  // 13 R Toe0     <- R Foot
+     3,  // 14 L Clavicle <- Spine2
+    14,  // 15 L UpperArm <- L Clavicle
+    15,  // 16 L Forearm  <- L UpperArm
+    16,  // 17 L Hand     <- L Forearm
+     3,  // 18 R Clavicle <- Spine2
+    18,  // 19 R UpperArm <- R Clavicle
+    19,  // 20 R Forearm  <- R UpperArm
+    20,  // 21 R Hand     <- R Forearm
+};
+
+static int match_by_hierarchy(Il2CppClass* TrCls,
+                              std::vector<Il2CppObject*>& bones, int N,
+                              std::vector<int>& gidx) {
+    if (!TrCls) return 0;
+    const MethodInfo* getCount = find_method_any(TrCls, "get_childCount");
+    const MethodInfo* getChild = find_method_any(TrCls, "GetChild");
+    if (!getCount || !getChild) { LOGE("rigid: no child api"); return 0; }
+
+    std::vector<char> used((size_t)N, 0);
+    for (int i = 0; i < 22; i++)
+        if (gidx[i] >= 0 && gidx[i] < N) used[gidx[i]] = 1;
+
+    int added = 0;
+    // kParentIdx 里父的索引一定小于子，顺序遍历就能保证父先处理
+    for (int pass = 0; pass < 2; pass++) {
+        bool progress = false;
+        for (int i = 0; i < 22; i++) {
+            if (gidx[i] >= 0) continue;
+            int pi = kParentIdx[i];
+            if (pi < 0 || gidx[pi] < 0 || gidx[pi] >= N) continue;
+            Il2CppObject* par = bones[gidx[pi]];
+            if (!par) continue;
+
+            Il2CppObject* r = invoke_inst(getCount, par, nullptr);
+            int nc = r ? *(int*)((char*)r + 16) : 0;
+            if (nc <= 0 || nc > 64) continue;
+
+            // 收集还没被占用的子骨骼
+            std::vector<int> cand;
+            for (int c = 0; c < nc; c++) {
+                int ci = c;
+                void* a[1] = { &ci };
+                Il2CppObject* ch = invoke_inst(getChild, par, a);
+                if (!ch) continue;
+                for (int k = 0; k < N; k++) {
+                    if (bones[k] == ch) {
+                        if (!used[k]) cand.push_back(k);
+                        break;
+                    }
+                }
+            }
+            if (cand.size() != 1) {
+                // 0 个：父这边没有可用子；多个：分不清是哪个（比如 Spine1 下面
+                // 同时挂着 Spine2 和一堆装饰骨），留给下一步，别乱猜
+                continue;
+            }
+            gidx[i] = cand[0];
+            used[cand[0]] = 1;
+            added++;
+            progress = true;
+            LOGI("rigid: hier[%2d] <- bone[%d](%s) via parent[%d]",
+                 i, cand[0], obj_name(bones[cand[0]]).c_str(), pi);
+        }
+        if (!progress) break;
+    }
+    LOGI("rigid: hierarchy added %d", added);
+    return added;
+}
+
 static Il2CppObject* g_rigidRoot = nullptr;
 
 static int spawn_rigid_parts(Il2CppObject* origSmr) {
@@ -4054,6 +4145,17 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
     LOGI("rigid: STEP4 name match");
     found = map_bones(ourNames, gnorm, &gidx);
     LOGI("rigid: name-mapped %d/%d bones, target rig has %d", found, (int)ourNames.size(), N);
+
+    // 名字对不上的，从已匹配的父骨骼沿子节点往下捞
+    {
+        Il2CppClass* TrCls = find_class_any("UnityEngine", "Transform");
+        int h = match_by_hierarchy(TrCls, bones, N, gidx);
+        if (h > 0) {
+            found = 0;
+            for (int i = 0; i < 22; i++) if (gidx[i] >= 0) found++;
+            LOGI("rigid: after hierarchy -> %d/22", found);
+        }
+    }
     LOGI("rigid: STEP4 done");
     mapped_done:;
     for (int i = 0; i < (int)ourNames.size(); i++) {
