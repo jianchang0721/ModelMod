@@ -3817,22 +3817,137 @@ static int try_humanoid_bones(Il2CppObject* origSmr, std::vector<Il2CppObject*>&
     if (!anim) { LOGE("rigid: no Animator on/near SMR"); return 0; }
     LOGI("rigid: animator=%p", anim);
 
+    // Avatar 检查：Animator 存在不代表是 Humanoid
+    {
+        Il2CppClass* AvCls = find_class_any("UnityEngine", "Avatar");
+        const MethodInfo* gav = find_method_any(AnimCls, "get_avatar");
+        Il2CppObject* av = gav ? invoke_inst(gav, anim, nullptr) : nullptr;
+        LOGI("rigid: avatar=%p", av);
+        if (av && AvCls) {
+            const MethodInfo* gih = find_method_any(AvCls, "get_isHuman");
+            const MethodInfo* giv = find_method_any(AvCls, "get_isValid");
+            const MethodInfo* gnm = find_method_any(AvCls, "get_name");
+            Il2CppObject* r = gih ? invoke_inst(gih, av, nullptr) : nullptr;
+            int isHuman = r ? *(uint8_t*)((char*)r + 16) : -1;
+            r = giv ? invoke_inst(giv, av, nullptr) : nullptr;
+            int isValid = r ? *(uint8_t*)((char*)r + 16) : -1;
+            std::string an = "?";
+            if (gnm) { Il2CppObject* o = invoke_inst(gnm, av, nullptr); if (o) an = to_utf8((Il2CppString*)o); }
+            LOGI("rigid: AVATAR name='%s' isHuman=%d isValid=%d", an.c_str(), isHuman, isValid);
+        } else {
+            LOGE("rigid: no avatar -> 不是 Humanoid rig，GetBoneTransform 会失败");
+        }
+    }
+
     int got = 0;
     for (int i = 0; i < 22; i++) {
         int id = kHbbMap[i];
         void* b[1] = { &id };
         Il2CppObject* tr = invoke_inst(gbt, anim, b);
         out[i] = tr;
-        if (tr) got++;
+        if (tr) {
+            got++;
+            LOGI("rigid: hbb[%2d] id=%-2d -> %s", i, id, obj_name(tr).c_str());
+        } else {
+            LOGI("rigid: hbb[%2d] id=%-2d -> NULL", i, id);
+        }
     }
     LOGI("rigid: humanoid bones %d/22", got);
     return got;
+}
+
+
+// ---------------------------------------------------------------
+// 把目标角色的骨骼层级整棵树打出来（名字 + 深度 + 子骨骼数 + 世界坐标）
+// 人形骨架拓扑是固定的：根只有 3 个子（脊椎/左腿/右腿），腿链 4 层，臂链从肩往下 4 层。
+// 有了这棵树，匹配就不需要猜名字了 —— 看形状就知道哪根是哪根。
+// ---------------------------------------------------------------
+static void dump_bone_tree(Il2CppObject* origSmr) {
+    Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+    if (!SMRCls) return;
+    const MethodInfo* gb = find_method_any(SMRCls, "get_bones");
+    Il2CppArray* ba = gb ? (Il2CppArray*)invoke_inst(gb, origSmr, nullptr) : nullptr;
+    if (!ba || ba->max_length == 0) { LOGE("bt: no bones"); return; }
+    int N = (int)ba->max_length;
+
+    Il2CppClass* TrCls = find_class_any("UnityEngine", "Transform");
+    if (!TrCls) return;
+    const MethodInfo* getParent = find_method_any(TrCls, "get_parent");
+    const MethodInfo* getCount  = find_method_any(TrCls, "get_childCount");
+    const MethodInfo* l2w       = find_method_any(TrCls, "get_localToWorldMatrix");
+
+    std::vector<Il2CppObject*> bones((size_t)N, nullptr);
+    std::set<Il2CppObject*> bset;
+    for (int i = 0; i < N; i++) {
+        Il2CppObject* b = *(Il2CppObject**)array_addr(ba, 8, (size_t)i);
+        bones[i] = b;
+        if (b) bset.insert(b);
+    }
+
+    std::map<Il2CppObject*, std::vector<Il2CppObject*> > tree;
+    std::vector<Il2CppObject*> roots;
+    for (int i = 0; i < N; i++) {
+        Il2CppObject* b = bones[i];
+        if (!b) continue;
+        Il2CppObject* par = getParent ? invoke_inst(getParent, b, nullptr) : nullptr;
+        if (par && bset.count(par)) tree[par].push_back(b);
+        else roots.push_back(b);
+    }
+
+    const MethodInfo* getLP = find_method_any(TrCls, "get_localPosition");
+    const MethodInfo* getLR = find_method_any(TrCls, "get_localRotation");
+    const MethodInfo* getLS = find_method_any(TrCls, "get_localScale");
+
+    LOGI("=== BONE TREE %d bones / %d roots ===", N, (int)roots.size());
+
+    struct Item { Il2CppObject* t; int depth; };
+    std::vector<Item> stack;
+    for (int i = (int)roots.size() - 1; i >= 0; i--) { Item it; it.t = roots[i]; it.depth = 0; stack.push_back(it); }
+
+    int printed = 0;
+    while (!stack.empty() && printed < 260) {
+        Item it = stack.back(); stack.pop_back();
+        std::string nm = obj_name(it.t);
+        int nc = 0;
+        if (getCount) { Il2CppObject* r = invoke_inst(getCount, it.t, nullptr); if (r) nc = *(int*)((char*)r + 16); }
+        float wx = 0, wy = 0, wz = 0;
+        if (l2w) {
+            Il2CppObject* m = invoke_inst(l2w, it.t, nullptr);
+            if (m) { const float* mm = (const float*)((char*)m + 16); wx = mm[12]; wy = mm[13]; wz = mm[14]; }
+        }
+        char indent[80]; int k = 0;
+        for (int d = 0; d < it.depth && k < 74; d++) { indent[k++] = '.'; indent[k++] = ' '; }
+        indent[k] = 0;
+
+        // 父骨骼名
+        Il2CppObject* par = getParent ? invoke_inst(getParent, it.t, nullptr) : nullptr;
+        std::string pname = par ? obj_name(par) : std::string("ROOT");
+
+        // localPosition / localRotation / localScale
+        float lx = 0, ly = 0, lz = 0, qx = 0, qy = 0, qz = 0, qw = 1, sx = 1, sy = 1, sz = 1;
+        if (getLP) { Il2CppObject* r = invoke_inst(getLP, it.t, nullptr); if (r) { lx=*(float*)((char*)r+16); ly=*(float*)((char*)r+20); lz=*(float*)((char*)r+24); } }
+        if (getLR) { Il2CppObject* r = invoke_inst(getLR, it.t, nullptr); if (r) { qx=*(float*)((char*)r+16); qy=*(float*)((char*)r+20); qz=*(float*)((char*)r+24); qw=*(float*)((char*)r+28); } }
+        if (getLS) { Il2CppObject* r = invoke_inst(getLS, it.t, nullptr); if (r) { sx=*(float*)((char*)r+16); sy=*(float*)((char*)r+20); sz=*(float*)((char*)r+24); } }
+
+        LOGI("BT %s%s  ch=%d  par=%s", indent, nm.c_str(), nc, pname.c_str());
+        LOGI("    lpos=(%.3f,%.3f,%.3f) lrot=(%.3f,%.3f,%.3f,%.3f) lscl=(%.3f,%.3f,%.3f) wpos=(%.2f,%.2f,%.2f)",
+             lx, ly, lz, qx, qy, qz, qw, sx, sy, sz, wx, wy, wz);
+        printed++;
+
+        std::vector<Il2CppObject*>& ch = tree[it.t];
+        for (int i = (int)ch.size() - 1; i >= 0; i--) { Item c; c.t = ch[i]; c.depth = it.depth + 1; stack.push_back(c); }
+    }
+    LOGI("=== BONE TREE END (%d printed) ===", printed);
 }
 
 static Il2CppObject* g_rigidRoot = nullptr;
 
 static int spawn_rigid_parts(Il2CppObject* origSmr) {
     LOGI("rigid: begin");
+    {
+        static Il2CppObject* dumpedFor = nullptr;
+        if (dumpedFor != origSmr) { dumpedFor = origSmr; dump_bone_tree(origSmr); }
+    }
     destroy_our_smrs();          // 先清掉上一轮建的块，否则每选一次就叠一层
     Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
     if (!SMRCls) { LOGE("rigid: no SMR class"); return 0; }
