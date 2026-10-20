@@ -52,6 +52,9 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static native int getCustomEnabled();
     // v141: 1 = 原 mesh 顶点减半 2 = 全绑 0 号骨 3 = 还原
     private static native void testMesh(int cmd);
+    // v144: 渲染模式 0=静态 1=刚性 2=CPU蒙皮
+    private static native void setRenderMode(int m);
+    private static native int getRenderMode();
 
     private static final int REQ_PICK = 0x4D44;   // 自定义模型选择器
 
@@ -280,6 +283,29 @@ public class HookEntry implements IXposedHookLoadPackage {
         btnT4.setOnClickListener(v -> { try { testMesh(4); toast(act, "探测中，看日志"); } catch (Throwable t) { } });
         btnRow4.addView(btnT4, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         panel.addView(btnRow4);
+
+        // v144: 渲染模式三选
+        TextView modeLabel = new TextView(act);
+        modeLabel.setTextColor(0xFF7FD4FF);
+        modeLabel.setTextSize(10);
+        modeLabel.setText("渲染模式（切了会重建）");
+        panel.addView(modeLabel);
+        LinearLayout btnRow5 = new LinearLayout(act);
+        btnRow5.setOrientation(LinearLayout.HORIZONTAL);
+        TextView btnM0 = mkBtn(act, "静态");
+        TextView btnM1 = mkBtn(act, "刚性");
+        TextView btnM2 = mkBtn(act, "CPU蒙皮");
+        btnM0.setOnClickListener(v -> { try { setRenderMode(0); toast(act, "静态：完整模型，不跟骨骼"); } catch (Throwable t) { } });
+        btnM1.setOnClickListener(v -> { try { setRenderMode(1); toast(act, "刚性：每块挂一根骨"); } catch (Throwable t) { } });
+        btnM2.setOnClickListener(v -> { try { setRenderMode(2); toast(act, "CPU蒙皮：真 LBS"); } catch (Throwable t) { } });
+        LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        mlp.rightMargin = 6;
+        btnRow5.addView(btnM0, mlp);
+        LinearLayout.LayoutParams mlp2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        mlp2.rightMargin = 6;
+        btnRow5.addView(btnM1, mlp2);
+        btnRow5.addView(btnM2, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        panel.addView(btnRow5);
 
         final Handler lh = new Handler(Looper.getMainLooper());
         lh.post(new Runnable() {

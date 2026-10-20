@@ -1033,6 +1033,12 @@ static volatile int g_probed = 0;
 static std::set<Il2CppObject*> g_ourSmrs;
 static volatile int g_custom_on = 1;      // 1 = 显示我们自己的模型
 
+// v144 渲染模式：
+//   0 = 静态（v113 那套：完整模型 + 贴图，不跟骨骼）
+//   1 = 刚性分段（每块挂一根骨骼，近似）
+//   2 = CPU 蒙皮（标准 LBS，顶点每 2 帧重算一次）
+static volatile int g_render_mode = 0;
+
 static volatile int g_replace_mode = 0;   // 1 = 隐藏原角色，用我们的模型顶替
 static Il2CppObject* g_player_root = nullptr;   // 玩家主控角色的根节点
 static volatile int g_hide_main_pending = 0;    // 替换开关切换后要立即刷一次隐藏
@@ -1487,12 +1493,12 @@ static void main_tick() {
     long ms = (long)(now.tv_sec - last.tv_sec) * 1000L + (now.tv_nsec - last.tv_nsec) / 1000000L;
     ensure_model_visible();
 
-    // CPU 蒙皮：约 20fps 刷一次，全速跑太重
-    {
-        // CPU 蒙皮在 hook 上下文里跑 il2cpp + 文件/顶点上传，fdsan 和 NPTH 都会炸，
-        // 先彻底关掉保稳定；下一步改成 worker 线程预算 + 主线程只做上传
-        // static int skinTick = 0;
-        // if ((skinTick++ % 30) == 0) { update_skin_parts(); }
+    // CPU 蒙皮（模式 2）：每 2 帧一次。
+    // v113 记的"fdsan / NPTH"经复查站不住：update_skin_parts 里一行文件操作都没有，
+    // 日志里 NPTH 一次都没出现过。真正崩的是旧版只减平移、没乘 bind 逆矩阵（v144 修）。
+    if (g_render_mode == 2 && !g_skinParts.empty()) {
+        static int skinTick = 0;
+        if ((skinTick++ % 2) == 0) update_skin_parts();
     }
 
     // v141: 验证命令，排到主线程跑
@@ -2334,15 +2340,114 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
 // ---------------------------------------------------------------
 // CPU 蒙皮：读 MMS2 的骨骼权重，每 N 帧算一次顶点
 // ---------------------------------------------------------------
+// ---------------------------------------------------------------
+// v144: 从游戏自己的 bindposes 收集每根骨骼的 bind 逆矩阵
+//
+// 这才是蒙皮缺的那块。之前所有方案都只有平移（x - 骨骼位置），
+// bind 姿态的旋转整个丢了 —— 所以在 bind pose 下算出来就已经歪了。
+// bindposes[i] = inverse(bone.localToWorldMatrix at bind)，完整 4x4，
+// 直接拿来当 B^-1 用，一行都不用自己推。
+// 实测这个数组可读（bindref 已验证 1201 根骨骼），不像 get_vertices。
+// ---------------------------------------------------------------
+static std::map<void*, std::vector<float>> g_bindInv;
+static volatile int g_bindInv_built = 0;
+
+static void build_bindinv_map() {
+    g_bindInv.clear();
+    Il2CppClass* SMRCls    = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+    Il2CppClass* ObjectCls = find_class_any("UnityEngine", "Object");
+    Il2CppClass* MeshCls   = find_class_any("UnityEngine", "Mesh");
+    Il2CppClass* Mat4Cls   = find_class_any("UnityEngine", "Matrix4x4");
+    if (!SMRCls || !ObjectCls || !MeshCls) { LOGE("bindinv: class missing"); return; }
+    const MethodInfo* find = find_method(ObjectCls, "FindObjectsOfType", 1);
+    const MethodInfo* gb   = find_method_any(SMRCls, "get_bones");
+    const MethodInfo* gm   = find_method_any(SMRCls, "get_sharedMesh");
+    const MethodInfo* gbp  = find_method_any(MeshCls, "get_bindposes");
+    if (!find || !gb || !gm || !gbp) { LOGE("bindinv: method missing"); return; }
+    int mstride = array_elem_size(Mat4Cls, 64);
+    void* a[1] = { g_api.type_get_object(g_api.class_get_type(SMRCls)) };
+    Il2CppArray* arr = (Il2CppArray*)invoke_static(find, a);
+    if (!arr) { LOGE("bindinv: FindObjectsOfType null"); return; }
+    int n = 0, smrs = 0;
+    for (size_t i = 0; i < arr->max_length; i++) {
+        Il2CppObject* smr = *(Il2CppObject**)array_addr(arr, sizeof(void*), i);
+        if (!smr) continue;
+        Il2CppArray* bones = (Il2CppArray*)invoke_inst(gb, smr, nullptr);
+        Il2CppObject* mesh  = invoke_inst(gm, smr, nullptr);
+        if (!bones || !mesh || bones->max_length == 0) continue;
+        Il2CppArray* bps = (Il2CppArray*)invoke_inst(gbp, mesh, nullptr);
+        if (!bps || bps->max_length != bones->max_length) continue;
+        smrs++;
+        for (size_t k = 0; k < bones->max_length; k++) {
+            Il2CppObject* b = *(Il2CppObject**)array_addr(bones, sizeof(void*), k);
+            if (!b) continue;
+            if (g_bindInv.find((void*)b) != g_bindInv.end()) continue;
+            const float* m = (const float*)array_addr(bps, (size_t)mstride, k);
+            std::vector<float> v(16);
+            for (int q = 0; q < 16; q++) v[q] = m[q];
+            g_bindInv[(void*)b] = v;
+            n++;
+        }
+    }
+    g_bindInv_built = 1;
+    LOGI("bindinv: %d bones from %d SMRs (bindposes readable=%s)", n, smrs, n > 0 ? "YES" : "NO");
+}
+
+// 列主序 4x4：out = a * b
+static void mat4_mul(const float* a, const float* b, float* out) {
+    float t[16];
+    for (int c = 0; c < 4; c++) {
+        for (int r = 0; r < 4; r++) {
+            t[c * 4 + r] = a[0 * 4 + r] * b[c * 4 + 0] + a[1 * 4 + r] * b[c * 4 + 1] +
+                           a[2 * 4 + r] * b[c * 4 + 2] + a[3 * 4 + r] * b[c * 4 + 3];
+        }
+    }
+    for (int i = 0; i < 16; i++) out[i] = t[i];
+}
+
+// 列主序仿射 4x4 求逆（最后一行必须是 0,0,0,1）
+static bool mat4_inv_affine(const float* m, float* out) {
+    const float* c0 = m + 0;
+    const float* c1 = m + 4;
+    const float* c2 = m + 8;
+    const float* c3 = m + 12;
+    float det = c0[0] * (c1[1] * c2[2] - c2[1] * c1[2])
+              - c1[0] * (c0[1] * c2[2] - c2[1] * c0[2])
+              + c2[0] * (c0[1] * c1[2] - c1[1] * c0[2]);
+    if (fabsf(det) < 1e-12f) return false;
+    float id = 1.0f / det;
+    float i00 = (c1[1] * c2[2] - c2[1] * c1[2]) * id;
+    float i10 = -(c0[1] * c2[2] - c2[1] * c0[2]) * id;
+    float i20 = (c0[1] * c1[2] - c1[1] * c0[2]) * id;
+    float i01 = -(c1[0] * c2[2] - c2[0] * c1[2]) * id;
+    float i11 = (c0[0] * c2[2] - c2[0] * c0[2]) * id;
+    float i21 = -(c0[0] * c1[2] - c1[0] * c0[2]) * id;
+    float i02 = (c1[0] * c2[1] - c2[0] * c1[1]) * id;
+    float i12 = -(c0[0] * c2[1] - c2[0] * c0[1]) * id;
+    float i22 = (c0[0] * c1[1] - c1[0] * c0[1]) * id;
+    out[0] = i00; out[1] = i01; out[2] = i02; out[3] = 0;
+    out[4] = i10; out[5] = i11; out[6] = i12; out[7] = 0;
+    out[8] = i20; out[9] = i21; out[10] = i22; out[11] = 0;
+    out[12] = -(i00 * c3[0] + i01 * c3[1] + i02 * c3[2]);
+    out[13] = -(i10 * c3[0] + i11 * c3[1] + i12 * c3[2]);
+    out[14] = -(i20 * c3[0] + i21 * c3[1] + i22 * c3[2]);
+    out[15] = 1;
+    return true;
+}
+
 struct SkinPart {
     Il2CppObject* mesh = nullptr;
     int nv = 0;
     std::vector<float> basePos;      // 原始顶点（模型空间）
     std::vector<uint8_t> joints;     // nv*4
     std::vector<float> weights;      // nv*4
-    std::vector<float> bindT;        // nb*3 每骨骼 bind 平移
+    std::vector<float> bindT;        // nb*3 每骨骼 bind 平移（旧，纯平移版）
+    std::vector<float> bindInv;      // nb*16 每骨骼 bind 逆矩阵（新，完整 4x4）
     std::vector<Il2CppObject*> bones;// 游戏骨骼 Transform
     Il2CppArray* varray = nullptr;   // 复用顶点数组，避免每帧 array_new 撑爆 GC
+    Il2CppObject* root = nullptr;    // 挂在哪个 root 下（算相对矩阵用）
+    float scaleK = 1.0f;             // PMX → 游戏单位的缩放
+    bool basePrepared = false;       // basePos 是否已经转成游戏空间
     std::vector<float> outBuf;
     std::vector<float> lastMats;     // 上一帧骨骼矩阵，没变就跳过 set_vertices
 };
@@ -2373,7 +2478,7 @@ static Il2CppObject* find_child_by_name(Il2CppObject* root, const char* name, in
 
 // 读 MMS2 的骨骼部分（在 spawn_one_part 读完顶点/索引之后调用）
 static bool load_skin_part(FILE* f, Il2CppObject* mesh, int nv, int ni,
-                           Il2CppObject* roleRoot) {
+                           Il2CppObject* roleRoot, float scaleK) {
     uint32_t nb = 0;
     if (fread(&nb, 4, 1, f) != 1 || nb == 0 || nb > 128) return false;
 
@@ -2402,6 +2507,8 @@ static bool load_skin_part(FILE* f, Il2CppObject* mesh, int nv, int ni,
 
     SkinPart sp;
     sp.mesh = mesh;
+    sp.root = roleRoot;
+    sp.scaleK = (scaleK > 0.0f) ? scaleK : 1.0f;
     sp.nv = nv;
     sp.joints = joints;
     sp.weights = weights;
@@ -2412,13 +2519,27 @@ static bool load_skin_part(FILE* f, Il2CppObject* mesh, int nv, int ni,
         sp.bindT[i*3+2] = -ibm[i*16+14];
     }
     // 找游戏骨骼
-    int found = 0;
+    int found = 0, withBind = 0;
+    sp.bindInv.resize((size_t)nb * 16, 0.0f);
     for (uint32_t i = 0; i < nb; i++) {
         Il2CppObject* b = find_child_by_name(roleRoot, names[i].c_str());
         sp.bones.push_back(b);
-        if (b) found++;
+        // 默认兜底：纯平移（= 老行为）
+        float* bi = &sp.bindInv[i * 16];
+        for (int q = 0; q < 4; q++) bi[q * 5] = 1.0f;
+        bi[12] = -sp.bindT[i * 3 + 0];
+        bi[13] = -sp.bindT[i * 3 + 1];
+        bi[14] = -sp.bindT[i * 3 + 2];
+        if (b) {
+            found++;
+            std::map<void*, std::vector<float>>::iterator it = g_bindInv.find((void*)b);
+            if (it != g_bindInv.end()) {
+                for (int q = 0; q < 16; q++) bi[q] = it->second[q];
+                withBind++;
+            }
+        }
     }
-    LOGI("skin: %d bones, found %d/%u", nv, found, nb);
+    LOGI("skin: %d bones, found %d/%u, real bindInv %d", nv, found, nb, withBind);
     g_skinParts.push_back(sp);
     g_lastBoneNames = names;
     return found > 0;
@@ -2441,9 +2562,10 @@ static void update_skin_parts() {
 
     const MethodInfo* getL2W   = find_method(TransCls, "get_localToWorldMatrix", 0);
     const MethodInfo* setVerts = find_method(MeshCls, "set_vertices", 1);
+    const MethodInfo* getV     = find_method(MeshCls, "get_vertices", 0);
     if (!getL2W || !setVerts) return;
 
-    // 场景切换会把挂上去的对象销毁掉，这里先把死掉的 part 清掉
+    // 场景切换会把挂上去的对象销毁掉，先把死掉的 part 清掉
     for (size_t i = g_skinParts.size(); i-- > 0; ) {
         if (!obj_alive(g_skinParts[i].mesh)) {
             LOGI("skin: part %zu dead, removed", i);
@@ -2451,37 +2573,71 @@ static void update_skin_parts() {
         }
     }
 
+    int totalPushed = 0;
     for (auto& sp : g_skinParts) {
         if (!sp.mesh) continue;
+
+        // ---- 1) 原始顶点，从 PMX 空间转到游戏空间 ----
+        // 静态路径靠 GameObject 的 localScale=k 和 localRotation=Ry180 做这件事；
+        // CPU 蒙皮要自己算，因为顶点马上要跟游戏骨骼的世界矩阵相乘。
         if (sp.basePos.empty()) {
-            // 第一次：读回原始顶点
-            const MethodInfo* getV = find_method(MeshCls, "get_vertices", 0);
             if (!getV) continue;
             Il2CppArray* arr = (Il2CppArray*)invoke_inst(getV, sp.mesh, nullptr);
-            if (!arr || arr->max_length != (size_t)sp.nv) continue;
+            if (!arr || arr->max_length != (size_t)sp.nv) {
+                LOGE("skin: get_vertices back failed len=%ld expect %d",
+                     arr ? (long)arr->max_length : -1L, sp.nv);
+                continue;
+            }
             sp.basePos.resize((size_t)sp.nv * 3);
             memcpy(sp.basePos.data(), array_addr(arr, 12, 0), (size_t)sp.nv * 12);
+            sp.basePrepared = false;
+        }
+        if (!sp.basePrepared) {
+            float k = sp.scaleK;
+            // Ry180： (x, y, z) -> (-x, y, -z)
+            for (int v = 0; v < sp.nv; v++) {
+                sp.basePos[v*3+0] *= -k;
+                sp.basePos[v*3+1] *=  k;
+                sp.basePos[v*3+2] *= -k;
+            }
+            sp.basePrepared = true;
+            LOGI("skin: %d verts mapped to game space (k=%.5f, Ry180)", sp.nv, k);
         }
 
-        // 骨骼矩阵
+        // ---- 2) 角色 root 的逆矩阵（骨骼矩阵要变成相对 root 的）----
+        float rootInv[16];
+        bool haveRoot = false;
+        if (sp.root && getL2W) {
+            Il2CppObject* rm = invoke_inst(getL2W, sp.root, nullptr);
+            if (rm) haveRoot = mat4_inv_affine((const float*)((char*)rm + 16), rootInv);
+        }
+
+        // ---- 3) 每根骨骼的蒙皮矩阵 = root^-1 * M_world * BindInv ----
         size_t nb = sp.bones.size();
+        if (sp.bindInv.size() < nb * 16) continue;
         std::vector<float> mats(nb * 16, 0.0f);
         for (size_t b = 0; b < nb; b++) {
-            if (!obj_alive(sp.bones[b])) { mats[b*16+0] = 1; mats[b*16+5] = 1; mats[b*16+10] = 1; mats[b*16+15] = 1; continue; }
-            Il2CppObject* m = invoke_inst(getL2W, sp.bones[b], nullptr);
-            if (!m) continue;
-            const float* mm = (const float*)((char*)m + 16);
-            for (int k = 0; k < 16; k++) mats[b*16+k] = mm[k];
+            float* dst = &mats[b * 16];
+            if (!sp.bones[b] || !obj_alive(sp.bones[b])) { dst[0] = 1; dst[5] = 1; dst[10] = 1; dst[15] = 1; continue; }
+            Il2CppObject* wm = invoke_inst(getL2W, sp.bones[b], nullptr);
+            if (!wm) { dst[0] = 1; dst[5] = 1; dst[10] = 1; dst[15] = 1; continue; }
+            const float* M = (const float*)((char*)wm + 16);
+            float Mrel[16];
+            if (haveRoot) mat4_mul(rootInv, M, Mrel);
+            else for (int q = 0; q < 16; q++) Mrel[q] = M[q];
+            // 先乘 bind 逆矩阵：skin = Mrel * BindInv
+            mat4_mul(Mrel, &sp.bindInv[b * 16], dst);
         }
 
-        // 骨骼没动就别刷顶点：NPTH 反调试对高频顶点上传很敏感，静止时不写就没风险
+        // 骨骼没动就不刷顶点，省一半开销
         if (sp.lastMats.size() == mats.size() &&
             memcmp(sp.lastMats.data(), mats.data(), mats.size() * sizeof(float)) == 0) {
             continue;
         }
         sp.lastMats = mats;
 
-        std::vector<float> out((size_t)sp.nv * 3);
+        // ---- 4) 线性蒙皮 out = Σ w_i * (M_i * BindInv_i * v) ----
+        if (sp.outBuf.size() < (size_t)sp.nv * 3) sp.outBuf.resize((size_t)sp.nv * 3);
         for (int v = 0; v < sp.nv; v++) {
             float x = sp.basePos[v*3+0], y = sp.basePos[v*3+1], z = sp.basePos[v*3+2];
             float ox = 0, oy = 0, oz = 0;
@@ -2490,23 +2646,25 @@ static void update_skin_parts() {
                 if (w <= 0.0001f) continue;
                 int b = sp.joints[v*4+k];
                 if (b < 0 || (size_t)b >= nb) continue;
-                float px = x - sp.bindT[b*3+0];
-                float py = y - sp.bindT[b*3+1];
-                float pz = z - sp.bindT[b*3+2];
-                const float* m = &mats[b*16];
-                ox += w * (m[0]*px + m[4]*py + m[8]*pz + m[12]);
-                oy += w * (m[1]*px + m[5]*py + m[9]*pz + m[13]);
-                oz += w * (m[2]*px + m[6]*py + m[10]*pz + m[14]);
+                const float* m = &mats[b * 16];
+                ox += w * (m[0]*x + m[4]*y + m[8]*z  + m[12]);
+                oy += w * (m[1]*x + m[5]*y + m[9]*z  + m[13]);
+                oz += w * (m[2]*x + m[6]*y + m[10]*z + m[14]);
             }
-            out[v*3+0] = ox; out[v*3+1] = oy; out[v*3+2] = oz;
+            sp.outBuf[v*3+0] = ox;
+            sp.outBuf[v*3+1] = oy;
+            sp.outBuf[v*3+2] = oz;
         }
 
         if (!sp.varray) sp.varray = g_api.array_new(V3Cls, sp.nv);
         if (!sp.varray) continue;
-        memcpy(array_addr(sp.varray, 12, 0), out.data(), (size_t)sp.nv * 12);
+        memcpy(array_addr(sp.varray, 12, 0), sp.outBuf.data(), (size_t)sp.nv * 12);
         void* a[1] = { sp.varray };
         invoke_inst(setVerts, sp.mesh, a);
+        totalPushed++;
     }
+    static int dbg = 0;
+    if (totalPushed && (dbg++ % 120) == 0) LOGI("skin: pushed %d parts", totalPushed);
 }
 
 // ---------------------------------------------------------------
@@ -2566,7 +2724,7 @@ static Il2CppObject* spawn_one_part(Il2CppObject* smr, Il2CppObject* roleRoot,
     if (setT) { void* a[1] = { ia }; invoke_inst(setT, mesh, a); }
 
     if (isSkinPart && mesh) {
-        load_skin_part(f, mesh, (int)nv, (int)ni, roleRoot);
+        load_skin_part(f, mesh, (int)nv, (int)ni, roleRoot, scaleK);
     }
     fclose(f);
 
@@ -2669,12 +2827,20 @@ static Il2CppObject* spawn_one_part(Il2CppObject* smr, Il2CppObject* roleRoot,
     if (gt && roleRoot && setParent) {
         void* a[1] = { roleRoot };
         invoke_inst(setParent, gt, a);
-        if (setLScale) { Vec3 s2 = {scaleK, scaleK, scaleK}; void* b[1] = { &s2 }; invoke_inst(setLScale, gt, b); }
-        if (setLRot) { Quat q = {0.0f, 1.0f, 0.0f, 0.0f}; void* b[1] = { &q }; invoke_inst(setLRot, gt, b); }
-        if (setLPos) {
-            Vec3 p = g_replace_mode ? Vec3{0, 0, 0} : Vec3{0, 2.4f, 0};
-            void* b[1] = { &p };
-            invoke_inst(setLPos, gt, b);
+        if (g_render_mode == 2) {
+            // CPU 蒙皮：顶点自己算到角色空间，节点不许再叠变换
+            if (setLScale) { Vec3 s2 = {1, 1, 1}; void* b[1] = { &s2 }; invoke_inst(setLScale, gt, b); }
+            if (setLRot) { Quat q = {0.0f, 0.0f, 0.0f, 1.0f}; void* b[1] = { &q }; invoke_inst(setLRot, gt, b); }
+            if (setLPos) { Vec3 p = {0, 0, 0}; void* b[1] = { &p }; invoke_inst(setLPos, gt, b); }
+            LOGI("part: cpu-skin transform (identity)");
+        } else {
+            if (setLScale) { Vec3 s2 = {scaleK, scaleK, scaleK}; void* b[1] = { &s2 }; invoke_inst(setLScale, gt, b); }
+            if (setLRot) { Quat q = {0.0f, 1.0f, 0.0f, 0.0f}; void* b[1] = { &q }; invoke_inst(setLRot, gt, b); }
+            if (setLPos) {
+                Vec3 p = g_replace_mode ? Vec3{0, 0, 0} : Vec3{0, 2.4f, 0};
+                void* b[1] = { &p };
+                invoke_inst(setLPos, gt, b);
+            }
         }
     }
     LOGI("part: done %s go=%p", meshPath, go);
@@ -5071,15 +5237,20 @@ static int spawn_parts_loop(Il2CppObject* smr) {
         return 0;
     }
 
-    // v123: 先试刚性分段（每块挂到骨骼 Transform 下，不碰蒙皮）
-    if (!g_gpu_skin) {
+    LOGI("parts: render_mode=%d", (int)g_render_mode);
+
+    // 刚性分段只在模式 1 用
+    if (g_render_mode == 1 && !g_gpu_skin) {
         int r = spawn_rigid_parts(smr);
         LOGI("parts: rigid=%d -> %s", r, r > 0 ? "RIGID MODE" : "fallback static");
         if (r > 0) return r;
-    } else {
+    } else if (g_gpu_skin) {
         LOGI("parts: already in rigid/gpu mode, skip");
         return 1;
     }
+
+    // 静态 / CPU 蒙皮 都要 bind 逆矩阵
+    if (!g_bindInv_built) build_bindinv_map();
 
     // 用 1.7 米 / 20.214 单位（南宫羽 bbox 高度）
     float scaleK = 1.7f / (20.214f * 1.0f);
@@ -5612,6 +5783,24 @@ Java_com_moss_modelmod_HookEntry_setCustomEnabled(JNIEnv*, jclass, jint on) {
 extern "C" JNIEXPORT jint JNICALL
 Java_com_moss_modelmod_HookEntry_getCustomEnabled(JNIEnv*, jclass) {
     return (jint)g_custom_on;
+}
+
+// v144: 渲染模式 0=静态 1=刚性 2=CPU蒙皮
+extern "C" JNIEXPORT void JNICALL
+Java_com_moss_modelmod_HookEntry_setRenderMode(JNIEnv*, jclass, jint m) {
+    g_render_mode = (int)m;
+    g_bindInv_built = 0;
+    g_skinParts.clear();
+    destroy_our_smrs();
+    g_gpu_tried = 0; g_gpu_skin = 0;
+    g_cube_done = 0;
+    g_force_tick = 1;
+    LOGI("render mode = %d", (int)m);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_moss_modelmod_HookEntry_getRenderMode(JNIEnv*, jclass) {
+    return (jint)g_render_mode;
 }
 
 // v141: 原生蒙皮验证开关
