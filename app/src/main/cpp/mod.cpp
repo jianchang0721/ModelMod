@@ -4376,37 +4376,43 @@ static void run_mesh_test(int cmd) {
     int v3stride = array_elem_size(V3Cls, 12);
 
     if (cmd == 3) {
-        if (!g_bak_mesh || g_bak_nv <= 0) { LOGE("test3: nothing backed up"); return; }
-        Il2CppClass* mc = g_api.object_get_class(g_bak_mesh);
-        if (!mc) mc = MeshCls;
-        if (!g_bak_verts.empty()) {
-            Il2CppArray* va = g_api.array_new(V3Cls, (size_t)g_bak_nv);
-            if (va) {
-                memcpy(array_addr(va, (size_t)v3stride, 0), g_bak_verts.data(), g_bak_verts.size());
-                const MethodInfo* sv = find_method_any(mc, "set_vertices");
-                if (sv) { void* a[1] = { va }; invoke_inst(sv, g_bak_mesh, a); LOGI("test3: vertices restored %d", g_bak_nv); }
-                else LOGE("test3: set_vertices missing");
-            }
+        if (!g_bak_mesh || g_bak_nv <= 0 || g_bak_verts.empty()) {
+            LOGE("test3: nothing backed up");
+            return;
         }
+        Il2CppClass* mc3 = g_api.object_get_class(g_bak_mesh);
+        if (!mc3) mc3 = MeshCls;
+        Il2CppArray* va3 = g_api.array_new(V3Cls, (size_t)g_bak_nv);
+        if (!va3) { LOGE("test3: array_new failed"); return; }
+        memcpy(array_addr(va3, (size_t)v3stride, 0), g_bak_verts.data(),
+               (size_t)g_bak_nv * 12 < g_bak_verts.size() ? (size_t)g_bak_nv * 12 : g_bak_verts.size());
+        const MethodInfo* sv3 = find_method_any(mc3, "set_vertices");
+        if (sv3) { void* a[1] = { va3 }; invoke_inst(sv3, g_bak_mesh, a); LOGI("test3: vertices restored %d", g_bak_nv); }
+        else LOGE("test3: set_vertices missing");
         if (!g_bak_bw.empty() && BWCls) {
             int bwstride = array_elem_size(BWCls, 32);
             Il2CppArray* bwa = g_api.array_new(BWCls, (size_t)g_bak_nv);
             if (bwa) {
                 memcpy(array_addr(bwa, (size_t)bwstride, 0), g_bak_bw.data(),
                        g_bak_bw.size() < (size_t)g_bak_nv * bwstride ? g_bak_bw.size() : (size_t)g_bak_nv * bwstride);
-                const MethodInfo* sw = find_method_any(mc, "set_boneWeights");
+                const MethodInfo* sw = find_method_any(mc3, "set_boneWeights");
                 if (sw) { void* a[1] = { bwa }; invoke_inst(sw, g_bak_mesh, a); LOGI("test3: boneWeights restored"); }
                 else LOGE("test3: set_boneWeights missing");
             }
         }
-        const MethodInfo* rb = find_method_any(mc, "RecalculateBounds");
-        if (rb) invoke_inst(rb, g_bak_mesh, nullptr);
+        const MethodInfo* rb3 = find_method_any(mc3, "RecalculateBounds");
+        if (rb3) invoke_inst(rb3, g_bak_mesh, nullptr);
         LOGI("===== MESHTEST cmd=3 END =====");
         return;
     }
 
     Il2CppObject* smr = test_target_smr();
     if (!smr) { LOGI("===== MESHTEST ABORT ====="); return; }
+
+    // 测试要看得见原角色：把我们的块全拆了，总开关也关掉
+    g_custom_on = 0;
+    destroy_our_smrs();
+
     Il2CppClass* mc = g_api.object_get_class(smr);
     if (!mc) { LOGE("test: cannot get SMR class"); return; }
     const MethodInfo* gm = find_method_any(mc, "get_sharedMesh");
@@ -4415,40 +4421,66 @@ static void run_mesh_test(int cmd) {
     Il2CppClass* meshCls = g_api.object_get_class(mesh);
     if (!meshCls) meshCls = MeshCls;
 
+    // 探：这些方法到底在不在
     const MethodInfo* gv = find_method_any(meshCls, "get_vertices");
-    Il2CppArray* va = gv ? (Il2CppArray*)invoke_inst(gv, mesh, nullptr) : nullptr;
-    if (!va || va->max_length < 100) { LOGE("test: get_vertices failed arr=%p len=%ld", (void*)va, va ? (long)va->max_length : -1L); return; }
-    int nv = (int)va->max_length;
-    LOGI("test: target nv=%d", nv);
+    LOGI("test: mesh=%p meshCls=%p get_vertices=%p argc=%u", (void*)mesh, (void*)meshCls,
+         (void*)gv, gv ? g_api.method_get_param_count(gv) : 0);
 
-    // 备份原数据（只在第一次备份，还原后再备份会覆盖成坏数据）
-    if (g_bak_mesh != mesh || g_bak_nv != nv) {
+    Il2CppArray* va = gv ? (Il2CppArray*)invoke_inst(gv, mesh, nullptr) : nullptr;
+    int nv = 0;
+    if (va) {
+        const unsigned char* h = (const unsigned char*)va;
+        char b0[20], b1[20], b2[20], b3[20], b4[20];
+        snprintf(b0, sizeof(b0), "%016llx", (unsigned long long)(*(const unsigned long long*)(h +  0)));
+        snprintf(b1, sizeof(b1), "%016llx", (unsigned long long)(*(const unsigned long long*)(h +  8)));
+        snprintf(b2, sizeof(b2), "%016llx", (unsigned long long)(*(const unsigned long long*)(h + 16)));
+        snprintf(b3, sizeof(b3), "%016llx", (unsigned long long)(*(const unsigned long long*)(h + 24)));
+        snprintf(b4, sizeof(b4), "%016llx", (unsigned long long)(*(const unsigned long long*)(h + 32)));
+        LOGI("test: hdr %s %s %s %s %s", b0, b1, b2, b3, b4);
+        unsigned long long ml = va->max_length;
+        LOGI("test: get_vertices len=%llu", ml);
+        if (va->max_length > 0 && va->max_length < 500000) nv = (int)va->max_length;
+    } else {
+        LOGI("test: get_vertices returned null");
+    }
+
+    if (nv == 0) {
+        const MethodInfo* gvc = find_method_any(meshCls, "get_vertexCount");
+        Il2CppObject* boxed = gvc ? invoke_inst(gvc, mesh, nullptr) : nullptr;
+        nv = unbox_i32(boxed);
+        LOGI("test: fallback vertexCount=%d (get_vertexCount=%p)", nv, (void*)gvc);
+        va = nullptr;
+    }
+    if (nv <= 0 || nv > 500000) { LOGE("test: bad nv=%d", nv); return; }
+
+    bool hadOrig = (va != nullptr);
+    if (hadOrig && (g_bak_mesh != mesh || g_bak_nv != nv)) {
         g_bak_mesh = mesh;
         g_bak_nv = nv;
         g_bak_verts.assign((size_t)nv * 12, 0);
         memcpy(g_bak_verts.data(), array_addr(va, (size_t)v3stride, 0), (size_t)nv * 12);
-        g_bak_bw.clear();
-        const MethodInfo* gw = find_method_any(meshCls, "get_boneWeights");
-        Il2CppArray* bwo = gw ? (Il2CppArray*)invoke_inst(gw, mesh, nullptr) : nullptr;
-        if (bwo && BWCls && bwo->max_length == va->max_length) {
-            int bwstride = array_elem_size(BWCls, 32);
-            g_bak_bw.assign((size_t)nv * bwstride, 0);
-            memcpy(g_bak_bw.data(), array_addr(bwo, (size_t)bwstride, 0), (size_t)nv * bwstride);
-            LOGI("test: backed up verts + boneWeights (bwstride=%d)", bwstride);
-        } else {
-            LOGI("test: backed up verts only (get_boneWeights=%p arr=%p len=%ld)",
-                 (void*)gw, (void*)bwo, bwo ? (long)bwo->max_length : -1L);
-        }
+        LOGI("test: backed up %d original verts", nv);
     }
 
     if (cmd == 1) {
-        float* p = (float*)array_addr(va, (size_t)v3stride, 0);
-        for (size_t i = 0; i < (size_t)nv * 3; i++) p[i] *= 0.5f;
+        if (!va) {
+            va = g_api.array_new(V3Cls, (size_t)nv);
+            if (!va) { LOGE("test1: array_new failed"); return; }
+        }
+        float* pp = (float*)array_addr(va, (size_t)v3stride, 0);
+        if (hadOrig) {
+            for (size_t i = 0; i < (size_t)nv * 3; i++) pp[i] *= 0.5f;
+            LOGI("test1: %d original verts scaled by 0.5", nv);
+        } else {
+            // 读不到原顶点就只能写死——全填 0，角色应该缩成一个点
+            for (size_t i = 0; i < (size_t)nv * 3; i++) pp[i] = 0.0f;
+            LOGI("test1: no original data, %d zero verts written (expect collapse)", nv);
+        }
         const MethodInfo* sv = find_method_any(meshCls, "set_vertices");
         if (!sv) { LOGE("test1: set_vertices stripped"); return; }
         void* a[1] = { va };
         invoke_inst(sv, mesh, a);
-        LOGI("test1: set_vertices x0.5 done on %d verts", nv);
+        LOGI("test1: set_vertices called nv=%d mesh=%p", nv, (void*)mesh);
     } else if (cmd == 2) {
         if (!BWCls) { LOGE("test2: no BoneWeight class"); return; }
         BwLayout L = bw_layout(BWCls);
@@ -4467,7 +4499,7 @@ static void run_mesh_test(int cmd) {
         if (!sw) { LOGE("test2: set_boneWeights stripped"); return; }
         void* a[1] = { bwa };
         invoke_inst(sw, mesh, a);
-        LOGI("test2: all %d verts bound to bone 0 (weight 1) done", nv);
+        LOGI("test2: all %d verts bound to bone 0, weight 1", nv);
     } else {
         LOGE("test: unknown cmd %d", cmd);
     }
