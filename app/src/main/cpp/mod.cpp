@@ -4061,13 +4061,132 @@ static int match_by_hierarchy(Il2CppClass* TrCls,
     return added;
 }
 
+
+// ---------------------------------------------------------------
+// 雷霆大导出：把场景里所有 SMR、所有骨骼、完整层级一次性写到文件。
+// 不走 logcat（会被截断），直接 fopen 写到游戏私有目录，再用 su 拷出来分析。
+// ---------------------------------------------------------------
+static void dump_tree_to(FILE* f, Il2CppObject* smr, const char* tag) {
+    Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+    Il2CppClass* TrCls  = find_class_any("UnityEngine", "Transform");
+    if (!SMRCls || !TrCls) return;
+    const MethodInfo* gb        = find_method_any(SMRCls, "get_bones");
+    const MethodInfo* getParent = find_method_any(TrCls, "get_parent");
+    const MethodInfo* getCount  = find_method_any(TrCls, "get_childCount");
+    const MethodInfo* l2w       = find_method_any(TrCls, "get_localToWorldMatrix");
+    const MethodInfo* getLP     = find_method_any(TrCls, "get_localPosition");
+    const MethodInfo* getLR     = find_method_any(TrCls, "get_localRotation");
+    const MethodInfo* getLS     = find_method_any(TrCls, "get_localScale");
+
+    Il2CppArray* ba = gb ? (Il2CppArray*)invoke_inst(gb, smr, nullptr) : nullptr;
+    if (!ba) { fprintf(f, "%s bones=NULL\n", tag); return; }
+    int N = (int)ba->max_length;
+
+    std::vector<Il2CppObject*> bones((size_t)N, nullptr);
+    std::set<Il2CppObject*> bset;
+    for (int i = 0; i < N; i++) {
+        Il2CppObject* b = *(Il2CppObject**)array_addr(ba, 8, (size_t)i);
+        bones[i] = b;
+        if (b) bset.insert(b);
+    }
+
+    std::map<Il2CppObject*, std::vector<Il2CppObject*> > tree;
+    std::vector<Il2CppObject*> roots;
+    for (int i = 0; i < N; i++) {
+        Il2CppObject* b = bones[i];
+        if (!b) continue;
+        Il2CppObject* par = getParent ? invoke_inst(getParent, b, nullptr) : nullptr;
+        if (par && bset.count(par)) tree[par].push_back(b);
+        else roots.push_back(b);
+    }
+
+    fprintf(f, "\n===== %s  bones=%d roots=%d =====\n", tag, N, (int)roots.size());
+
+    struct Item { Il2CppObject* t; int depth; };
+    std::vector<Item> stack;
+    for (int i = (int)roots.size() - 1; i >= 0; i--) { Item it; it.t = roots[i]; it.depth = 0; stack.push_back(it); }
+
+    int printed = 0;
+    while (!stack.empty() && printed < 400) {
+        Item it = stack.back(); stack.pop_back();
+        std::string nm = obj_name(it.t);
+        int nc = 0;
+        if (getCount) { Il2CppObject* r = invoke_inst(getCount, it.t, nullptr); if (r) nc = *(int*)((char*)r + 16); }
+
+        float wx = 0, wy = 0, wz = 0, lx = 0, ly = 0, lz = 0, qx = 0, qy = 0, qz = 0, qw = 1;
+        if (l2w) { Il2CppObject* m = invoke_inst(l2w, it.t, nullptr); if (m) { const float* mm = (const float*)((char*)m+16); wx=mm[12]; wy=mm[13]; wz=mm[14]; } }
+        if (getLP) { Il2CppObject* r = invoke_inst(getLP, it.t, nullptr); if (r) { lx=*(float*)((char*)r+16); ly=*(float*)((char*)r+20); lz=*(float*)((char*)r+24); } }
+        if (getLR) { Il2CppObject* r = invoke_inst(getLR, it.t, nullptr); if (r) { qx=*(float*)((char*)r+16); qy=*(float*)((char*)r+20); qz=*(float*)((char*)r+24); qw=*(float*)((char*)r+28); } }
+
+        // 在 bones[] 里的下标
+        int idx = -1;
+        for (int k = 0; k < N; k++) if (bones[k] == it.t) { idx = k; break; }
+
+        for (int d = 0; d < it.depth && d < 20; d++) fputc(' ', f);
+        fprintf(f, "[%3d] %-26s ch=%-2d wpos=(%8.2f,%8.2f,%8.2f) lpos=(%7.3f,%7.3f,%7.3f) lrot=(%6.3f,%6.3f,%6.3f,%6.3f)\n",
+                idx, nm.c_str(), nc, wx, wy, wz, lx, ly, lz, qx, qy, qz, qw);
+        printed++;
+
+        std::vector<Il2CppObject*>& ch = tree[it.t];
+        for (int i = (int)ch.size() - 1; i >= 0; i--) { Item c; c.t = ch[i]; c.depth = it.depth + 1; stack.push_back(c); }
+    }
+    if (printed >= 400) fprintf(f, "  ... truncated at 400\n");
+}
+
+static void dump_everything() {
+    const char* paths[2] = {
+        "/data/user/0/com.hermes.h1game/files/bonedb.txt",
+        "/data/data/com.hermes.h1game/files/bonedb.txt",
+    };
+    FILE* f = nullptr;
+    for (int i = 0; i < 2 && !f; i++) f = fopen(paths[i], "w");
+    if (!f) { LOGE("dump_everything: cannot open file"); return; }
+
+    Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+    std::vector<Fingerprint> list;
+    if (SMRCls) collect_fingerprints(SMRCls, list);
+
+    fprintf(f, "# ModelMod bonedb  smrs=%d\n", (int)list.size());
+
+    // 我们的 22 根（从 bonepos.txt 读过来对照）
+    fprintf(f, "\n##### OURS (PMX 22 bones, p = -bindpose.T) #####\n");
+    {
+        const char* bp[2] = {
+            "/data/user/0/com.hermes.h1game/files/bonepos.txt",
+            "/data/data/com.hermes.h1game/files/bonepos.txt",
+        };
+        FILE* g = nullptr;
+        for (int i = 0; i < 2 && !g; i++) g = fopen(bp[i], "r");
+        if (g) {
+            char line[256];
+            while (fgets(line, sizeof(line), g)) fprintf(f, "  %s", line);
+            fclose(g);
+        } else {
+            fprintf(f, "  (bonepos.txt not found)\n");
+        }
+    }
+
+    // 每个 SMR 一份完整树
+    for (size_t i = 0; i < list.size(); i++) {
+        Il2CppObject* sm = list[i].smr;
+        if (!sm || !*(void**)((char*)sm + 16)) continue;
+        char tag[512];
+        snprintf(tag, sizeof(tag), "SMR[%d] %s", (int)i, list[i].chain.c_str());
+        dump_tree_to(f, sm, tag);
+    }
+
+    fclose(f);
+    LOGI("dump_everything -> bonedb.txt (%d smrs)", (int)list.size());
+    // 标记到 log，方便确认执行了
+}
+
 static Il2CppObject* g_rigidRoot = nullptr;
 
 static int spawn_rigid_parts(Il2CppObject* origSmr) {
     LOGI("rigid: begin");
     {
-        static Il2CppObject* dumpedFor = nullptr;
-        if (dumpedFor != origSmr) { dumpedFor = origSmr; LOGI("rigid: STEP1 dump tree"); dump_bone_tree(origSmr); LOGI("rigid: STEP1 done"); }
+        static bool everDumped = false;
+        if (!everDumped) { everDumped = true; LOGI("rigid: STEP1 dump_everything"); dump_everything(); LOGI("rigid: STEP1 done"); }
     }
     destroy_our_smrs();
     LOGI("rigid: STEP2 cleared old");          // 先清掉上一轮建的块，否则每选一次就叠一层
