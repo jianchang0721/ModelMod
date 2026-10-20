@@ -1498,7 +1498,7 @@ static void main_tick() {
     // 日志里 NPTH 一次都没出现过。真正崩的是旧版只减平移、没乘 bind 逆矩阵（v144 修）。
     if (g_render_mode == 2) {
         static int skinTick = 0;
-        if ((skinTick++ % 2) == 0) update_skin_parts();
+        if ((skinTick++ % 3) == 0) update_skin_parts();
     }
 
     // v141: 验证命令，排到主线程跑
@@ -2370,6 +2370,16 @@ static void build_bindinv_map() {
     int mstride = array_elem_size(Mat4Cls, 64);
     void* a[1] = { g_api.type_get_object(g_api.class_get_type(SMRCls)) };
     Il2CppArray* arr = (Il2CppArray*)invoke_static(find, a);
+    // 场景里 23/40 个 SMR 是未激活的池子对象，FindObjectsOfType 拿不到它们，
+    // 而我们要找的骨骼很可能就在那些 SMR 的 bones[] 里
+    if (!arr || arr->max_length == 0) {
+        Il2CppClass* ResCls = find_class_any("UnityEngine", "Resources");
+        const MethodInfo* fa = ResCls ? find_method(ResCls, "FindObjectsOfTypeAll", 1) : nullptr;
+        if (fa) {
+            arr = (Il2CppArray*)invoke_static(fa, a);
+            LOGI("bindinv: switched to Resources.FindObjectsOfTypeAll");
+        }
+    }
     if (!arr) { LOGE("bindinv: FindObjectsOfType null"); return; }
     int n = 0, smrs = 0;
     for (size_t i = 0; i < arr->max_length; i++) {
@@ -2543,6 +2553,12 @@ static bool load_skin_part(FILE* f, Il2CppObject* mesh, int nv, int ni,
         }
     }
     LOGI("skin: %d bones, found %d/%u, real bindInv %d", nv, found, nb, withBind);
+    for (uint32_t i = 0; i < nb; i++) {
+        std::map<void*, std::vector<float>>::iterator it =
+            sp.bones[i] ? g_bindInv.find((void*)sp.bones[i]) : g_bindInv.end();
+        LOGI("skin:   bone[%2u] %-22s obj=%s bindInv=%s", i, names[i].c_str(),
+             sp.bones[i] ? "OK" : "MISS", it != g_bindInv.end() ? "OK" : "fallback");
+    }
     g_skinParts.push_back(sp);
     g_lastBoneNames = names;
     return found > 0;
@@ -2659,11 +2675,15 @@ static void update_skin_parts() {
             sp.outBuf[v*3+2] = oz;
         }
 
-        if (!sp.varray) sp.varray = g_api.array_new(V3Cls, sp.nv);
-        if (!sp.varray) continue;
-        memcpy(array_addr(sp.varray, 12, 0), sp.outBuf.data(), (size_t)sp.nv * 12);
-        void* a[1] = { sp.varray };
+        // v147: 每次重新分配。之前缓存 sp.varray 复用，看着省事，
+        // 但那个 Il2CppArray 只有 C++ 侧一个裸指针指着它，托管 GC 完全不知道，
+        // 几帧之后就被回收 —— memcpy 写到野内存上，必崩（v109-v113 的"崩溃"就是它）
+        Il2CppArray* varr = g_api.array_new(V3Cls, sp.nv);
+        if (!varr) continue;
+        memcpy(array_addr(varr, 12, 0), sp.outBuf.data(), (size_t)sp.nv * 12);
+        void* a[1] = { varr };
         invoke_inst(setVerts, sp.mesh, a);
+        sp.varray = nullptr;
         totalPushed++;
     }
     static int dbg = 0;
