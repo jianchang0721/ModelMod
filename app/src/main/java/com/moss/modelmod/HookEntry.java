@@ -274,6 +274,13 @@ public class HookEntry implements IXposedHookLoadPackage {
         btnRow3.addView(btnT3, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         panel.addView(btnRow3);
 
+        LinearLayout btnRow4 = new LinearLayout(act);
+        btnRow4.setOrientation(LinearLayout.HORIZONTAL);
+        TextView btnT4 = mkBtn(act, "验4 探测 readability/setter");
+        btnT4.setOnClickListener(v -> { try { testMesh(4); toast(act, "探测中，看日志"); } catch (Throwable t) { } });
+        btnRow4.addView(btnT4, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        panel.addView(btnRow4);
+
         final Handler lh = new Handler(Looper.getMainLooper());
         lh.post(new Runnable() {
             @Override public void run() {

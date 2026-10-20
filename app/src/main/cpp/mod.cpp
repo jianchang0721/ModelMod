@@ -4367,6 +4367,43 @@ static Il2CppObject* test_target_smr() {
     return best;
 }
 
+// ---------------------------------------------------------------
+// v143: mesh 元信息 + SMR setter 全量探测
+// ---------------------------------------------------------------
+static void dump_mesh_meta(Il2CppObject* mesh, Il2CppClass* meshCls) {
+    const char* names[] = {"get_isReadable", "get_vertexCount", "get_subMeshCount",
+                           "get_bindposes", "get_boneWeights", "get_triangles",
+                           "get_normals", "get_uv", "get_vertexBufferCount"};
+    Il2CppClass* arrCls = find_class_any("System", "Array");
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        const MethodInfo* m = find_method_any(meshCls, names[i]);
+        if (!m) { LOGI("meta: %-20s MISSING", names[i]); continue; }
+        Il2CppObject* r = invoke_inst(m, mesh, nullptr);
+        if (!r) { LOGI("meta: %-20s -> null", names[i]); continue; }
+        Il2CppClass* rc = g_api.object_get_class(r);
+        const char* rn = rc ? g_api.class_get_name(rc) : "?";
+        bool isArr = (rc && arrCls && g_api.class_is_assignable_from(rc, arrCls));
+        if (isArr) {
+            LOGI("meta: %-20s -> ARRAY len=%llu", names[i], (unsigned long long)((Il2CppArray*)r)->max_length);
+        } else {
+            LOGI("meta: %-20s -> %p cls=%s val16=%d", names[i], (void*)r, rn ? rn : "?", *(int*)((char*)r + 16));
+        }
+    }
+}
+
+static void dump_smr_setters(Il2CppClass* smrCls) {
+    const char* names[] = {"set_sharedMesh", "get_sharedMesh", "set_bones", "get_bones",
+                           "set_rootBone", "get_rootBone", "set_localBounds", "get_localBounds",
+                           "set_updateWhenOffscreen", "get_updateWhenOffscreen",
+                           "set_sharedMaterials", "get_sharedMaterials", "BakeMesh",
+                           "set_mesh", "get_mesh", "set_skinnedMotionVectors"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        const MethodInfo* m = find_method_any(smrCls, names[i]);
+        LOGI("smrset: %-24s %p argc=%u", names[i], (void*)m,
+             m ? g_api.method_get_param_count(m) : 0);
+    }
+}
+
 static void run_mesh_test(int cmd) {
     LOGI("===== MESHTEST cmd=%d BEGIN =====", cmd);
     Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
@@ -4452,6 +4489,35 @@ static void run_mesh_test(int cmd) {
         va = nullptr;
     }
     if (nv <= 0 || nv > 500000) { LOGE("test: bad nv=%d", nv); return; }
+
+    if (cmd == 4) {
+        dump_mesh_meta(mesh, meshCls);
+        LOGI("---- smr setters ----");
+        dump_smr_setters(mc);
+        LOGI("---- try to flip readable ----");
+        const MethodInfo* md = find_method_any(meshCls, "MarkDynamic");
+        if (md) { invoke_inst(md, mesh, nullptr); LOGI("test4: MarkDynamic ok"); }
+        else LOGI("test4: MarkDynamic missing");
+        const MethodInfo* up = find_method_any(meshCls, "UploadMeshData");
+        if (up) {
+            bool noLonger = false;
+            void* a[1] = { &noLonger };
+            invoke_inst(up, mesh, a);
+            LOGI("test4: UploadMeshData(false) ok");
+        } else LOGI("test4: UploadMeshData missing");
+        LOGI("---- meta after flip ----");
+        dump_mesh_meta(mesh, meshCls);
+        Il2CppArray* za = g_api.array_new(V3Cls, (size_t)nv);
+        if (za) {
+            float* zp = (float*)array_addr(za, (size_t)v3stride, 0);
+            for (size_t i = 0; i < (size_t)nv * 3; i++) zp[i] = 0.0f;
+            const MethodInfo* sv4 = find_method_any(meshCls, "set_vertices");
+            if (sv4) { void* a2[1] = { za }; invoke_inst(sv4, mesh, a2); LOGI("test4: set_vertices(zeros) after flip, nv=%d", nv); }
+            else LOGE("test4: set_vertices missing");
+        }
+        LOGI("===== MESHTEST cmd=4 END =====");
+        return;
+    }
 
     bool hadOrig = (va != nullptr);
     if (hadOrig && (g_bak_mesh != mesh || g_bak_nv != nv)) {
