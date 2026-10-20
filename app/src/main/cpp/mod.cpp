@@ -2614,8 +2614,52 @@ static bool load_skin_part(FILE* f, Il2CppObject* mesh, int nv, int ni,
             if (it != g_bindInv.end()) {
                 for (int q = 0; q < 16; q++) bi[q] = it->second[q];
                 withBind++;
+            } else {
+                // 游戏骨骼里没有这根（bonedb 已确认 11001 没有 Spine2、手臂链在
+                // UpperArm 之后断开，没有 Forearm）。顺着 Transform 父链往上找，
+                // 借最近一个有 bindInv 的。代价是那一段丢一次弯曲，但不会撕。
+                Il2CppClass* TransCls = find_class_any("UnityEngine", "Transform");
+                const MethodInfo* gp = TransCls ? find_method_any(TransCls, "get_parent") : nullptr;
+                Il2CppObject* cur = b;
+                int borrowed = 0;
+                for (int up = 0; up < 8 && cur && gp; up++) {
+                    Il2CppObject* par = invoke_inst(gp, cur, nullptr);
+                    if (!par) break;
+                    cur = par;
+                    std::map<void*, std::vector<float>>::iterator pit = g_bindInv.find((void*)cur);
+                    if (pit != g_bindInv.end()) { it = pit; borrowed = up + 1; break; }
+                }
+                if (it != g_bindInv.end()) {
+                    for (int q = 0; q < 16; q++) bi[q] = it->second[q];
+                    withBind++;
+                    LOGI("skin: bone[%u] %s bindInv borrowed from parent up %d",
+                         i, names[i].c_str(), borrowed);
+                }
             }
         }
+    }
+
+    // 连父链都借不到的（Spine2 连对象都没找到），按槽位硬指定父骨骼借
+    static const struct { int slot; int parentSlot; } kBorrow[] = {
+        { 3,  2},   // Spine2    <- Spine1
+        {16, 15},   // L Forearm <- L UpperArm
+        {20, 19},   // R Forearm <- R UpperArm
+    };
+    for (size_t h = 0; h < sizeof(kBorrow) / sizeof(kBorrow[0]); h++) {
+        int s = kBorrow[h].slot, ps = kBorrow[h].parentSlot;
+        if (s < 0 || s >= (int)nb || ps < 0 || ps >= (int)nb) continue;
+        float* si = &sp.bindInv[s * 16];
+        // 判断是不是还在吃纯平移兜底：单位旋转 + 只有平移
+        bool fallback = true;
+        for (int q = 0; q < 16 && fallback; q++) {
+            float want = (q == 0 || q == 5 || q == 10 || q == 15) ? 1.0f : 0.0f;
+            if (q == 12 || q == 13 || q == 14) continue;   // 平移位不比
+            if (fabsf(si[q] - want) > 1e-4f) fallback = false;
+        }
+        if (!fallback) continue;
+        const float* pi = &sp.bindInv[ps * 16];
+        for (int q = 0; q < 16; q++) si[q] = pi[q];
+        LOGI("skin: slot %d bindInv hard-borrowed from slot %d", s, ps);
     }
     LOGI("skin: %d bones, found %d/%u, real bindInv %d", nv, found, nb, withBind);
     for (uint32_t i = 0; i < nb; i++) {
