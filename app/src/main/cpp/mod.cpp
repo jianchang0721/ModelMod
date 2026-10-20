@@ -1496,7 +1496,7 @@ static void main_tick() {
     // CPU 蒙皮（模式 2）：每 2 帧一次。
     // v113 记的"fdsan / NPTH"经复查站不住：update_skin_parts 里一行文件操作都没有，
     // 日志里 NPTH 一次都没出现过。真正崩的是旧版只减平移、没乘 bind 逆矩阵（v144 修）。
-    if (g_render_mode == 2 && !g_skinParts.empty()) {
+    if (g_render_mode == 2) {
         static int skinTick = 0;
         if ((skinTick++ % 2) == 0) update_skin_parts();
     }
@@ -2340,6 +2340,9 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
 // ---------------------------------------------------------------
 // CPU 蒙皮：读 MMS2 的骨骼权重，每 N 帧算一次顶点
 // ---------------------------------------------------------------
+static const MethodInfo* find_method_any(Il2CppClass* klass, const char* name);
+static int array_elem_size(Il2CppClass* k, int fallback);
+
 // ---------------------------------------------------------------
 // v144: 从游戏自己的 bindposes 收集每根骨骼的 bind 逆矩阵
 //
