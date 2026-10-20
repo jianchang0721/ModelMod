@@ -4237,7 +4237,42 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
     LOGI("rigid: layer=%d", layer);
 
     LOGI("rigid: STEP5 spawning pieces");
-    const float kBase = 1.7f / 20.214f;
+
+    // ---- 自适应缩放 ----
+    // 之前写死 kBase = 1.7/20.214 = 0.084，把每块缩小了 10 倍，
+    // 结果 27 块各自缩成小碎片挂在各自骨骼位置上 —— 看起来就是"碎一地"。
+    // 正确比例要从游戏骨骼自身量：Pelvis→Head 的实际跨度 / PMX 里的跨度。
+    float kBase = 1.7f / 20.214f;
+    {
+        Il2CppClass* TrCls2 = find_class_any("UnityEngine", "Transform");
+        const MethodInfo* l2w2 = TrCls2 ? find_method_any(TrCls2, "get_localToWorldMatrix") : nullptr;
+        int bpi = -1, bhi = -1;
+        for (int i = 0; i < 22; i++) {
+            int g = gidx[i];
+            if (g < 0 || g >= N) continue;
+            if (gnorm[g].find("pelvis") != std::string::npos) bpi = g;
+            if (gnorm[g].find("head")   != std::string::npos) bhi = g;
+        }
+        if (bpi >= 0 && bhi >= 0 && l2w2 && bones[bpi] && bones[bhi]) {
+            float py = 0, hy = 0;
+            Il2CppObject* m1 = invoke_inst(l2w2, bones[bpi], nullptr);
+            if (m1) py = *(float*)((char*)m1 + 16 + 13*4);
+            Il2CppObject* m2 = invoke_inst(l2w2, bones[bhi], nullptr);
+            if (m2) hy = *(float*)((char*)m2 + 16 + 13*4);
+            float gSpan = fabsf(hy - py);
+            float pSpan = 16.0363f - 8.0000f;      // PMX Pelvis→Head
+            LOGI("rigid: span game=%.3f pmx=%.3f", gSpan, pSpan);
+            if (gSpan > 0.05f && gSpan < 500.0f && pSpan > 0.01f) {
+                kBase = gSpan / pSpan;
+                LOGI("rigid: kBase auto %.5f -> %.5f", 1.7f / 20.214f, kBase);
+            } else {
+                LOGE("rigid: span out of range, keep fallback %.5f", kBase);
+            }
+        } else {
+            LOGE("rigid: no pelvis/head for k, keep fallback %.5f", kBase);
+        }
+    }
+
     int made = 0, skipped = 0;
 
     for (int part = 0; part < 4; part++) {
