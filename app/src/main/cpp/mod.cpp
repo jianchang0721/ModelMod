@@ -3760,6 +3760,75 @@ static int match_bones_by_position(const char* dir,
     return matched;
 }
 
+
+// ---------------------------------------------------------------
+// 方案 A：用 Unity 的 Humanoid 骨骼语义 API 拿骨骼
+// Animator.GetBoneTransform(HumanBodyBones) 直接按"语义"返回 Transform，
+// 完全不用管骨骼叫什么名字、在哪个位置。前提是角色用 Humanoid rig。
+// 枚举值（Unity 2018.4）：
+//   0 Hips 1 LUpperLeg 2 RUpperLeg 3 LLowerLeg 4 RLowerLeg 5 LFoot 6 RFoot
+//   7 Spine 8 Chest 9 Neck 10 Head 11 LShoulder 12 RShoulder
+//   13 LUpperArm 14 RUpperArm 15 LLowerArm 16 RLowerArm 17 LHand 18 RHand
+//   19 LToes 20 RToes
+// ---------------------------------------------------------------
+static const int kHbbMap[22] = {
+    0,   // 0  Pelvis      -> Hips
+    7,   // 1  Spine       -> Spine
+    8,   // 2  Spine1      -> Chest
+    8,   // 3  Spine2      -> Chest（2018 没有 UpperChest，重复用）
+    9,   // 4  Neck        -> Neck
+    10,  // 5  Head        -> Head
+    1,   // 6  L Thigh     -> LeftUpperLeg
+    3,   // 7  L Calf      -> LeftLowerLeg
+    5,   // 8  L Foot      -> LeftFoot
+    19,  // 9  L Toe0      -> LeftToes
+    2,   // 10 R Thigh     -> RightUpperLeg
+    4,   // 11 R Calf      -> RightLowerLeg
+    6,   // 12 R Foot      -> RightFoot
+    20,  // 13 R Toe0      -> RightToes
+    11,  // 14 L Clavicle  -> LeftShoulder
+    13,  // 15 L UpperArm  -> LeftUpperArm
+    15,  // 16 L Forearm   -> LeftLowerArm
+    17,  // 17 L Hand      -> LeftHand
+    12,  // 18 R Clavicle  -> RightShoulder
+    14,  // 19 R UpperArm  -> RightUpperArm
+    16,  // 20 R Forearm   -> RightLowerArm
+    18,  // 21 R Hand      -> RightHand
+};
+
+static int try_humanoid_bones(Il2CppObject* origSmr, std::vector<Il2CppObject*>& out) {
+    out.assign(22, nullptr);
+    Il2CppClass* AnimCls = find_class_any("UnityEngine", "Animator");
+    if (!AnimCls) { LOGE("rigid: no Animator class"); return 0; }
+    const MethodInfo* gbt = find_method_any(AnimCls, "GetBoneTransform");
+    if (!gbt) { LOGE("rigid: Animator.GetBoneTransform STRIPPED"); return 0; }
+
+    Il2CppClass* CompCls = find_class_any("UnityEngine", "Component");
+    const MethodInfo* getGO = CompCls ? find_method_any(CompCls, "get_gameObject") : nullptr;
+    const MethodInfo* getComp = CompCls ? find_method(CompCls, "GetComponent", 1) : nullptr;
+    const MethodInfo* getCompParent = CompCls ? find_method_any(CompCls, "GetComponentInParent") : nullptr;
+    if (!getGO || !getComp) { LOGE("rigid: component api missing"); return 0; }
+
+    void* t[1] = { g_api.type_get_object(g_api.class_get_type(AnimCls)) };
+    Il2CppObject* anim = nullptr;
+    Il2CppObject* go = invoke_inst(getGO, origSmr, nullptr);
+    if (go) anim = invoke_inst(getComp, go, t);
+    if (!anim && getCompParent) anim = invoke_inst(getCompParent, origSmr, t);
+    if (!anim) { LOGE("rigid: no Animator on/near SMR"); return 0; }
+    LOGI("rigid: animator=%p", anim);
+
+    int got = 0;
+    for (int i = 0; i < 22; i++) {
+        int id = kHbbMap[i];
+        void* b[1] = { &id };
+        Il2CppObject* tr = invoke_inst(gbt, anim, b);
+        out[i] = tr;
+        if (tr) got++;
+    }
+    LOGI("rigid: humanoid bones %d/22", got);
+    return got;
+}
+
 static Il2CppObject* g_rigidRoot = nullptr;
 
 static int spawn_rigid_parts(Il2CppObject* origSmr) {
@@ -3801,8 +3870,30 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
     std::vector<std::string> ourNames;
     if (!read_mm2_names(p0, ourNames)) { LOGE("rigid: cannot read custom_0 names"); return 0; }
     std::vector<int> gidx;
-    int found = map_bones(ourNames, gnorm, &gidx);
+    int found = 0;
+
+    // ---- 优先走 Humanoid 语义骨骼 ----
+    {
+        std::vector<Il2CppObject*> hb;
+        int hbGot = try_humanoid_bones(origSmr, hb);
+        if (hbGot >= 15) {
+            LOGI("rigid: *** using HUMANOID bone API (%d/22) ***", hbGot);
+            bones.assign(hb.begin(), hb.end());
+            N = (int)bones.size();           // 22
+            gnorm.assign((size_t)N, std::string());
+            for (int i = 0; i < N; i++)
+                gnorm[i] = bones[i] ? norm_bone(obj_name(bones[i]), false) : std::string();
+            gidx.assign((size_t)N, -1);
+            for (int i = 0; i < N; i++) if (bones[i]) { gidx[i] = i; found++; }
+            LOGI("rigid: humanoid mapped %d/22", found);
+            goto mapped_done;
+        }
+        if (hbGot > 0) LOGI("rigid: humanoid only %d/22, fallback to name matching", hbGot);
+    }
+
+    found = map_bones(ourNames, gnorm, &gidx);
     LOGI("rigid: name-mapped %d/%d bones, target rig has %d", found, (int)ourNames.size(), N);
+    mapped_done:;
     for (int i = 0; i < (int)ourNames.size(); i++) {
         LOGI("rigid: namemap[%2d] %-20s -> %s", i, ourNames[i].c_str(),
              gidx[i] >= 0 ? gnorm[gidx[i]].c_str() : "NONE");
