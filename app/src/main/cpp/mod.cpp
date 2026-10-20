@@ -2343,6 +2343,22 @@ static Il2CppObject* spawn_model_object(Il2CppObject* smr) {
 static const MethodInfo* find_method_any(Il2CppClass* klass, const char* name);
 static int array_elem_size(Il2CppClass* k, int fallback);
 
+static std::string norm_bone(const std::string& in, bool stripBip);
+
+// 硬映射：只对 11001 这名角色有效，名字对不上时兜底
+// 依据 11001_U_1/Body 的骨骼树：
+//   L Calf → Bone19(脚) → Bone18(脚趾) → Bone17
+//   R Calf → Bone16(脚) → Bone15(脚趾) → Bone14
+//   Bone57 是独立根，在左手末端；Bone38 在右手末端
+static const struct { const char* target; int slot; } kHardMap[] = {
+    {"bone19",  8},   // L Foot
+    {"bone18",  9},   // L Toe0
+    {"bone16", 12},   // R Foot
+    {"bone15", 13},   // R Toe0
+    {"bone57", 17},   // L Hand
+    {"bone38", 21},   // R Hand
+};
+
 // ---------------------------------------------------------------
 // v144: 从游戏自己的 bindposes 收集每根骨骼的 bind 逆矩阵
 //
@@ -2491,7 +2507,7 @@ static Il2CppObject* find_child_by_name(Il2CppObject* root, const char* name, in
 
 // 读 MMS2 的骨骼部分（在 spawn_one_part 读完顶点/索引之后调用）
 static bool load_skin_part(FILE* f, Il2CppObject* mesh, int nv, int ni,
-                           Il2CppObject* roleRoot, float scaleK) {
+                           Il2CppObject* roleRoot, float scaleK, Il2CppObject* smr) {
     uint32_t nb = 0;
     if (fread(&nb, 4, 1, f) != 1 || nb == 0 || nb > 128) return false;
 
@@ -2531,11 +2547,60 @@ static bool load_skin_part(FILE* f, Il2CppObject* mesh, int nv, int ni,
         sp.bindT[i*3+1] = -ibm[i*16+13];
         sp.bindT[i*3+2] = -ibm[i*16+14];
     }
-    // 找游戏骨骼
+    // ---- 找游戏骨骼 ----
+    // v148：优先用这个 SMR 自己的 bones[]。
+    // 原因：bindposes 和 SMR.bones[] 是按下标一一对应的，
+    // 在角色层级里按名字瞎找（find_child_by_name）会拿到同名的另一个 Transform，
+    // 那父指针就不在 bindposes 那本字典里 —— 上一版四肢 14 根全走 fallback 就是这个。
+    Il2CppArray* smrBones = nullptr;
+    {
+        Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+        if (smr && SMRCls) {
+            const MethodInfo* gb = find_method_any(SMRCls, "get_bones");
+            if (gb) smrBones = (Il2CppArray*)invoke_inst(gb, smr, nullptr);
+        }
+    }
+    size_t smrNB = (smrBones && smrBones->max_length < 4096) ? smrBones->max_length : 0;
+    LOGI("skin: smr bones=%zu, our names=%u", smrNB, nb);
+
+    std::vector<int> hit(nb, -1);
+    if (smrNB > 0) {
+        for (uint32_t i = 0; i < nb; i++) {
+            std::string want = norm_bone(names[i], false);
+            for (size_t j = 0; j < smrNB; j++) {
+                Il2CppObject* t = *(Il2CppObject**)array_addr(smrBones, sizeof(void*), j);
+                if (!t) continue;
+                if (norm_bone(obj_name(t), false) == want) { hit[i] = (int)j; break; }
+            }
+        }
+        // 名字对不上的，用硬映射再捞一遍
+        int hard = 0;
+        for (size_t h = 0; h < sizeof(kHardMap) / sizeof(kHardMap[0]); h++) {
+            int slot = kHardMap[h].slot;
+            if (slot < 0 || slot >= (int)nb || hit[slot] >= 0) continue;
+            for (size_t j = 0; j < smrNB; j++) {
+                Il2CppObject* t = *(Il2CppObject**)array_addr(smrBones, sizeof(void*), j);
+                if (!t) continue;
+                if (norm_bone(obj_name(t), false) == kHardMap[h].target) {
+                    hit[slot] = (int)j;
+                    hard++;
+                    LOGI("skin: hardmap slot %d <- %s", slot, kHardMap[h].target);
+                    break;
+                }
+            }
+        }
+        int nameHit = 0;
+        for (uint32_t i = 0; i < nb; i++) if (hit[i] >= 0) nameHit++;
+        LOGI("skin: name hits %d / %u (hardmap added %d)", nameHit, nb, hard);
+    }
+
     int found = 0, withBind = 0;
     sp.bindInv.resize((size_t)nb * 16, 0.0f);
     for (uint32_t i = 0; i < nb; i++) {
-        Il2CppObject* b = find_child_by_name(roleRoot, names[i].c_str());
+        Il2CppObject* b = nullptr;
+        if (hit[i] >= 0 && smrBones)
+            b = *(Il2CppObject**)array_addr(smrBones, sizeof(void*), (size_t)hit[i]);
+        if (!b) b = find_child_by_name(roleRoot, names[i].c_str());   // 最后兜底
         sp.bones.push_back(b);
         // 默认兜底：纯平移（= 老行为）
         float* bi = &sp.bindInv[i * 16];
@@ -2747,7 +2812,7 @@ static Il2CppObject* spawn_one_part(Il2CppObject* smr, Il2CppObject* roleRoot,
     if (setT) { void* a[1] = { ia }; invoke_inst(setT, mesh, a); }
 
     if (isSkinPart && mesh) {
-        load_skin_part(f, mesh, (int)nv, (int)ni, roleRoot, scaleK);
+        load_skin_part(f, mesh, (int)nv, (int)ni, roleRoot, scaleK, smr);
     }
     fclose(f);
 
@@ -4398,14 +4463,7 @@ static void dump_everything() {
 //   Bone57 是独立根，wpos 在左手末端
 //   Bone38 是独立根，wpos 在右手末端
 // ---------------------------------------------------------------
-static const struct { const char* target; int slot; } kHardMap[] = {
-    {"bone19",  8},   // L Foot
-    {"bone18",  9},   // L Toe0
-    {"bone16", 12},   // R Foot
-    {"bone15", 13},   // R Toe0
-    {"bone57", 17},   // L Hand
-    {"bone38", 21},   // R Hand
-};
+// kHardMap 已上移到 load_skin_part 之前
 
 static int apply_hard_map(const std::vector<std::string>& gnorm, int N, std::vector<int>& gidx) {
     int added = 0;
