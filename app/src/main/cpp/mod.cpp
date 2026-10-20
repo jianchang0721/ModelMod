@@ -1053,6 +1053,20 @@ static int spawn_parts_loop(Il2CppObject* smr);
 static void build_target_list(Il2CppObject* playerRoot);
 static int spawn_rigid_parts(Il2CppObject* origSmr);
 static void update_skin_parts();
+
+// ===== v141: 原生蒙皮验证 =====
+// 思路：一行 bindposes 都不改，只改原 mesh 自己的顶点和权重，
+// 让游戏拿它自己的 bindposes + bones 去做蒙皮。
+// 1 = 顶点整体减半（验证 set_vertices 单次调用能否生效）
+// 2 = 全部顶点绑到 0 号骨（验证 set_boneWeights 能否生效）
+// 3 = 还原
+static volatile int g_test_cmd = 0;
+static std::vector<unsigned char> g_bak_verts;
+static std::vector<unsigned char> g_bak_bw;
+static int g_bak_nv = 0;
+static Il2CppObject* g_bak_mesh = nullptr;
+static void run_mesh_test(int cmd);
+
 static void* g_orig_canvas = nullptr;
 static void* g_orig_inst1 = nullptr;
 static void* g_orig_inst2 = nullptr;
@@ -1479,6 +1493,12 @@ static void main_tick() {
         // 先彻底关掉保稳定；下一步改成 worker 线程预算 + 主线程只做上传
         // static int skinTick = 0;
         // if ((skinTick++ % 30) == 0) { update_skin_parts(); }
+    }
+
+    // v141: 验证命令，排到主线程跑
+    if (g_test_cmd) {
+        int c = g_test_cmd; g_test_cmd = 0;
+        run_mesh_test(c);
     }
 
     // 开关切换：立即处理，不等 3 秒
@@ -4218,6 +4238,245 @@ static int apply_hard_map(const std::vector<std::string>& gnorm, int N, std::vec
     return added;
 }
 
+// ---------------------------------------------------------------
+// v141: 从 bindposes 反推「骨骼 bind 那一帧」的世界姿态
+//
+// 块的 localRotation/localScale 必须抵消 bind 姿态，不是 spawn 那一瞬的姿态。
+// 之前的写法是 inverse(骨骼实时 worldRotation)：角色只要不在 bind pose，
+// 每块就整体带着 bind→现在的增量旋转——位置对、方向歪就是这么来的。
+//
+// bindposes[i] = inverse(bone.localToWorldMatrix at bind)
+//   → 真 3x3 = (1/s) * R_bind^T
+//   → 列长 l = 1/s，列归一化后就是 R_bind^T，正是要的 localRotation
+//   → localScale = kBase * l
+// ---------------------------------------------------------------
+struct BindRef { Quat rot; float sc; bool ok; };
+
+static void quat_from_basis(const float c[3][3], Quat& q) {
+    // c[列][行]
+    float m00 = c[0][0], m01 = c[1][0], m02 = c[2][0];
+    float m10 = c[0][1], m11 = c[1][1], m12 = c[2][1];
+    float m20 = c[0][2], m21 = c[1][2], m22 = c[2][2];
+    float tr = m00 + m11 + m22;
+    if (tr > 0.0f) {
+        float s = sqrtf(tr + 1.0f) * 2.0f;
+        q.w = 0.25f * s; q.x = (m21 - m12) / s; q.y = (m02 - m20) / s; q.z = (m10 - m01) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        float s = sqrtf(1.0f + m00 - m11 - m22) * 2.0f;
+        q.w = (m21 - m12) / s; q.x = 0.25f * s; q.y = (m01 + m10) / s; q.z = (m02 + m20) / s;
+    } else if (m11 > m22) {
+        float s = sqrtf(1.0f + m11 - m00 - m22) * 2.0f;
+        q.w = (m02 - m20) / s; q.x = (m01 + m10) / s; q.y = 0.25f * s; q.z = (m12 + m21) / s;
+    } else {
+        float s = sqrtf(1.0f + m22 - m00 - m11) * 2.0f;
+        q.w = (m10 - m01) / s; q.x = (m02 + m20) / s; q.y = (m12 + m21) / s; q.z = 0.25f * s;
+    }
+}
+
+static void build_bindref_map(Il2CppClass* SMRCls, std::map<void*, BindRef>& out) {
+    out.clear();
+    if (!SMRCls) return;
+    Il2CppClass* ObjectCls = find_class_any("UnityEngine", "Object");
+    Il2CppClass* MeshCls   = find_class_any("UnityEngine", "Mesh");
+    Il2CppClass* Mat4Cls   = find_class_any("UnityEngine", "Matrix4x4");
+    if (!ObjectCls || !MeshCls) { LOGE("bindref: class missing"); return; }
+    const MethodInfo* find = find_method(ObjectCls, "FindObjectsOfType", 1);
+    const MethodInfo* gb   = find_method_any(SMRCls, "get_bones");
+    const MethodInfo* gm   = find_method_any(SMRCls, "get_sharedMesh");
+    const MethodInfo* gbp  = find_method_any(MeshCls, "get_bindposes");
+    if (!find || !gb || !gm || !gbp) {
+        LOGE("bindref: method missing find=%p bones=%p mesh=%p bp=%p",
+             (void*)find, (void*)gb, (void*)gm, (void*)gbp);
+        return;
+    }
+    int mstride = array_elem_size(Mat4Cls, 64);
+    void* a[1] = { g_api.type_get_object(g_api.class_get_type(SMRCls)) };
+    Il2CppArray* arr = (Il2CppArray*)invoke_static(find, a);
+    if (!arr) { LOGE("bindref: FindObjectsOfType null"); return; }
+
+    int smrSeen = 0, badLen = 0;
+    for (size_t i = 0; i < arr->max_length; i++) {
+        Il2CppObject* smr = *(Il2CppObject**)array_addr(arr, sizeof(void*), i);
+        if (!smr) continue;
+        Il2CppArray* bones = (Il2CppArray*)invoke_inst(gb, smr, nullptr);
+        Il2CppObject* mesh  = invoke_inst(gm, smr, nullptr);
+        if (!bones || !mesh || bones->max_length == 0) continue;
+        Il2CppArray* bps = (Il2CppArray*)invoke_inst(gbp, mesh, nullptr);
+        if (!bps || bps->max_length != bones->max_length) { badLen++; continue; }
+        smrSeen++;
+        for (size_t k = 0; k < bones->max_length; k++) {
+            Il2CppObject* b = *(Il2CppObject**)array_addr(bones, sizeof(void*), k);
+            if (!b) continue;
+            if (out.find((void*)b) != out.end()) continue;   // 同一根骨骼多个 SMR 都有，取第一个
+            const float* m = (const float*)array_addr(bps, (size_t)mstride, k);
+            // 列主序：第一列 m[0..2]，第二列 m[4..6]，第三列 m[8..10]
+            float c[3][3] = {{m[0], m[1], m[2]}, {m[4], m[5], m[6]}, {m[8], m[9], m[10]}};
+            BindRef r; r.ok = false; r.sc = 1.0f; r.rot.x = 0; r.rot.y = 0; r.rot.z = 0; r.rot.w = 1;
+            float l0 = sqrtf(c[0][0]*c[0][0] + c[0][1]*c[0][1] + c[0][2]*c[0][2]);
+            float l1 = sqrtf(c[1][0]*c[1][0] + c[1][1]*c[1][1] + c[1][2]*c[1][2]);
+            float l2 = sqrtf(c[2][0]*c[2][0] + c[2][1]*c[2][1] + c[2][2]*c[2][2]);
+            if (l0 > 1e-5f && l1 > 1e-5f && l2 > 1e-5f) {
+                float n[3][3];
+                for (int q = 0; q < 3; q++) {
+                    n[0][q] = c[0][q] / l0;
+                    n[1][q] = c[1][q] / l1;
+                    n[2][q] = c[2][q] / l2;
+                }
+                quat_from_basis(n, r.rot);
+                r.sc = (l0 + l1 + l2) / 3.0f;
+                r.ok = true;
+            }
+            out[(void*)b] = r;
+        }
+    }
+    LOGI("bindref: %d SMRs usable (%d length mismatches), %d bones with bind pose",
+         smrSeen, badLen, (int)out.size());
+}
+
+// ---------------------------------------------------------------
+// v141: 原生蒙皮可行性验证
+// cmd 1 = 顶点整体 x0.5 写回   （验 set_vertices）
+// cmd 2 = 全部顶点绑 0 号骨    （验 set_boneWeights）
+// cmd 3 = 还原这两项
+// ---------------------------------------------------------------
+static Il2CppObject* test_target_smr() {
+    Il2CppClass* SMRCls = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+    if (!SMRCls) { LOGE("test: no SMR class"); return nullptr; }
+    if (g_tgt_sel >= 0) {
+       Il2CppObject* s = nullptr;
+        pthread_mutex_lock(&g_tgt_mtx);
+        if (g_tgt_sel < (int)g_tgt_smrs.size()) s = g_tgt_smrs[g_tgt_sel];
+        pthread_mutex_unlock(&g_tgt_mtx);
+        if (s && *(void**)((char*)s + 16)) {
+            LOGI("test: using picked target idx=%d", (int)g_tgt_sel);
+            return s;
+        }
+    }
+    std::vector<Fingerprint> fps;
+    collect_fingerprints(SMRCls, fps);
+    Il2CppObject* best = nullptr;
+    int bestv = 0;
+    for (size_t i = 0; i < fps.size(); i++) {
+        if (!fps[i].smr) continue;
+        if (fps[i].verts <= 100 || fps[i].verts > 200000) continue;
+        if (!under_player_root(fps[i].smr)) continue;
+        if (fps[i].verts > bestv) { bestv = fps[i].verts; best = fps[i].smr; }
+    }
+    if (best) LOGI("test: auto target verts=%d", bestv);
+    else LOGE("test: no player SMR found (pick a target first)");
+    return best;
+}
+
+static void run_mesh_test(int cmd) {
+    LOGI("===== MESHTEST cmd=%d BEGIN =====", cmd);
+    Il2CppClass* MeshCls = find_class_any("UnityEngine", "Mesh");
+    Il2CppClass* V3Cls   = find_class_any("UnityEngine", "Vector3");
+    Il2CppClass* BWCls   = find_class_any("UnityEngine", "BoneWeight");
+    if (!MeshCls || !V3Cls) { LOGE("test: class missing M=%p V3=%p", (void*)MeshCls, (void*)V3Cls); return; }
+    int v3stride = array_elem_size(V3Cls, 12);
+
+    if (cmd == 3) {
+        if (!g_bak_mesh || g_bak_nv <= 0) { LOGE("test3: nothing backed up"); return; }
+        Il2CppClass* mc = g_api.object_get_class(g_bak_mesh);
+        if (!mc) mc = MeshCls;
+        if (!g_bak_verts.empty()) {
+            Il2CppArray* va = g_api.array_new(V3Cls, (size_t)g_bak_nv);
+            if (va) {
+                memcpy(array_addr(va, (size_t)v3stride, 0), g_bak_verts.data(), g_bak_verts.size());
+                const MethodInfo* sv = find_method_any(mc, "set_vertices");
+                if (sv) { void* a[1] = { va }; invoke_inst(sv, g_bak_mesh, a); LOGI("test3: vertices restored %d", g_bak_nv); }
+                else LOGE("test3: set_vertices missing");
+            }
+        }
+        if (!g_bak_bw.empty() && BWCls) {
+            int bwstride = array_elem_size(BWCls, 32);
+            Il2CppArray* bwa = g_api.array_new(BWCls, (size_t)g_bak_nv);
+            if (bwa) {
+                memcpy(array_addr(bwa, (size_t)bwstride, 0), g_bak_bw.data(),
+                       g_bak_bw.size() < (size_t)g_bak_nv * bwstride ? g_bak_bw.size() : (size_t)g_bak_nv * bwstride);
+                const MethodInfo* sw = find_method_any(mc, "set_boneWeights");
+                if (sw) { void* a[1] = { bwa }; invoke_inst(sw, g_bak_mesh, a); LOGI("test3: boneWeights restored"); }
+                else LOGE("test3: set_boneWeights missing");
+            }
+        }
+        const MethodInfo* rb = find_method_any(mc, "RecalculateBounds");
+        if (rb) invoke_inst(rb, g_bak_mesh, nullptr);
+        LOGI("===== MESHTEST cmd=3 END =====");
+        return;
+    }
+
+    Il2CppObject* smr = test_target_smr();
+    if (!smr) { LOGI("===== MESHTEST ABORT ====="); return; }
+    Il2CppClass* mc = g_api.object_get_class(smr);
+    if (!mc) { LOGE("test: cannot get SMR class"); return; }
+    const MethodInfo* gm = find_method_any(mc, "get_sharedMesh");
+    Il2CppObject* mesh = gm ? invoke_inst(gm, smr, nullptr) : nullptr;
+    if (!mesh) { LOGE("test: sharedMesh null"); return; }
+    Il2CppClass* meshCls = g_api.object_get_class(mesh);
+    if (!meshCls) meshCls = MeshCls;
+
+    const MethodInfo* gv = find_method_any(meshCls, "get_vertices");
+    Il2CppArray* va = gv ? (Il2CppArray*)invoke_inst(gv, mesh, nullptr) : nullptr;
+    if (!va || va->max_length < 100) { LOGE("test: get_vertices failed arr=%p len=%ld", (void*)va, va ? (long)va->max_length : -1L); return; }
+    int nv = (int)va->max_length;
+    LOGI("test: target nv=%d", nv);
+
+    // 备份原数据（只在第一次备份，还原后再备份会覆盖成坏数据）
+    if (g_bak_mesh != mesh || g_bak_nv != nv) {
+        g_bak_mesh = mesh;
+        g_bak_nv = nv;
+        g_bak_verts.assign((size_t)nv * 12, 0);
+        memcpy(g_bak_verts.data(), array_addr(va, (size_t)v3stride, 0), (size_t)nv * 12);
+        g_bak_bw.clear();
+        const MethodInfo* gw = find_method_any(meshCls, "get_boneWeights");
+        Il2CppArray* bwo = gw ? (Il2CppArray*)invoke_inst(gw, mesh, nullptr) : nullptr;
+        if (bwo && BWCls && bwo->max_length == va->max_length) {
+            int bwstride = array_elem_size(BWCls, 32);
+            g_bak_bw.assign((size_t)nv * bwstride, 0);
+            memcpy(g_bak_bw.data(), array_addr(bwo, (size_t)bwstride, 0), (size_t)nv * bwstride);
+            LOGI("test: backed up verts + boneWeights (bwstride=%d)", bwstride);
+        } else {
+            LOGI("test: backed up verts only (get_boneWeights=%p arr=%p len=%ld)",
+                 (void*)gw, (void*)bwo, bwo ? (long)bwo->max_length : -1L);
+        }
+    }
+
+    if (cmd == 1) {
+        float* p = (float*)array_addr(va, (size_t)v3stride, 0);
+        for (size_t i = 0; i < (size_t)nv * 3; i++) p[i] *= 0.5f;
+        const MethodInfo* sv = find_method_any(meshCls, "set_vertices");
+        if (!sv) { LOGE("test1: set_vertices stripped"); return; }
+        void* a[1] = { va };
+        invoke_inst(sv, mesh, a);
+        LOGI("test1: set_vertices x0.5 done on %d verts", nv);
+    } else if (cmd == 2) {
+        if (!BWCls) { LOGE("test2: no BoneWeight class"); return; }
+        BwLayout L = bw_layout(BWCls);
+        int bwstride = array_elem_size(BWCls, 32);
+        Il2CppArray* bwa = g_api.array_new(BWCls, (size_t)nv);
+        if (!bwa) { LOGE("test2: array_new failed"); return; }
+        unsigned char* base = (unsigned char*)array_addr(bwa, (size_t)bwstride, 0);
+        for (int i = 0; i < nv; i++) {
+            unsigned char* e = base + (size_t)i * (size_t)bwstride;
+            for (int q = 0; q < 4; q++) {
+                *(int*)(e + L.idx[q]) = 0;
+                *(float*)(e + L.wgt[q]) = (q == 0) ? 1.0f : 0.0f;
+            }
+        }
+        const MethodInfo* sw = find_method_any(meshCls, "set_boneWeights");
+        if (!sw) { LOGE("test2: set_boneWeights stripped"); return; }
+        void* a[1] = { bwa };
+        invoke_inst(sw, mesh, a);
+        LOGI("test2: all %d verts bound to bone 0 (weight 1) done", nv);
+    } else {
+        LOGE("test: unknown cmd %d", cmd);
+    }
+
+    const MethodInfo* rb = find_method_any(meshCls, "RecalculateBounds");
+    if (rb) invoke_inst(rb, mesh, nullptr);
+    LOGI("===== MESHTEST cmd=%d END =====", cmd);
+}
+
 static Il2CppObject* g_rigidRoot = nullptr;
 
 static int spawn_rigid_parts(Il2CppObject* origSmr) {
@@ -4396,6 +4655,10 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
     if (layer == 0) layer = 10;
     LOGI("rigid: layer=%d", layer);
 
+    LOGI("rigid: STEP4b bind pose refs");
+    std::map<void*, BindRef> bindref;
+    build_bindref_map(SMRCls, bindref);
+
     LOGI("rigid: STEP5 spawning pieces");
 
     // ---- 自适应缩放 ----
@@ -4566,40 +4829,57 @@ static int spawn_rigid_parts(Il2CppObject* origSmr) {
             void* pa[1] = { bones[tgt] };
             invoke_inst(setParent, gt, pa);
 
-            // localScale = k / 骨骼世界缩放
-            float ws = 1.0f;
-            if (l2w) {
-                Il2CppObject* m2 = invoke_inst(l2w, bones[tgt], nullptr);
-                if (m2) {
-                    const float* mm = (const float*)((char*)m2 + 16);
-                    float sx = sqrtf(mm[0]*mm[0] + mm[1]*mm[1] + mm[2]*mm[2]);
-                    if (sx > 0.0001f) ws = sx;
-                }
-            }
-            float ls = kBase / ws;
-            if (setLScl) { Vec3 v = {ls, ls, ls}; void* a[1]={&v}; invoke_inst(setLScl, gt, a); }
-
-            // ---- 关键：抵消骨骼自身的 bind 旋转 ----
-            // 块的顶点是"模型空间"的偏移 (v-p)，如果 localRotation 是单位矩阵，
-            // 世界朝向就跟着骨骼的旋转走（Bip001 Pelvis 的 lrot 是 (-0.518,0.491,0.493,0.497)，
-            // 根本不是单位）——表现为位置对、方向全歪。
-            // 设成 inverse(bone.worldRotation) 之后：R * R^-1 = I，偏移就保持模型空间朝向。
+            // ---------------------------------------------------------------
+            // v141：三元组一次设死，全部拿 bindposes 推出来的 bind 姿态
+            //
+            // 顶点早已减过骨骼 bind 位置（v - p），所以块原点放在骨骼原点：
+            //   世界 = M_bone * T(0) * R_b * S_b * (v - p)
+            // bind 时 M_bone = T(p) * R_bind * S(s)，要它退化成 p + (v-p)*kBase 就得：
+            //   R_b = R_bind^T   （bindpose 3x3 列归一化后的矩阵）
+            //   S_b = kBase / s  （bindpose 列长 l = 1/s → kBase * l）
+            // 一次设死之后，骨骼动画的增量旋转照常带着块转，这才是对的。
+            // v139 用实时 worldRotation 是错的：角色不在 bind pose 时每块就带着
+            // bind→现在的增量旋转，表现就是“位置对、方向歪”。
+            // ---------------------------------------------------------------
+            BindRef br;
+            br.ok = false; br.sc = 1.0f;
+            br.rot.x = 0; br.rot.y = 0; br.rot.z = 0; br.rot.w = 1;
             {
+                std::map<void*, BindRef>::iterator it = bindref.find((void*)bones[tgt]);
+                if (it != bindref.end() && it->second.ok) br = it->second;
+            }
+            float ls;
+            if (br.ok) {
+                ls = kBase * br.sc;
+            } else {
+                // bindposes 里没这根骨骼（union 里来自别的 SMR），退回实时世界变换
+                float ws = 1.0f;
+                if (l2w) {
+                    Il2CppObject* m2 = invoke_inst(l2w, bones[tgt], nullptr);
+                    if (m2) {
+                        const float* mm = (const float*)((char*)m2 + 16);
+                        float sx = sqrtf(mm[0]*mm[0] + mm[1]*mm[1] + mm[2]*mm[2]);
+                        if (sx > 0.0001f) ws = sx;
+                    }
+                }
+                ls = kBase / ws;
                 const MethodInfo* getRot = find_method_any(TransCls, "get_rotation");
-                Quat inv = {0, 0, 0, 1};
                 if (getRot) {
                     Il2CppObject* rq = invoke_inst(getRot, bones[tgt], nullptr);
                     if (rq) {
-                        float qx = *(float*)((char*)rq + 16);
-                        float qy = *(float*)((char*)rq + 20);
-                        float qz = *(float*)((char*)rq + 24);
-                        float qw = *(float*)((char*)((char*)rq) + 28);
-                        // 单位四元数的逆 = 共轭
-                        inv.x = -qx; inv.y = -qy; inv.z = -qz; inv.w = qw;
+                        br.rot.x = -*(float*)((char*)rq + 16);
+                        br.rot.y = -*(float*)((char*)rq + 20);
+                        br.rot.z = -*(float*)((char*)rq + 24);
+                        br.rot.w =  *(float*)((char*)rq + 28);
                     }
                 }
-                if (setLRot) { void* a[1] = { &inv }; invoke_inst(setLRot, gt, a); }
             }
+            if (made < 30) {
+                LOGI("rigid: piece p%d/s%d -> bone[%d](%s) bind=%s ls=%.5f",
+                     part, j, tgt, gnorm[tgt].c_str(), br.ok ? "YES" : "no", ls);
+            }
+            if (setLScl) { Vec3 v = {ls, ls, ls}; void* a[1]={&v}; invoke_inst(setLScl, gt, a); }
+            if (setLRot) { void* a[1] = { &br.rot }; invoke_inst(setLRot, gt, a); }
             if (setLPos) { Vec3 v = {0,0,0}; void* a[1]={&v}; invoke_inst(setLPos, gt, a); }
 
             g_ourSmrs.insert(go);
@@ -5234,6 +5514,15 @@ Java_com_moss_modelmod_HookEntry_setCustomEnabled(JNIEnv*, jclass, jint on) {
 extern "C" JNIEXPORT jint JNICALL
 Java_com_moss_modelmod_HookEntry_getCustomEnabled(JNIEnv*, jclass) {
     return (jint)g_custom_on;
+}
+
+// v141: 原生蒙皮验证开关
+// 1 = 原 mesh 顶点 x0.5   2 = 全部顶点绑 0 号骨   3 = 还原
+extern "C" JNIEXPORT void JNICALL
+Java_com_moss_modelmod_HookEntry_testMesh(JNIEnv*, jclass, jint cmd) {
+    g_test_cmd = (int)cmd;
+    g_force_tick = 1;
+    LOGI("test cmd queued: %d", (int)cmd);
 }
 
 extern "C" JNIEXPORT jint JNICALL

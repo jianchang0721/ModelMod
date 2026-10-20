@@ -50,6 +50,8 @@ public class HookEntry implements IXposedHookLoadPackage {
     private static native int selectedTarget();
     private static native void setCustomEnabled(int on);
     private static native int getCustomEnabled();
+    // v141: 1 = 原 mesh 顶点减半 2 = 全绑 0 号骨 3 = 还原
+    private static native void testMesh(int cmd);
 
     private static final int REQ_PICK = 0x4D44;   // 自定义模型选择器
 
@@ -253,6 +255,24 @@ public class HookEntry implements IXposedHookLoadPackage {
         btnTarget.setOnClickListener(v -> showTargets(act));
         btnRow2.addView(btnTarget, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         panel.addView(btnRow2);
+
+        // v141: 原生蒙皮可行性验证（先关掉"显示自定义模型"，否则块会遮住原角色）
+        LinearLayout btnRow3 = new LinearLayout(act);
+        btnRow3.setOrientation(LinearLayout.HORIZONTAL);
+        TextView btnT1 = mkBtn(act, "验1 减半");
+        btnT1.setOnClickListener(v -> { try { testMesh(1); toast(act, "原模型顶点 x0.5"); } catch (Throwable t) { } });
+        TextView btnT2 = mkBtn(act, "验2 绑0骨");
+        btnT2.setOnClickListener(v -> { try { testMesh(2); toast(act, "全部顶点绑到 0 号骨"); } catch (Throwable t) { } });
+        TextView btnT3 = mkBtn(act, "还原");
+        btnT3.setOnClickListener(v -> { try { testMesh(3); toast(act, "已还原"); } catch (Throwable t) { } });
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        tlp.rightMargin = 6;
+        btnRow3.addView(btnT1, tlp);
+        LinearLayout.LayoutParams tlp2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        tlp2.rightMargin = 6;
+        btnRow3.addView(btnT2, tlp2);
+        btnRow3.addView(btnT3, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        panel.addView(btnRow3);
 
         final Handler lh = new Handler(Looper.getMainLooper());
         lh.post(new Runnable() {
