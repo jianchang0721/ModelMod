@@ -2594,6 +2594,24 @@ static bool load_skin_part(FILE* f, Il2CppObject* mesh, int nv, int ni,
         LOGI("skin: name hits %d / %u (hardmap added %d)", nameHit, nb, hard);
     }
 
+    // 原 mesh 的 bounds —— vertices 读不了，但这个属性通常还在，能给出角色真实尺寸
+    if (smr) {
+        Il2CppClass* SMRCls0 = find_class_any("UnityEngine", "SkinnedMeshRenderer");
+        Il2CppClass* MeshCls0 = find_class_any("UnityEngine", "Mesh");
+        const MethodInfo* gm0 = SMRCls0 ? find_method_any(SMRCls0, "get_sharedMesh") : nullptr;
+        Il2CppObject* mesh0 = gm0 ? invoke_inst(gm0, smr, nullptr) : nullptr;
+        const MethodInfo* gb0 = MeshCls0 ? find_method_any(MeshCls0, "get_bounds") : nullptr;
+        Il2CppObject* bd = (gb0 && mesh0) ? invoke_inst(gb0, mesh0, nullptr) : nullptr;
+        if (bd) {
+            // Bounds { Vector3 center; Vector3 extents; } 各 3 个 float，装箱后 offset 16 起
+            const float* f = (const float*)((char*)bd + 16);
+            LOGI("meshbounds: center=(%.3f,%.3f,%.3f) extents=(%.3f,%.3f,%.3f) height=%.3f",
+                 f[0], f[1], f[2], f[3], f[4], f[5], f[4] * 2.0f);
+        } else {
+            LOGI("meshbounds: bounds unreadable (get_bounds=%p)", (void*)gb0);
+        }
+    }
+
     int found = 0, withBind = 0;
     sp.bindInv.resize((size_t)nb * 16, 0.0f);
     for (uint32_t i = 0; i < nb; i++) {
@@ -2639,7 +2657,43 @@ static bool load_skin_part(FILE* f, Il2CppObject* mesh, int nv, int ni,
         }
     }
 
-    // 连父链都借不到的（Spine2 连对象都没找到），按槽位硬指定父骨骼借
+    // ---- 骨架对拍 ----
+    // 我们的 bind 位置来自 MMS2 的 inverseBindMatrix 平移（PMX 单位，身高 20.2）
+    // 游戏的 bind 位置 = bindposes 求逆后的平移（游戏单位）
+    // ratio 一致 = 只是缩放问题；ratio 乱 = 骨架本身不一样
+    for (uint32_t i = 0; i < nb; i++) {
+        std::map<void*, std::vector<float>>::iterator cit =
+            sp.bones[i] ? g_bindInv.find((void*)sp.bones[i]) : g_bindInv.end();
+        if (cit == g_bindInv.end()) continue;
+        float minv[16];
+        if (!mat4_inv_affine(cit->second.data(), minv)) continue;
+        float ox = sp.bindT[i*3+0], oy = sp.bindT[i*3+1], oz = sp.bindT[i*3+2];
+        float gx = minv[12], gy = minv[13], gz = minv[14];
+        float on = sqrtf(ox*ox + oy*oy + oz*oz);
+        float gn = sqrtf(gx*gx + gy*gy + gz*gz);
+        // M_bind = bindposes^-1，取 3x3 每列长度 = 该轴的世界缩放
+        float s0 = sqrtf(minv[0]*minv[0] + minv[1]*minv[1] + minv[2]*minv[2]);
+        float s1 = sqrtf(minv[4]*minv[4] + minv[5]*minv[5] + minv[6]*minv[6]);
+        float s2 = sqrtf(minv[8]*minv[8] + minv[9]*minv[9] + minv[10]*minv[10]);
+        // 旋转是不是单位：3x3 归一化后跟单位阵的偏差
+        float dev = 0.0f;
+        if (s0 > 1e-6f && s1 > 1e-6f && s2 > 1e-6f) {
+            float r[3][3] = {
+                {minv[0]/s0, minv[1]/s0, minv[2]/s0},
+                {minv[4]/s1, minv[5]/s1, minv[6]/s1},
+                {minv[8]/s2, minv[9]/s2, minv[10]/s2},
+            };
+            // 列主序：r[c][row]。单位阵是 r[0][0]=r[1][1]=r[2][2]=1
+            dev = fabsf(r[0][0]-1) + fabsf(r[1][1]-1) + fabsf(r[2][2]-1)
+                + fabsf(r[0][1]) + fabsf(r[0][2]) + fabsf(r[1][0])
+                + fabsf(r[1][2]) + fabsf(r[2][0]) + fabsf(r[2][1]);
+        }
+        LOGI("bindpos: %2u %-20s ours=(%7.2f,%7.2f,%7.2f)|%6.2f| game=(%7.3f,%7.3f,%7.3f)|%6.3f| ratio=%.3f scale=(%.2f,%.2f,%.2f) rotdev=%.3f",
+             i, names[i].c_str(), ox, oy, oz, on, gx, gy, gz, gn,
+             (gn > 1e-6f) ? (on / gn) : 0.0f, s0, s1, s2, dev);
+    }
+
+    // 连父链都借不到的（Spine2 连对象都没找到），按硬指定父骨骼借
     static const struct { int slot; int parentSlot; } kBorrow[] = {
         { 3,  2},   // Spine2    <- Spine1
         {16, 15},   // L Forearm <- L UpperArm
