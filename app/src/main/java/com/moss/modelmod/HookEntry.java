@@ -18,6 +18,7 @@ import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
 
@@ -315,24 +316,22 @@ public class HookEntry implements IXposedHookLoadPackage {
             }
         });
 
-        // 单独窗口拖动
-        panel.setOnTouchListener(new View.OnTouchListener() {
-            private float dx, dy;
-            @Override public boolean onTouch(View v, MotionEvent e) {
-                switch (e.getAction()) {
-                    case MotionEvent.ACTION_DOWN:
-                        dx = e.getRawX() - panel.getX();
-                        dy = e.getRawY() - panel.getY();
-                        return true;
-                    case MotionEvent.ACTION_MOVE:
-                        panel.setX(e.getRawX() - dx);
-                        panel.setY(e.getRawY() - dy);
-                        return true;
-                }
-                return true;
+        // v145: 控件太多，超出屏幕就看不着了 —— 包一层限高的 ScrollView，上下滑就能点到。
+        // 拖动由卡片标题负责（title.setOnTouchListener），这里不能抢触摸事件，
+        // 否则 ScrollView 收不到 MOVE，滑不动。
+        final int maxH = (int) (act.getResources().getDisplayMetrics().heightPixels * 0.45f);
+        ScrollView sv = new ScrollView(act) {
+            @Override
+            protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+                int h = View.MeasureSpec.makeMeasureSpec(maxH, View.MeasureSpec.AT_MOST);
+                super.onMeasure(widthMeasureSpec, h);
             }
-        });
-        return panel;
+        };
+        sv.setFillViewport(false);
+        sv.setVerticalScrollBarEnabled(true);
+        sv.addView(panel, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        return sv;
     }
 
     private static String hideName(int i) {
@@ -434,11 +433,19 @@ public class HookEntry implements IXposedHookLoadPackage {
                         downAt = System.currentTimeMillis();
                         moved = false;
                         return true;
-                    case MotionEvent.ACTION_MOVE:
-                        root.setX(e.getRawX() - dx);
-                        root.setY(e.getRawY() - dy);
+                    case MotionEvent.ACTION_MOVE: {
+                        float nx = e.getRawX() - dx;
+                        float ny = e.getRawY() - dy;
+                        int sw2 = act.getResources().getDisplayMetrics().widthPixels;
+                        int sh2 = act.getResources().getDisplayMetrics().heightPixels;
+                        // 至少留 80px 在屏幕里，别拖出去就找不回来了
+                        nx = Math.max(-600f, Math.min(nx, sw2 - 80f));
+                        ny = Math.max(0f, Math.min(ny, sh2 - 80f));
+                        root.setX(nx);
+                        root.setY(ny);
                         moved = true;
                         return true;
+                    }
                     case MotionEvent.ACTION_UP:
                         if (!moved && System.currentTimeMillis() - downAt < 300) {
                             boolean visible = root.getVisibility() == View.VISIBLE;
